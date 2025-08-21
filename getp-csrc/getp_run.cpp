@@ -32,6 +32,12 @@ static float *d_w_router, *d_b_router;
 static float *d_w_mlp1, *d_w_mlp2, *d_b_mlp1, *d_b_mlp2;
 static float *d_rms_out_w, *d_out;
 
+// Memory optimization: expert weights loaded on-demand
+static bool use_expert_streaming = false;
+static int current_expert_loaded = -1;
+static float *d_current_expert_mlp1 = nullptr, *d_current_expert_mlp2 = nullptr;
+static float *d_current_expert_b_mlp1 = nullptr, *d_current_expert_b_mlp2 = nullptr;
+
 static Config *h_config;
 
 // Custom GPU kernels
@@ -339,6 +345,21 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     int n_kv_heads = h_config->n_kv_heads;
     int kv_dim = head_dim * n_kv_heads;
     
+    // Check available GPU memory and enable optimizations
+    size_t free_mem, total_mem;
+    HIP_CHECK(hipMemGetInfo(&free_mem, &total_mem));
+    printf("GPU Memory: %zu MB free, %zu MB total\n", free_mem / (1024*1024), total_mem / (1024*1024));
+    
+    // Calculate total memory needed for expert weights
+    size_t expert_memory = (size_t)n_layers * n_experts * (2 * intermediate_dim * hidden_dim + hidden_dim * intermediate_dim + 2 * intermediate_dim + hidden_dim) * sizeof(float);
+    printf("Expert weights would need: %zu MB\n", expert_memory / (1024*1024));
+    
+    // Enable expert streaming if memory is tight
+    if (expert_memory > free_mem * 0.6) {
+        use_expert_streaming = true;
+        printf("Enabling expert weight streaming to save memory\n");
+    }
+    
     // Allocate GPU memory for activations
     HIP_CHECK(hipMalloc(&d_x, hidden_dim * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_t, hidden_dim * sizeof(float)));
@@ -425,25 +446,81 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMalloc(&d_b_router, n_layers * n_experts * sizeof(float)));
     HIP_CHECK(hipMemcpy(d_b_router, w->b_router, n_layers * n_experts * sizeof(float), hipMemcpyHostToDevice));
     
-    size_t mlp1_size = n_layers * n_experts * 2 * intermediate_dim * hidden_dim;
-    HIP_CHECK(hipMalloc(&d_w_mlp1, mlp1_size * sizeof(float)));
-    HIP_CHECK(hipMemcpy(d_w_mlp1, w->w_mlp1, mlp1_size * sizeof(float), hipMemcpyHostToDevice));
-    
-    size_t mlp2_size = n_layers * n_experts * hidden_dim * intermediate_dim;
-    HIP_CHECK(hipMalloc(&d_w_mlp2, mlp2_size * sizeof(float)));
-    HIP_CHECK(hipMemcpy(d_w_mlp2, w->w_mlp2, mlp2_size * sizeof(float), hipMemcpyHostToDevice));
-    
-    HIP_CHECK(hipMalloc(&d_b_mlp1, n_layers * n_experts * 2 * intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMemcpy(d_b_mlp1, w->b_mlp1, n_layers * n_experts * 2 * intermediate_dim * sizeof(float), hipMemcpyHostToDevice));
-    
-    HIP_CHECK(hipMalloc(&d_b_mlp2, n_layers * n_experts * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMemcpy(d_b_mlp2, w->b_mlp2, n_layers * n_experts * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    if (use_expert_streaming) {
+        // Only allocate memory for one expert at a time
+        HIP_CHECK(hipMalloc(&d_current_expert_mlp1, 2 * intermediate_dim * hidden_dim * sizeof(float)));
+        HIP_CHECK(hipMalloc(&d_current_expert_mlp2, hidden_dim * intermediate_dim * sizeof(float)));
+        HIP_CHECK(hipMalloc(&d_current_expert_b_mlp1, 2 * intermediate_dim * sizeof(float)));
+        HIP_CHECK(hipMalloc(&d_current_expert_b_mlp2, hidden_dim * sizeof(float)));
+        
+        // Keep pointers NULL to indicate streaming mode
+        d_w_mlp1 = nullptr;
+        d_w_mlp2 = nullptr;
+        d_b_mlp1 = nullptr;
+        d_b_mlp2 = nullptr;
+        
+        printf("Expert streaming mode enabled - loading experts on demand\n");
+    } else {
+        // Original full allocation
+        size_t mlp1_size = n_layers * n_experts * 2 * intermediate_dim * hidden_dim;
+        HIP_CHECK(hipMalloc(&d_w_mlp1, mlp1_size * sizeof(float)));
+        HIP_CHECK(hipMemcpy(d_w_mlp1, w->w_mlp1, mlp1_size * sizeof(float), hipMemcpyHostToDevice));
+        
+        size_t mlp2_size = n_layers * n_experts * hidden_dim * intermediate_dim;
+        HIP_CHECK(hipMalloc(&d_w_mlp2, mlp2_size * sizeof(float)));
+        HIP_CHECK(hipMemcpy(d_w_mlp2, w->w_mlp2, mlp2_size * sizeof(float), hipMemcpyHostToDevice));
+        
+        HIP_CHECK(hipMalloc(&d_b_mlp1, n_layers * n_experts * 2 * intermediate_dim * sizeof(float)));
+        HIP_CHECK(hipMemcpy(d_b_mlp1, w->b_mlp1, n_layers * n_experts * 2 * intermediate_dim * sizeof(float), hipMemcpyHostToDevice));
+        
+        HIP_CHECK(hipMalloc(&d_b_mlp2, n_layers * n_experts * hidden_dim * sizeof(float)));
+        HIP_CHECK(hipMemcpy(d_b_mlp2, w->b_mlp2, n_layers * n_experts * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    }
     
     HIP_CHECK(hipMalloc(&d_rms_out_w, hidden_dim * sizeof(float)));
     HIP_CHECK(hipMemcpy(d_rms_out_w, w->rms_out_w, hidden_dim * sizeof(float), hipMemcpyHostToDevice));
     
     HIP_CHECK(hipMalloc(&d_out, vocab_size * hidden_dim * sizeof(float)));
     HIP_CHECK(hipMemcpy(d_out, w->out, vocab_size * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+}
+
+void load_expert_weights(Transformer *transformer, int layer, int expert) {
+    if (!use_expert_streaming) return;
+    
+    int expert_id = layer * h_config->n_experts + expert;
+    if (current_expert_loaded == expert_id) return;  // Already loaded
+    
+    // Safety checks
+    if (!d_current_expert_mlp1 || !d_current_expert_mlp2 || 
+        !d_current_expert_b_mlp1 || !d_current_expert_b_mlp2) {
+        fprintf(stderr, "Error: expert streaming buffers not allocated\n");
+        return;
+    }
+    
+    TransformerWeights *w = &transformer->weights;
+    int hidden_dim = h_config->hidden_dim;
+    int intermediate_dim = h_config->intermediate_dim;
+    int n_experts = h_config->n_experts;
+    
+    // Calculate correct offsets for this specific expert in this layer
+    // The weights are organized as [layer][expert][weights]
+    size_t layer_expert_offset = layer * n_experts + expert;
+    size_t mlp1_offset = layer_expert_offset * (2 * intermediate_dim * hidden_dim);
+    size_t mlp2_offset = layer_expert_offset * (hidden_dim * intermediate_dim);
+    size_t b_mlp1_offset = layer_expert_offset * (2 * intermediate_dim);
+    size_t b_mlp2_offset = layer_expert_offset * hidden_dim;
+    
+    // Copy expert weights to GPU
+    HIP_CHECK(hipMemcpy(d_current_expert_mlp1, w->w_mlp1 + mlp1_offset, 
+                       2 * intermediate_dim * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_current_expert_mlp2, w->w_mlp2 + mlp2_offset, 
+                       hidden_dim * intermediate_dim * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_current_expert_b_mlp1, w->b_mlp1 + b_mlp1_offset, 
+                       2 * intermediate_dim * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_current_expert_b_mlp2, w->b_mlp2 + b_mlp2_offset, 
+                       hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+    
+    current_expert_loaded = expert_id;
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -461,7 +538,19 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipFree(d_token_embedding_table)); HIP_CHECK(hipFree(d_rms_attn_w)); HIP_CHECK(hipFree(d_rms_ffn_w));
     HIP_CHECK(hipFree(d_w_qkv)); HIP_CHECK(hipFree(d_w_o)); HIP_CHECK(hipFree(d_b_qkv)); HIP_CHECK(hipFree(d_b_o)); HIP_CHECK(hipFree(d_attn_sinks));
     HIP_CHECK(hipFree(d_w_router)); HIP_CHECK(hipFree(d_b_router));
-    HIP_CHECK(hipFree(d_w_mlp1)); HIP_CHECK(hipFree(d_w_mlp2)); HIP_CHECK(hipFree(d_b_mlp1)); HIP_CHECK(hipFree(d_b_mlp2));
+    
+    if (use_expert_streaming) {
+        if (d_current_expert_mlp1) HIP_CHECK(hipFree(d_current_expert_mlp1));
+        if (d_current_expert_mlp2) HIP_CHECK(hipFree(d_current_expert_mlp2));
+        if (d_current_expert_b_mlp1) HIP_CHECK(hipFree(d_current_expert_b_mlp1));
+        if (d_current_expert_b_mlp2) HIP_CHECK(hipFree(d_current_expert_b_mlp2));
+    } else {
+        if (d_w_mlp1) HIP_CHECK(hipFree(d_w_mlp1));
+        if (d_w_mlp2) HIP_CHECK(hipFree(d_w_mlp2));
+        if (d_b_mlp1) HIP_CHECK(hipFree(d_b_mlp1));
+        if (d_b_mlp2) HIP_CHECK(hipFree(d_b_mlp2));
+    }
+    
     HIP_CHECK(hipFree(d_rms_out_w)); HIP_CHECK(hipFree(d_out));
 }
 
@@ -590,35 +679,64 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
             }
             
             if (in_topk) {
-                // MLP1 (gate_up projection)
-                int expert_offset = l * n_experts + e;
-                dim3 mlp1_grid((2 * intermediate_dim + block.x - 1) / block.x);
-                matmul_kernel<<<mlp1_grid, block>>>(d_mlp1_out, d_t, 
-                                                   d_w_mlp1 + expert_offset * (2 * intermediate_dim) * hidden_dim, 
-                                                   hidden_dim, 2 * intermediate_dim);
-                
-                // Add MLP1 bias
-                add_bias_kernel<<<mlp1_grid, block>>>(d_mlp1_out, 
-                                                     d_b_mlp1 + expert_offset * (2 * intermediate_dim), 
-                                                     2 * intermediate_dim);
-                
-                // Split gate and up
-                dim3 split_mlp_grid((intermediate_dim + block.x - 1) / block.x);
-                split_gate_up_kernel<<<split_mlp_grid, block>>>(d_gate, d_up, d_mlp1_out, intermediate_dim);
-                
-                // SwiGLU activation
-                swiglu_kernel<<<split_mlp_grid, block>>>(d_gate_up, d_gate, d_up, intermediate_dim, p->swiglu_limit);
-                
-                // MLP2 (down projection)
-                matmul_kernel<<<grid, block>>>(d_tb2, d_gate_up, 
-                                              d_w_mlp2 + expert_offset * hidden_dim * intermediate_dim, 
-                                              intermediate_dim, hidden_dim);
-                
-                // Add MLP2 bias
-                add_bias_kernel<<<grid, block>>>(d_tb2, d_b_mlp2 + expert_offset * hidden_dim, hidden_dim);
-                
-                // Weighted aggregation
-                weighted_sum_kernel<<<grid, block>>>(d_e_agg, d_tb2, expert_w, hidden_dim);
+                if (use_expert_streaming) {
+                    // Load expert weights on demand
+                    load_expert_weights(transformer, l, e);
+                    
+                    // MLP1 (gate_up projection) using current expert
+                    dim3 mlp1_grid((2 * intermediate_dim + block.x - 1) / block.x);
+                    matmul_kernel<<<mlp1_grid, block>>>(d_mlp1_out, d_t, d_current_expert_mlp1, 
+                                                       hidden_dim, 2 * intermediate_dim);
+                    
+                    // Add MLP1 bias
+                    add_bias_kernel<<<mlp1_grid, block>>>(d_mlp1_out, d_current_expert_b_mlp1, 2 * intermediate_dim);
+                    
+                    // Split gate and up
+                    dim3 split_mlp_grid((intermediate_dim + block.x - 1) / block.x);
+                    split_gate_up_kernel<<<split_mlp_grid, block>>>(d_gate, d_up, d_mlp1_out, intermediate_dim);
+                    
+                    // SwiGLU activation
+                    swiglu_kernel<<<split_mlp_grid, block>>>(d_gate_up, d_gate, d_up, intermediate_dim, p->swiglu_limit);
+                    
+                    // MLP2 (down projection)
+                    matmul_kernel<<<grid, block>>>(d_tb2, d_gate_up, d_current_expert_mlp2, intermediate_dim, hidden_dim);
+                    
+                    // Add MLP2 bias
+                    add_bias_kernel<<<grid, block>>>(d_tb2, d_current_expert_b_mlp2, hidden_dim);
+                    
+                    // Weighted aggregation
+                    weighted_sum_kernel<<<grid, block>>>(d_e_agg, d_tb2, expert_w, hidden_dim);
+                } else {
+                    // Original full memory approach
+                    int expert_offset = l * n_experts + e;
+                    dim3 mlp1_grid((2 * intermediate_dim + block.x - 1) / block.x);
+                    matmul_kernel<<<mlp1_grid, block>>>(d_mlp1_out, d_t, 
+                                                       d_w_mlp1 + expert_offset * (2 * intermediate_dim) * hidden_dim, 
+                                                       hidden_dim, 2 * intermediate_dim);
+                    
+                    // Add MLP1 bias
+                    add_bias_kernel<<<mlp1_grid, block>>>(d_mlp1_out, 
+                                                         d_b_mlp1 + expert_offset * (2 * intermediate_dim), 
+                                                         2 * intermediate_dim);
+                    
+                    // Split gate and up
+                    dim3 split_mlp_grid((intermediate_dim + block.x - 1) / block.x);
+                    split_gate_up_kernel<<<split_mlp_grid, block>>>(d_gate, d_up, d_mlp1_out, intermediate_dim);
+                    
+                    // SwiGLU activation
+                    swiglu_kernel<<<split_mlp_grid, block>>>(d_gate_up, d_gate, d_up, intermediate_dim, p->swiglu_limit);
+                    
+                    // MLP2 (down projection)
+                    matmul_kernel<<<grid, block>>>(d_tb2, d_gate_up, 
+                                                  d_w_mlp2 + expert_offset * hidden_dim * intermediate_dim, 
+                                                  intermediate_dim, hidden_dim);
+                    
+                    // Add MLP2 bias
+                    add_bias_kernel<<<grid, block>>>(d_tb2, d_b_mlp2 + expert_offset * hidden_dim, hidden_dim);
+                    
+                    // Weighted aggregation
+                    weighted_sum_kernel<<<grid, block>>>(d_e_agg, d_tb2, expert_w, hidden_dim);
+                }
             }
         }
         
