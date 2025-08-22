@@ -152,14 +152,20 @@ __global__ void copy_qkv_kernel(float *q, float *k, float *v, float *qkv,
                                 int n_attn_heads, int n_kv_heads, int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int q_size = n_attn_heads * head_dim;
-    int k_size = n_kv_heads * head_dim;
+    int kv_size = n_kv_heads * head_dim;
+    int total_qkv = q_size + 2 * kv_size;
     
-    if (idx < q_size) {
-        q[idx] = qkv[idx];
-    } else if (idx < q_size + k_size) {
-        k[idx - q_size] = qkv[idx];
-    } else if (idx < q_size + k_size + k_size) {
-        v[idx - q_size - k_size] = qkv[idx];
+    if (idx < total_qkv) {
+        if (idx < q_size) {
+            // Copy Q: indices 0 to q_size-1
+            q[idx] = qkv[idx];
+        } else if (idx < q_size + kv_size) {
+            // Copy K: indices q_size to q_size+kv_size-1
+            k[idx - q_size] = qkv[idx];
+        } else {
+            // Copy V: indices q_size+kv_size to q_size+2*kv_size-1
+            v[idx - q_size - kv_size] = qkv[idx];
+        }
     }
 }
 
@@ -170,18 +176,33 @@ __global__ void compute_cos_sin_kernel(float *cos_vals, float *sin_vals, int pos
     int d_half = head_dim / 2;
     
     if (idx < d_half) {
-        float freq = powf(rope_theta, (2.0f * idx) / head_dim);
+        float freq = powf(rope_theta, ((float)(2 * idx)) / (float)head_dim);
         float inv_freq;
+        float concentration = 1.0f;
         
         if (scaling_factor > 1.0f) {
-            inv_freq = 1.0f / (scaling_factor * freq);
+            // YaRN concentration
+            concentration = 0.1f * logf(scaling_factor) + 1.0f;
+            
+            // NTK by parts
+            float ntk_beta = 32.0f;
+            float ntk_alpha = 1.0f;
+            float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(rope_theta);
+            float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(rope_theta);
+            
+            float interpolation = 1.0f / (scaling_factor * freq);
+            float extrapolation = 1.0f / freq;
+            
+            float ramp = ((float)idx - low) / (high - low);
+            ramp = fmaxf(0.0f, fminf(1.0f, ramp));
+            
+            float mask = 1.0f - ramp;
+            inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
         } else {
             inv_freq = 1.0f / freq;
         }
         
         float val = pos * inv_freq;
-        float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
-        
         cos_vals[idx] = cosf(val) * concentration;
         sin_vals[idx] = sinf(val) * concentration;
     }
@@ -207,12 +228,12 @@ __global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin,
 
 __global__ void attention_scores_kernel(float *att, float *q, float *key_cache, 
                                        int h, int pos, int head_dim, int kv_dim, 
-                                       int n_kv_heads, int seq_len, float *mask) {
+                                       int n_attn_heads, int n_kv_heads, int seq_len, float *mask) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (t <= pos) {
-        int kv_mul = (n_kv_heads > 0) ? (h / n_kv_heads) : 0;
-        float *k = key_cache + t * kv_dim + kv_mul * head_dim;
+        int kv_mul = n_attn_heads / n_kv_heads;  // Fix GQA calculation
+        float *k = key_cache + t * kv_dim + (h / kv_mul) * head_dim;
         
         float score = 0.0f;
         for (int i = 0; i < head_dim; i++) {
@@ -230,15 +251,16 @@ __global__ void attention_scores_kernel(float *att, float *q, float *key_cache,
 
 __global__ void attention_values_kernel(float *tb, float *att, float *value_cache,
                                        int h, int pos, int head_dim, int kv_dim,
-                                       int n_kv_heads, int seq_len) {
+                                       int n_attn_heads, int n_kv_heads, int seq_len) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (i < head_dim) {
         float result = 0.0f;
-        int kv_mul = (n_kv_heads > 0) ? (h / n_kv_heads) : 0;
+        int kv_mul = n_attn_heads / n_kv_heads;  // Fix GQA calculation
         
+        // Only accumulate over actual timesteps (0 to pos), skip attention sink
         for (int t = 0; t <= pos; t++) {
-            float *v = value_cache + t * kv_dim + kv_mul * head_dim;
+            float *v = value_cache + t * kv_dim + (h / kv_mul) * head_dim;
             float a = att[h * seq_len + t];
             result += a * v[i];
         }
@@ -307,6 +329,7 @@ __global__ void split_gate_up_kernel(float *gate, float *up, float *mlp1_out,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx < intermediate_dim) {
+        // CPU does: gate[j] = mlp1_out[2*j], up[j] = mlp1_out[2*j + 1]
         gate[idx] = mlp1_out[2 * idx];
         up[idx] = mlp1_out[2 * idx + 1];
     }
@@ -610,23 +633,23 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         // Multi-head attention
         for (int h = 0; h < n_attn_heads; h++) {
             // Compute attention scores
-            dim3 att_grid((pos + 2 + block.x - 1) / block.x);
+            dim3 att_grid((pos + 1 + block.x - 1) / block.x);
             attention_scores_kernel<<<att_grid, block>>>(d_att, d_q, d_key_cache + loff,
-                                                        h, pos, head_dim, kv_dim, n_kv_heads, seq_len,
+                                                        h, pos, head_dim, kv_dim, n_attn_heads, n_kv_heads, seq_len,
                                                         (p->sliding_window > 0 && l % 2 == 0) ? d_mask : nullptr);
             
-            // Add attention sink
+            // Add attention sink at correct position (pos + 1)
             float sink_val;
             HIP_CHECK(hipMemcpy(&sink_val, d_attn_sinks + l * n_attn_heads + h, sizeof(float), hipMemcpyDeviceToHost));
             HIP_CHECK(hipMemcpy(d_att + h * seq_len + pos + 1, &sink_val, sizeof(float), hipMemcpyHostToDevice));
             
-            // Softmax
+            // Softmax over pos+2 elements (0 to pos, plus sink at pos+1)
             softmax_kernel<<<1, block>>>(d_att + h * seq_len, pos + 2);
             
             // Compute attention values
             dim3 val_grid((head_dim + block.x - 1) / block.x);
             attention_values_kernel<<<val_grid, block>>>(d_tb, d_att, d_value_cache + loff,
-                                                        h, pos, head_dim, kv_dim, n_kv_heads, seq_len);
+                                                        h, pos, head_dim, kv_dim, n_attn_heads, n_kv_heads, seq_len);
         }
         
         // Output projection
@@ -747,8 +770,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         residual_connection_kernel<<<grid, block>>>(d_x, d_e_agg, hidden_dim);
     }
     
-    // Final RMSNorm
-    rmsnorm_kernel<<<grid, block>>>(d_x, d_x, d_rms_out_w, hidden_dim);
+    // Final RMSNorm - use temporary buffer
+    rmsnorm_kernel<<<grid, block>>>(d_t, d_x, d_rms_out_w, hidden_dim);
+    // Copy back to d_x
+    HIP_CHECK(hipMemcpy(d_x, d_t, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
     
     // Output projection to logits
     dim3 logits_grid((p->vocab_size + block.x - 1) / block.x);
