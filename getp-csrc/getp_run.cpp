@@ -1,6 +1,7 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
+#include "../profiler.h"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -352,6 +353,7 @@ __global__ void memset_zero_kernel(float *ptr, int size) {
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
+    PROFILE_FUNCTION();
     h_config = &transformer->config;
     
     // Initialize HIP
@@ -508,6 +510,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 }
 
 void load_expert_weights(Transformer *transformer, int layer, int expert) {
+    PROFILE_FUNCTION();
     if (!use_expert_streaming) return;
     
     int expert_id = layer * h_config->n_experts + expert;
@@ -578,6 +581,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 }
 
 float *gpu_forward(Transformer *transformer, int token, int pos) {
+    PROFILE_FUNCTION();
     Config *p = h_config;
     
     int hidden_dim = p->hidden_dim;
@@ -593,23 +597,28 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     dim3 grid((hidden_dim + block.x - 1) / block.x);
     
     // Copy token embedding to x
-    copy_embedding_kernel<<<grid, block>>>(d_x, d_token_embedding_table, token, hidden_dim);
+    PROFILE_KERNEL_LAUNCH("copy_embedding_kernel", 
+        copy_embedding_kernel<<<grid, block>>>(d_x, d_token_embedding_table, token, hidden_dim));
     
     // Forward through all layers
     for (int l = 0; l < p->n_layers; l++) {
         // RMSNorm for attention
-        rmsnorm_kernel<<<grid, block>>>(d_t, d_x, d_rms_attn_w + l * hidden_dim, hidden_dim);
+        PROFILE_KERNEL_LAUNCH("rmsnorm_kernel", 
+            rmsnorm_kernel<<<grid, block>>>(d_t, d_x, d_rms_attn_w + l * hidden_dim, hidden_dim));
         
         // QKV projection
         int qkv_out_dim = (n_attn_heads + 2 * n_kv_heads) * head_dim;
         dim3 qkv_grid((qkv_out_dim + block.x - 1) / block.x);
-        matmul_kernel<<<qkv_grid, block>>>(d_qkv, d_t, d_w_qkv + l * hidden_dim * qkv_out_dim, hidden_dim, qkv_out_dim);
+        PROFILE_KERNEL_LAUNCH("matmul_kernel_qkv", 
+            matmul_kernel<<<qkv_grid, block>>>(d_qkv, d_t, d_w_qkv + l * hidden_dim * qkv_out_dim, hidden_dim, qkv_out_dim));
         
         // Add bias
-        add_bias_kernel<<<qkv_grid, block>>>(d_qkv, d_b_qkv + l * qkv_out_dim, qkv_out_dim);
+        PROFILE_KERNEL_LAUNCH("add_bias_kernel", 
+            add_bias_kernel<<<qkv_grid, block>>>(d_qkv, d_b_qkv + l * qkv_out_dim, qkv_out_dim));
         
         // Split QKV
-        copy_qkv_kernel<<<qkv_grid, block>>>(d_q, d_k, d_v, d_qkv, n_attn_heads, n_kv_heads, head_dim);
+        PROFILE_KERNEL_LAUNCH("copy_qkv_kernel", 
+            copy_qkv_kernel<<<qkv_grid, block>>>(d_q, d_k, d_v, d_qkv, n_attn_heads, n_kv_heads, head_dim));
         
         // Copy K,V to cache
         int loff = l * seq_len * kv_dim;
@@ -618,14 +627,17 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         
         // RoPE
         dim3 rope_grid(((head_dim / 2) + block.x - 1) / block.x);
-        compute_cos_sin_kernel<<<rope_grid, block>>>(d_cos_vals, d_sin_vals, pos,
-                                                    p->rope_theta, head_dim, p->rope_scaling_factor,
-                                                    p->initial_context_length);
+        PROFILE_KERNEL_LAUNCH("compute_cos_sin_kernel", 
+            compute_cos_sin_kernel<<<rope_grid, block>>>(d_cos_vals, d_sin_vals, pos,
+                                                        p->rope_theta, head_dim, p->rope_scaling_factor,
+                                                        p->initial_context_length));
         
         dim3 rope_apply_grid(n_attn_heads, (head_dim / 2 + 31) / 32);
-        apply_rotary_emb_kernel<<<rope_apply_grid, 32>>>(d_q, d_cos_vals, d_sin_vals, n_attn_heads, head_dim);
+        PROFILE_KERNEL_LAUNCH("apply_rotary_emb_kernel_q", 
+            apply_rotary_emb_kernel<<<rope_apply_grid, 32>>>(d_q, d_cos_vals, d_sin_vals, n_attn_heads, head_dim));
         rope_apply_grid = dim3(n_kv_heads, (head_dim / 2 + 31) / 32);
-        apply_rotary_emb_kernel<<<rope_apply_grid, 32>>>(d_k, d_cos_vals, d_sin_vals, n_kv_heads, head_dim);
+        PROFILE_KERNEL_LAUNCH("apply_rotary_emb_kernel_k", 
+            apply_rotary_emb_kernel<<<rope_apply_grid, 32>>>(d_k, d_cos_vals, d_sin_vals, n_kv_heads, head_dim));
         
         // Update cache with rotated K
         HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * kv_dim, d_k, kv_dim * sizeof(float), hipMemcpyDeviceToDevice));
@@ -634,9 +646,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         for (int h = 0; h < n_attn_heads; h++) {
             // Compute attention scores
             dim3 att_grid((pos + 1 + block.x - 1) / block.x);
-            attention_scores_kernel<<<att_grid, block>>>(d_att, d_q, d_key_cache + loff,
-                                                        h, pos, head_dim, kv_dim, n_attn_heads, n_kv_heads, seq_len,
-                                                        (p->sliding_window > 0 && l % 2 == 0) ? d_mask : nullptr);
+            PROFILE_KERNEL_LAUNCH("attention_scores_kernel", 
+                attention_scores_kernel<<<att_grid, block>>>(d_att, d_q, d_key_cache + loff,
+                                                            h, pos, head_dim, kv_dim, n_attn_heads, n_kv_heads, seq_len,
+                                                            (p->sliding_window > 0 && l % 2 == 0) ? d_mask : nullptr));
             
             // Add attention sink at correct position (pos + 1)
             float sink_val;
@@ -644,12 +657,14 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
             HIP_CHECK(hipMemcpy(d_att + h * seq_len + pos + 1, &sink_val, sizeof(float), hipMemcpyHostToDevice));
             
             // Softmax over pos+2 elements (0 to pos, plus sink at pos+1)
-            softmax_kernel<<<1, block>>>(d_att + h * seq_len, pos + 2);
+            PROFILE_KERNEL_LAUNCH("softmax_kernel", 
+                softmax_kernel<<<1, block>>>(d_att + h * seq_len, pos + 2));
             
             // Compute attention values
             dim3 val_grid((head_dim + block.x - 1) / block.x);
-            attention_values_kernel<<<val_grid, block>>>(d_tb, d_att, d_value_cache + loff,
-                                                        h, pos, head_dim, kv_dim, n_attn_heads, n_kv_heads, seq_len);
+            PROFILE_KERNEL_LAUNCH("attention_values_kernel", 
+                attention_values_kernel<<<val_grid, block>>>(d_tb, d_att, d_value_cache + loff,
+                                                            h, pos, head_dim, kv_dim, n_attn_heads, n_kv_heads, seq_len));
         }
         
         // Output projection
@@ -785,6 +800,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps) {
+    PROFILE_FUNCTION();
     const char *empty_prompt = "";
     if (input_seq == NULL) {
         input_seq = empty_prompt;
@@ -852,6 +868,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
+    PROFILE_FUNCTION();
     long long num_token_out = 0;
     
     for (int idx = 0; idx < requests->num_reqs; ++idx) {

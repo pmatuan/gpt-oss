@@ -19,6 +19,7 @@
 #endif
 
 #include "tokenizer.hpp"
+#include "profiler.h"
 
 // ----------------------------------------------------------------------------
 
@@ -1245,6 +1246,10 @@ int main(int argc, char **argv) {
   free_sampler(&sampler);
   free_tokenizer(&tokenizer);
   free_transformer(&transformer);
+  
+  // Print profiling summary
+  g_profiler.print_summary();
+  
   return 0;
 }
 
