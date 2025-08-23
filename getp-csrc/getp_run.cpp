@@ -780,7 +780,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   int num_prompt_tokens = 0;
   int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) * sizeof(int));
-  encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
+  encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
          transformer->config.initial_context_length);
   if (num_prompt_tokens < 1) {
     fprintf(stderr, "Expected at least 1 prompt token\n");
@@ -790,6 +790,13 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   int next;
   int token = prompt_tokens[0];
   int pos = 0;
+
+  // print the very first token
+  // should be removed
+  const char *first_piece = decode_piece(tokenizer, 200006, token);
+  safe_printf(first_piece);
+  fflush(stdout);
+  
   while (pos < steps) {
     float *d_log = gpu_forward(transformer, token, pos);
 
