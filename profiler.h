@@ -107,19 +107,19 @@ public:
                   });
         
         std::cout << "\n=== PROFILING SUMMARY ===\n";
-        std::cout << std::left << std::setw(25) << "Function" 
+        std::cout << std::left << std::setw(40) << "Function" 
                   << std::right << std::setw(12) << "Total (ms)" 
                   << std::setw(10) << "Calls" 
                   << std::setw(15) << "Average (ms)" << "\n";
-        std::cout << std::string(62, '-') << "\n";
+        std::cout << std::string(77, '-') << "\n";
         
         for (const auto& stat : sorted_stats) {
-            std::cout << std::left << std::setw(25) << stat.name
+            std::cout << std::left << std::setw(40) << stat.name
                       << std::right << std::setw(12) << std::fixed << std::setprecision(3) << stat.total_time_ms
                       << std::setw(10) << stat.call_count
                       << std::setw(15) << std::fixed << std::setprecision(3) << stat.average_time_ms << "\n";
         }
-        std::cout << std::string(62, '=') << "\n";
+        std::cout << std::string(77, '=') << "\n";
     }
 };
 
