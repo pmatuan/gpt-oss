@@ -1,5 +1,6 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -8,6 +9,11 @@
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+#define TK 128
+#define TM 4
+#define BLOCK_SIZE 256
+#define LDS_PAD 8
 
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \
@@ -18,6 +24,10 @@
       exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
+
+typedef struct __align__(2) {
+  uint16_t x;
+} bf16_t;
 
 static inline void debug_print_gpu_memory(const char *tag) {
   size_t free_b = 0, total_b = 0;
@@ -34,8 +44,6 @@ static inline void debug_print_gpu_memory(const char *tag) {
   fflush(stdout);
 }
 
-typedef uint16_t bf16_t;
-
 static inline bf16_t f32_to_bf16(float f) {
   union {
     float f;
@@ -45,15 +53,42 @@ static inline bf16_t f32_to_bf16(float f) {
   uint32_t lsb = (x >> 16) & 1;
   uint32_t rounding_bias = 0x00007FFF + lsb;
   x += rounding_bias;
-  bf16_t h = (bf16_t)(x >> 16);
-  return h;
+  bf16_t result;
+  result.x = (uint16_t)(x >> 16);
+  return result;
 }
 
-__device__ __forceinline__ float bf16_to_f32(bf16_t h) {
-  uint32_t x = ((uint32_t)h) << 16;
-  float f = __uint_as_float(x);
-  return f;
+__device__ __forceinline__ float bf16_to_f32(bf16_t val) {
+  union {
+    float f;
+    uint32_t i;
+  } u;
+  u.i = ((uint32_t)val.x) << 16;
+  return u.f;
 }
+
+__device__ __forceinline__ float4 load_bf16x8_to_float4(const bf16_t *ptr) {
+  uint4 bf16_data = *((uint4 *)ptr);
+  float4 result;
+  result.x = bf16_to_f32(*(bf16_t *)&bf16_data.x);
+  result.y = bf16_to_f32(*((bf16_t *)&bf16_data.x + 1));
+  result.z = bf16_to_f32(*(bf16_t *)&bf16_data.y);
+  result.w = bf16_to_f32(*((bf16_t *)&bf16_data.y + 1));
+  return result;
+}
+
+__device__ __forceinline__ float4
+load_bf16x8_to_float4_offset4(const bf16_t *ptr) {
+  uint4 bf16_data = *((uint4 *)ptr);
+  float4 result;
+  result.x = bf16_to_f32(*(bf16_t *)&bf16_data.z);
+  result.y = bf16_to_f32(*((bf16_t *)&bf16_data.z + 1));
+  result.z = bf16_to_f32(*(bf16_t *)&bf16_data.w);
+  result.w = bf16_to_f32(*((bf16_t *)&bf16_data.w + 1));
+  return result;
+}
+
+inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 // Global GPU Buffers
 // Activations / temporaries (FP32)
@@ -332,28 +367,144 @@ __global__ void memset_zero_kernel(float *ptr, int size) {
 // Matmul: W(d,n)[bf16] @ x(n)[f32] -> y(d)[f32]; FP32 accumulate
 __global__ void matmul_bf16_wxf32_yf32(float *y, const float *x,
                                        const bf16_t *w, int n, int d) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x; // 0..d-1
-  if (row >= d)
+
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  int tid = threadIdx.x;
+  int bid = blockIdx.x;
+  int wid = tid / BLOCK_SIZE;
+  int lid = tid % BLOCK_SIZE;
+
+  int row_start = bid * TM;
+  if (row_start >= d)
     return;
-  const bf16_t *wrow = w + (size_t)row * n;
-  float acc = 0.0f;
-  for (int j = 0; j < n; ++j) {
-    acc += bf16_to_f32(wrow[j]) * x[j];
+
+  float acc[TM] = {0.0f};
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    int k_end = min(k_base + TK, n);
+    int k_size = k_end - k_base;
+
+    for (int i = tid; i < k_size; i += BLOCK_SIZE) {
+      if (k_base + i < n) {
+        lds_x[i] = x[k_base + i];
+      } else {
+        lds_x[i] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    for (int tm = 0; tm < TM; ++tm) {
+      int row = row_start + tm;
+      if (row >= d)
+        break;
+
+      const bf16_t *w_row = &w[row * n + k_base];
+      float row_acc = 0.0f;
+
+#pragma unroll 8
+      for (int k = lid * 8; k < k_size; k += 64 * 8) {
+        if (k + 7 < k_size) {
+          float4 w_vec1 = load_bf16x8_to_float4(&w_row[k]);
+          float4 w_vec2 = load_bf16x8_to_float4_offset4(&w_row[k]);
+
+          float4 x_vec1 = *((float4 *)&lds_x[k]);
+          float4 x_vec2 = *((float4 *)&lds_x[k + 4]);
+
+          row_acc += w_vec1.x * x_vec1.x + w_vec1.y * x_vec1.y +
+                     w_vec1.z * x_vec1.z + w_vec1.w * x_vec1.w +
+                     w_vec2.x * x_vec2.x + w_vec2.y * x_vec2.y +
+                     w_vec2.z * x_vec2.z + w_vec2.w * x_vec2.w;
+        }
+      }
+
+#pragma unroll
+      for (int offset = 32; offset > 0; offset >>= 1) {
+        row_acc += __shfl_down(row_acc, offset);
+      }
+
+      acc[tm] += row_acc;
+    }
+    __syncthreads();
   }
-  y[row] = acc;
+
+  if (lid == 0) {
+    for (int tm = 0; tm < TM; ++tm) {
+      int row = row_start + tm;
+      if (row < d) {
+        y[row] = acc[tm];
+      }
+    }
+  }
 }
 
-// Minimal FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
+// FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
 __global__ void matmul_f32_wxf32_yf32(float *y, const float *x, const float *w,
                                       int n, int d) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= d)
+
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  int tid = threadIdx.x;
+  int bid = blockIdx.x;
+  int wid = tid / BLOCK_SIZE;
+  int lid = tid % BLOCK_SIZE;
+
+  int row_start = bid * TM;
+  if (row_start >= d)
     return;
-  const float *wr = w + (size_t)row * n;
-  float acc = 0.0f;
-  for (int j = 0; j < n; ++j)
-    acc += wr[j] * x[j];
-  y[row] = acc;
+
+  float acc[TM] = {0.0f};
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    int k_end = min(k_base + TK, n);
+    int k_size = k_end - k_base;
+
+    for (int i = tid; i < k_size; i += BLOCK_SIZE) {
+      if (k_base + i < n) {
+        lds_x[i] = x[k_base + i];
+      } else {
+        lds_x[i] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    for (int tm = 0; tm < TM; ++tm) {
+      int row = row_start + tm;
+      if (row >= d)
+        break;
+
+      const float *w_row = &w[row * n + k_base];
+      float row_acc = 0.0f;
+
+#pragma unroll 8
+      for (int k = lid * 4; k < k_size; k += 64 * 4) {
+        if (k + 3 < k_size) {
+          float4 w_vec = *((float4 *)&w_row[k]);
+          float4 x_vec = *((float4 *)&lds_x[k]);
+
+          row_acc += w_vec.x * x_vec.x + w_vec.y * x_vec.y + w_vec.z * x_vec.z +
+                     w_vec.w * x_vec.w;
+        }
+      }
+
+#pragma unroll
+      for (int offset = 32; offset > 0; offset >>= 1) {
+        row_acc += __shfl_down(row_acc, offset);
+      }
+
+      acc[tm] += row_acc;
+    }
+    __syncthreads();
+  }
+
+  if (lid == 0) {
+    for (int tm = 0; tm < TM; ++tm) {
+      int row = row_start + tm;
+      if (row < d) {
+        y[row] = acc[tm];
+      }
+    }
+  }
 }
 
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
@@ -578,8 +729,9 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   const int E = p->n_experts;
   const int S = p->seq_len;
 
-  dim3 block(256);
-  dim3 gridH((H + block.x - 1) / block.x);
+  // Use optimized launch configurations
+  dim3 block = dim3(BLOCK_SIZE, 1, 1);
+  dim3 gridH = get_gemv_grid_dim(H);
 
   // x <- embedding[token] (BF16 -> FP32)
   PROFILE_KERNEL_LAUNCH("copy_embedding_bf16_row_kernel",
@@ -588,20 +740,21 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
   for (int l = 0; l < p->n_layers; ++l) {
     // RMSNorm (attn)
-    PROFILE_KERNEL_LAUNCH("rmsnorm_kernel(attn)",
-                          rmsnorm_kernel<<<1, 256, 256 * sizeof(double)>>>(
-                              d_t, d_x, d_rms_attn_w + l * H, H));
+    PROFILE_KERNEL_LAUNCH(
+        "rmsnorm_kernel(attn)",
+        rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
+            d_t, d_x, d_rms_attn_w + l * H, H));
 
     // QKV
     const int QKV_D = D * (Hq + 2 * Hk);
-    dim3 gridQKV((QKV_D + block.x - 1) / block.x);
+    dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH(
         "matmul_bf16_wxf32_yf32(QKV)",
         matmul_bf16_wxf32_yf32<<<gridQKV, block>>>(
             d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, H, QKV_D));
-    PROFILE_KERNEL_LAUNCH(
-        "add_bias_kernel(b_qkv)",
-        add_bias_kernel<<<gridQKV, block>>>(d_qkv, d_b_qkv + l * QKV_D, QKV_D));
+    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_qkv)",
+                          add_bias_kernel<<<get_gemv_grid_dim(QKV_D), block>>>(
+                              d_qkv, d_b_qkv + l * QKV_D, QKV_D));
 
     PROFILE_KERNEL_LAUNCH(
         "split_qkv_kernel",
@@ -644,9 +797,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
       HIP_CHECK(hipMemcpy(d_att + h * S + pos + 1, &sink_val, sizeof(float),
                           hipMemcpyHostToDevice));
 
-      PROFILE_KERNEL_LAUNCH("softmax_kernel(att)",
-                            softmax_kernel<<<1, 256, 256 * sizeof(float)>>>(
-                                d_att + h * S, pos + 2));
+      PROFILE_KERNEL_LAUNCH(
+          "softmax_kernel(att)",
+          softmax_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+              d_att + h * S, pos + 2));
 
       dim3 gridVal((D + block.x - 1) / block.x);
       PROFILE_KERNEL_LAUNCH(
@@ -656,24 +810,25 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     }
 
     const int O_N = D * Hq;
-    dim3 gridO((H + block.x - 1) / block.x);
+    dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH(
         "matmul_bf16_wxf32_yf32(W_o)",
         matmul_bf16_wxf32_yf32<<<gridO, block>>>(
             d_tb2, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, O_N, H));
-    PROFILE_KERNEL_LAUNCH(
-        "add_bias_kernel(b_o)",
-        add_bias_kernel<<<gridO, block>>>(d_tb2, d_b_o + l * H, H));
+    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_o)",
+                          add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
+                              d_tb2, d_b_o + l * H, H));
     PROFILE_KERNEL_LAUNCH("residual_add_kernel(attn)",
                           residual_add_kernel<<<gridH, block>>>(d_x, d_tb2, H));
 
     // FFN RMSNorm
-    PROFILE_KERNEL_LAUNCH("rmsnorm_kernel(ffn)",
-                          rmsnorm_kernel<<<1, 256, 256 * sizeof(double)>>>(
-                              d_t, d_x, d_rms_ffn_w + l * H, H));
+    PROFILE_KERNEL_LAUNCH(
+        "rmsnorm_kernel(ffn)",
+        rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
+            d_t, d_x, d_rms_ffn_w + l * H, H));
 
     // Router FP32: d_router_score(E) = W_router(E,H) @ d_t(H)
-    dim3 gridE((E + block.x - 1) / block.x);
+    dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH(
         "matmul_f32_wxf32_yf32(router)",
         matmul_f32_wxf32_yf32<<<gridE, block>>>(
@@ -687,9 +842,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                           topk_kernel_1token<<<1, 1>>>(d_topk_v, d_topk_i,
                                                        d_router_score, E,
                                                        p->experts_per_token));
-    PROFILE_KERNEL_LAUNCH("softmax_kernel(topk)",
-                          softmax_kernel<<<1, 256, 256 * sizeof(float)>>>(
-                              d_topk_v, p->experts_per_token));
+    PROFILE_KERNEL_LAUNCH(
+        "softmax_kernel(topk)",
+        softmax_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+            d_topk_v, p->experts_per_token));
 
     // Aggregate experts
     PROFILE_KERNEL_LAUNCH("memset_zero_kernel(e_agg)",
@@ -709,7 +865,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
       float ew = h_topk_v[kk];
       // MLP1: (2IM x H) @ d_t
       size_t off = ((size_t)l * E + e) * (size_t)(2 * IM) * (size_t)H;
-      dim3 gridM1((2 * IM + block.x - 1) / block.x);
+      dim3 gridM1 = get_gemv_grid_dim(2 * IM);
       PROFILE_KERNEL_LAUNCH(
           "matmul_bf16_wxf32_yf32(MLP1)",
           matmul_bf16_wxf32_yf32<<<gridM1, block>>>(
@@ -717,9 +873,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
       // Add bias b_mlp1
       size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
-      PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_mlp1)",
-                            add_bias_kernel<<<gridM1, block>>>(
-                                d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
+      PROFILE_KERNEL_LAUNCH(
+          "add_bias_kernel(b_mlp1)",
+          add_bias_kernel<<<get_gemv_grid_dim(2 * IM), block>>>(
+              d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
 
       // Split & SwiGLU
       dim3 gridIM((IM + block.x - 1) / block.x);
@@ -732,15 +889,16 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
       // MLP2: (H x IM) @ gate_up
       off = ((size_t)l * E + e) * (size_t)H * (size_t)IM;
-      PROFILE_KERNEL_LAUNCH("matmul_bf16_wxf32_yf32(MLP2)",
-                            matmul_bf16_wxf32_yf32<<<gridH, block>>>(
-                                d_tb2, d_gate_up, d_w_mlp2_bf16 + off, IM, H));
+      PROFILE_KERNEL_LAUNCH(
+          "matmul_bf16_wxf32_yf32(MLP2)",
+          matmul_bf16_wxf32_yf32<<<get_gemv_grid_dim(H), block>>>(
+              d_tb2, d_gate_up, d_w_mlp2_bf16 + off, IM, H));
 
       // Add b_mlp2, then weighted sum into e_agg
       size_t b2off = ((size_t)l * E + e) * (size_t)H;
-      PROFILE_KERNEL_LAUNCH(
-          "add_bias_kernel(b_mlp2)",
-          add_bias_kernel<<<gridH, block>>>(d_tb2, g_b_mlp2 + b2off, H));
+      PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_mlp2)",
+                            add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
+                                d_tb2, g_b_mlp2 + b2off, H));
       PROFILE_KERNEL_LAUNCH(
           "weighted_sum_kernel",
           weighted_sum_kernel<<<gridH, block>>>(d_e_agg, d_tb2, ew, H));
@@ -755,14 +913,15 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   }
 
   // Final RMSNorm
-  PROFILE_KERNEL_LAUNCH("rmsnorm_kernel(final)",
-                        rmsnorm_kernel<<<1, 256, 256 * sizeof(double)>>>(
-                            d_t, d_x, d_rms_out_w, H));
+  PROFILE_KERNEL_LAUNCH(
+      "rmsnorm_kernel(final)",
+      rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
+          d_t, d_x, d_rms_out_w, H));
   HIP_CHECK(hipMemcpy(d_x, d_t, H * sizeof(float), hipMemcpyDeviceToDevice));
 
   // LM head: (V x H) @ x -> logits(V)
   const int V = p->vocab_size;
-  dim3 gridV((V + block.x - 1) / block.x);
+  dim3 gridV = get_gemv_grid_dim(V);
   PROFILE_KERNEL_LAUNCH("matmul_bf16_wxf32_yf32(OUT)",
                         matmul_bf16_wxf32_yf32<<<gridV, block>>>(
                             d_logits, d_x, d_out_bf16, H, V));
@@ -796,7 +955,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   const char *first_piece = decode_piece(tokenizer, 200006, token);
   safe_printf(first_piece);
   fflush(stdout);
-  
+
   while (pos < steps) {
     float *d_log = gpu_forward(transformer, token, pos);
 
