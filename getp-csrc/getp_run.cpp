@@ -14,6 +14,7 @@
 #define TM 4
 #define BLOCK_SIZE 256
 #define LDS_PAD 8
+#define WF_SIZE 64
 
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \
@@ -65,27 +66,6 @@ __device__ __forceinline__ float bf16_to_f32(bf16_t val) {
   } u;
   u.i = ((uint32_t)val.x) << 16;
   return u.f;
-}
-
-__device__ __forceinline__ float4 load_bf16x8_to_float4(const bf16_t *ptr) {
-  uint4 bf16_data = *((uint4 *)ptr);
-  float4 result;
-  result.x = bf16_to_f32(*(bf16_t *)&bf16_data.x);
-  result.y = bf16_to_f32(*((bf16_t *)&bf16_data.x + 1));
-  result.z = bf16_to_f32(*(bf16_t *)&bf16_data.y);
-  result.w = bf16_to_f32(*((bf16_t *)&bf16_data.y + 1));
-  return result;
-}
-
-__device__ __forceinline__ float4
-load_bf16x8_to_float4_offset4(const bf16_t *ptr) {
-  uint4 bf16_data = *((uint4 *)ptr);
-  float4 result;
-  result.x = bf16_to_f32(*(bf16_t *)&bf16_data.z);
-  result.y = bf16_to_f32(*((bf16_t *)&bf16_data.z + 1));
-  result.z = bf16_to_f32(*(bf16_t *)&bf16_data.w);
-  result.w = bf16_to_f32(*((bf16_t *)&bf16_data.w + 1));
-  return result;
 }
 
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
@@ -365,146 +345,123 @@ __global__ void memset_zero_kernel(float *ptr, int size) {
 }
 
 // Matmul: W(d,n)[bf16] @ x(n)[f32] -> y(d)[f32]; FP32 accumulate
-__global__ void matmul_bf16_wxf32_yf32(float *y, const float *x,
-                                       const bf16_t *w, int n, int d) {
-
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
+                                       const float * __restrict__ x,
+                                       const bf16_t * __restrict__ w,
+                                       int n, int d) {
   __shared__ float lds_x[TK + LDS_PAD];
 
-  int tid = threadIdx.x;
-  int bid = blockIdx.x;
-  int wid = tid / BLOCK_SIZE;
-  int lid = tid % BLOCK_SIZE;
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;               // wave id in block: 0..TM-1
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
 
-  int row_start = bid * TM;
-  if (row_start >= d)
-    return;
-
-  float acc[TM] = {0.0f};
+  float acc_all = 0.0f;
 
   for (int k_base = 0; k_base < n; k_base += TK) {
-    int k_end = min(k_base + TK, n);
-    int k_size = k_end - k_base;
+    const int k_size = min(TK, n - k_base);
 
-    for (int i = tid; i < k_size; i += BLOCK_SIZE) {
-      if (k_base + i < n) {
-        lds_x[i] = x[k_base + i];
-      } else {
-        lds_x[i] = 0.0f;
-      }
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
     }
     __syncthreads();
 
-    for (int tm = 0; tm < TM; ++tm) {
-      int row = row_start + tm;
-      if (row >= d)
-        break;
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
 
-      const bf16_t *w_row = &w[row * n + k_base];
-      float row_acc = 0.0f;
+    float acc = 0.0f;
+    int k = lane << 1;
+    const uint32_t* __restrict__ w32 = reinterpret_cast<const uint32_t*>(w_row);
 
-#pragma unroll 8
-      for (int k = lid * 8; k < k_size; k += 64 * 8) {
-        if (k + 7 < k_size) {
-          float4 w_vec1 = load_bf16x8_to_float4(&w_row[k]);
-          float4 w_vec2 = load_bf16x8_to_float4_offset4(&w_row[k]);
-
-          float4 x_vec1 = *((float4 *)&lds_x[k]);
-          float4 x_vec2 = *((float4 *)&lds_x[k + 4]);
-
-          row_acc += w_vec1.x * x_vec1.x + w_vec1.y * x_vec1.y +
-                     w_vec1.z * x_vec1.z + w_vec1.w * x_vec1.w +
-                     w_vec2.x * x_vec2.x + w_vec2.y * x_vec2.y +
-                     w_vec2.z * x_vec2.z + w_vec2.w * x_vec2.w;
-        }
-      }
-
-#pragma unroll
-      for (int offset = 32; offset > 0; offset >>= 1) {
-        row_acc += __shfl_down(row_acc, offset);
-      }
-
-      acc[tm] += row_acc;
+    // vectorized loop: 2 elems per step, step over wave by 2*64
+    for (; (k + 1) < k_size; k += (WF_SIZE << 1)) {
+      // each packed = [hi:bf16(k+1) | lo:bf16(k)]
+      uint32_t packed = w32[k >> 1];
+      bf16_t bf16_0, bf16_1;
+      bf16_0.x = (uint16_t)(packed & 0xFFFF);
+      bf16_1.x = (uint16_t)(packed >> 16);
+      float wx0 = bf16_to_f32(bf16_0);
+      float wx1 = bf16_to_f32(bf16_1);
+      // FMA with cached x
+      acc = fmaf(wx0, lds_x[k], acc);
+      acc = fmaf(wx1, lds_x[k + 1], acc);
     }
+
+    // tail (odd leftover)
+    if (k < k_size) {
+      uint16_t h = reinterpret_cast<const uint16_t*>(w_row)[k];
+      bf16_t bf16_h;
+      bf16_h.x = h;
+      acc = fmaf(bf16_to_f32(bf16_h), lds_x[k], acc);
+    }
+
+    // Wave reduction (width = 64)
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
     __syncthreads();
   }
 
-  if (lid == 0) {
-    for (int tm = 0; tm < TM; ++tm) {
-      int row = row_start + tm;
-      if (row < d) {
-        y[row] = acc[tm];
-      }
-    }
-  }
+  if (lane == 0) y[row] = acc_all;
 }
 
 // FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
-__global__ void matmul_f32_wxf32_yf32(float *y, const float *x, const float *w,
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
+                                      const float * __restrict__ x,
+                                      const float * __restrict__ w,
                                       int n, int d) {
-
   __shared__ float lds_x[TK + LDS_PAD];
 
-  int tid = threadIdx.x;
-  int bid = blockIdx.x;
-  int wid = tid / BLOCK_SIZE;
-  int lid = tid % BLOCK_SIZE;
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
 
-  int row_start = bid * TM;
-  if (row_start >= d)
-    return;
-
-  float acc[TM] = {0.0f};
+  float acc_all = 0.0f;
 
   for (int k_base = 0; k_base < n; k_base += TK) {
-    int k_end = min(k_base + TK, n);
-    int k_size = k_end - k_base;
+    const int k_size = min(TK, n - k_base);
 
-    for (int i = tid; i < k_size; i += BLOCK_SIZE) {
-      if (k_base + i < n) {
-        lds_x[i] = x[k_base + i];
-      } else {
-        lds_x[i] = 0.0f;
-      }
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
     }
     __syncthreads();
 
-    for (int tm = 0; tm < TM; ++tm) {
-      int row = row_start + tm;
-      if (row >= d)
-        break;
+    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
 
-      const float *w_row = &w[row * n + k_base];
-      float row_acc = 0.0f;
+    float acc = 0.0f;
+    int k = lane;
 
-#pragma unroll 8
-      for (int k = lid * 4; k < k_size; k += 64 * 4) {
-        if (k + 3 < k_size) {
-          float4 w_vec = *((float4 *)&w_row[k]);
-          float4 x_vec = *((float4 *)&lds_x[k]);
-
-          row_acc += w_vec.x * x_vec.x + w_vec.y * x_vec.y + w_vec.z * x_vec.z +
-                     w_vec.w * x_vec.w;
-        }
+    uintptr_t base = reinterpret_cast<uintptr_t>(w_row);
+    if ((((base + sizeof(float)*k) & 0xF) == 0)) {
+      for (; (k + 3) < k_size; k += (WF_SIZE << 2)) {
+        float4 wv = *reinterpret_cast<const float4*>(&w_row[k]);
+        float4 xv = *reinterpret_cast<const float4*>(&lds_x[k]);
+        acc = fmaf(wv.x, xv.x, acc);
+        acc = fmaf(wv.y, xv.y, acc);
+        acc = fmaf(wv.z, xv.z, acc);
+        acc = fmaf(wv.w, xv.w, acc);
       }
-
-#pragma unroll
-      for (int offset = 32; offset > 0; offset >>= 1) {
-        row_acc += __shfl_down(row_acc, offset);
-      }
-
-      acc[tm] += row_acc;
     }
+
+    for (; k < k_size; k += WF_SIZE) {
+      acc = fmaf(w_row[k], lds_x[k], acc);
+    }
+
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
     __syncthreads();
   }
 
-  if (lid == 0) {
-    for (int tm = 0; tm < TM; ++tm) {
-      int row = row_start + tm;
-      if (row < d) {
-        y[row] = acc[tm];
-      }
-    }
-  }
+  if (lane == 0) y[row] = acc_all;
 }
 
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
