@@ -1,6 +1,7 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -26,9 +27,7 @@
     }                                                                          \
   } while (0)
 
-typedef struct __align__(2) {
-  uint16_t x;
-} bf16_t;
+typedef __hip_bfloat16 bf16_t;
 
 static inline void debug_print_gpu_memory(const char *tag) {
   size_t free_b = 0, total_b = 0;
@@ -46,26 +45,11 @@ static inline void debug_print_gpu_memory(const char *tag) {
 }
 
 static inline bf16_t f32_to_bf16(float f) {
-  union {
-    float f;
-    uint32_t u;
-  } v = {f};
-  uint32_t x = v.u;
-  uint32_t lsb = (x >> 16) & 1;
-  uint32_t rounding_bias = 0x00007FFF + lsb;
-  x += rounding_bias;
-  bf16_t result;
-  result.x = (uint16_t)(x >> 16);
-  return result;
+  return __hip_bfloat16(f);
 }
 
 __device__ __forceinline__ float bf16_to_f32(bf16_t val) {
-  union {
-    float f;
-    uint32_t i;
-  } u;
-  u.i = ((uint32_t)val.x) << 16;
-  return u.f;
+  return __bfloat162float(val);
 }
 
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
@@ -120,44 +104,40 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
   double inv = rsqrt(s_rms[0] / (double)size + 1e-5);
 
   // Apply scale
+  // TODO: can be optimize
   for (int i = threadIdx.x; i < size; i += blockDim.x) {
     o[i] = weight[i] * (float)(inv * (double)x[i]);
   }
 }
 
 __global__ void softmax_kernel(float *x, int size) {
-  extern __shared__ float s_soft[]; // reuse: reduction buffer
-  float maxv = -INFINITY;
-  for (int i = threadIdx.x; i < size; i += blockDim.x) {
-    maxv = fmaxf(maxv, x[i]);
+  // Single-threaded sequential implementation to match CPU exactly
+  if (threadIdx.x == 0) {
+    // Find max value (sequential like CPU)
+    double max_val = (double)x[0];
+    for (int i = 1; i < size; i++) {
+      double v = (double)x[i];
+      if (v > max_val) {
+        max_val = v;
+      }
+    }
+    
+    // Exp and sum (sequential like CPU)
+    double sum = 0.0;
+    for (int i = 0; i < size; i++) {
+      float ev = expf((float)((double)x[i] - max_val));
+      x[i] = ev;
+      sum += (double)ev;
+    }
+    
+    // Normalize (sequential like CPU)
+    double inv_sum = 1.0 / sum;
+    for (int i = 0; i < size; i++) {
+      x[i] = (float)((double)x[i] * inv_sum);
+    }
   }
-  s_soft[threadIdx.x] = maxv;
-  __syncthreads();
-  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-    if (threadIdx.x < s)
-      s_soft[threadIdx.x] = fmaxf(s_soft[threadIdx.x], s_soft[threadIdx.x + s]);
-    __syncthreads();
-  }
-  maxv = s_soft[0];
-
-  double sum = 0.0;
-  for (int i = threadIdx.x; i < size; i += blockDim.x) {
-    float v = expf(x[i] - maxv);
-    x[i] = v;
-    sum += v;
-  }
-  // reduce sum
-  s_soft[threadIdx.x] = (float)sum;
-  __syncthreads();
-  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-    if (threadIdx.x < s)
-      s_soft[threadIdx.x] += s_soft[threadIdx.x + s];
-    __syncthreads();
-  }
-  float inv = 1.0f / s_soft[0];
-  for (int i = threadIdx.x; i < size; i += blockDim.x)
-    x[i] *= inv;
 }
+
 
 __global__ void add_bias_kernel(float *y, const float *b, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -239,42 +219,64 @@ __global__ void compute_cos_sin_kernel(float *cosv, float *sinv, int pos,
   sinv[i] = sinf(val) * concentration;
 }
 
-// Attention score for head h
-__global__ void attention_scores_kernel(float *att, const float *q,
-                                        const float *key_cache, int h, int pos,
-                                        int head_dim, int kv_dim,
-                                        int n_attn_heads, int n_kv_heads,
-                                        int seq_len, const float *mask) {
+__global__ void attention_scores_kernel(
+    float *att,
+    const float *q,
+    const float *key_cache,
+    int h, int pos,
+    int head_dim, int kv_dim,
+    int n_attn_heads, int n_kv_heads,
+    int seq_len, const float *mask) {
+
   int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t > pos)
-    return;
-  int kv_mul = n_attn_heads / n_kv_heads;
-  const float *k = key_cache + t * kv_dim + (h / kv_mul) * head_dim;
-  float score = 0.0f;
-  for (int i = 0; i < head_dim; ++i)
-    score += q[h * head_dim + i] * k[i];
-  score *= rsqrtf((float)head_dim);
-  if (mask)
-    score += mask[pos * seq_len + t];
-  att[h * seq_len + t] = score;
+  if (t > pos || t >= seq_len) return;
+
+  const int kv_mul = n_attn_heads / n_kv_heads;
+  const float *k = key_cache + (size_t)t * kv_dim + (h / kv_mul) * head_dim;
+
+  double acc = 0.0;
+  const float *qh = q + (size_t)h * head_dim;
+  #pragma unroll
+  for (int i = 0; i < head_dim; ++i) {
+    acc += (double)qh[i] * (double)k[i];
+  }
+
+  const double scale = 1.0 / sqrt((double)head_dim);
+  double score = acc * scale;
+
+  if (mask) {
+    score += (double)mask[(size_t)pos * seq_len + t];
+  }
+
+  att[(size_t)h * seq_len + t] = (float)score;
 }
 
-__global__ void attention_values_kernel(float *tb, const float *att,
-                                        const float *value_cache, int h,
-                                        int pos, int head_dim, int kv_dim,
-                                        int n_attn_heads, int n_kv_heads,
-                                        int seq_len) {
+__global__ void attention_values_kernel(
+    float *tb,
+    const float *att,
+    const float *value_cache,
+    int h, int pos,
+    int head_dim, int kv_dim,
+    int n_attn_heads, int n_kv_heads,
+    int seq_len) {
+
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= head_dim)
-    return;
-  float res = 0.0f;
-  int kv_mul = n_attn_heads / n_kv_heads;
+  if (i >= head_dim) return;
+
+  const int kv_mul = n_attn_heads / n_kv_heads;
+  const int base_v = (h / kv_mul) * head_dim;
+
+  double acc = 0.0;
+  const float *att_h = att + (size_t)h * seq_len;
+
   for (int t = 0; t <= pos; ++t) {
-    const float *v = value_cache + t * kv_dim + (h / kv_mul) * head_dim;
-    res += att[h * seq_len + t] * v[i];
+    const float *v = value_cache + (size_t)t * kv_dim + base_v;
+    acc += (double)att_h[t] * (double)v[i];
   }
-  tb[h * head_dim + i] = res;
+
+  tb[(size_t)h * head_dim + i] = (float)acc;
 }
+
 
 __global__ void residual_add_kernel(float *x, const float *residual, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -282,26 +284,57 @@ __global__ void residual_add_kernel(float *x, const float *residual, int size) {
     x[i] += residual[i];
 }
 
+// Pair struct for GPU sorting (matching CPU implementation)
+typedef struct {
+  float value;
+  int index;
+} GPUPair;
+
+// Comparison function for GPU qsort (descending order)
+__device__ int gpu_compare_desc(const void *a, const void *b) {
+  const GPUPair *pa = (const GPUPair *)a;
+  const GPUPair *pb = (const GPUPair *)b;
+  if (pb->value > pa->value) return 1;
+  if (pb->value < pa->value) return -1;
+  return 0;
+}
+
+// GPU sorting function using bubble sort (since qsort not available on device)
+__device__ void gpu_sort_pairs(GPUPair *pairs, int n) {
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (pairs[j].value < pairs[j + 1].value) {
+        GPUPair temp = pairs[j];
+        pairs[j] = pairs[j + 1];
+        pairs[j + 1] = temp;
+      }
+    }
+  }
+}
+
 __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
                                    const float *router_score, int num_experts,
                                    int experts_per_token) {
-  for (int k = 0; k < experts_per_token; ++k) {
-    float max_val = -INFINITY;
-    int max_idx = 0;
-    for (int i = 0; i < num_experts; ++i) {
-      bool used = false;
-      for (int j = 0; j < k; ++j)
-        if (topk_indices[j] == i) {
-          used = true;
-          break;
-        }
-      if (!used && router_score[i] > max_val) {
-        max_val = router_score[i];
-        max_idx = i;
-      }
-    }
-    topk_values[k] = max_val;
-    topk_indices[k] = max_idx;
+  // Allocate shared memory for pairs (assuming small number of experts)
+  extern __shared__ GPUPair pairs[];
+  
+  // Copy router scores to pairs array
+  for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
+    pairs[i].value = router_score[i];
+    pairs[i].index = i;
+  }
+  __syncthreads();
+  
+  // Sort pairs in descending order (only thread 0 does the sorting)
+  if (threadIdx.x == 0) {
+    gpu_sort_pairs(pairs, num_experts);
+  }
+  __syncthreads();
+  
+  // Extract top-k results
+  for (int i = threadIdx.x; i < experts_per_token; i += blockDim.x) {
+    topk_values[i] = pairs[i].value;
+    topk_indices[i] = pairs[i].index;
   }
 }
 
@@ -322,8 +355,12 @@ __global__ void swiglu_kernel(float *gate_up, const float *gate,
   if (i < intermediate_dim) {
     float g = gate[i];
     float u = up[i];
-    g = fminf(fmaxf(g, -swiglu_limit), swiglu_limit);
-    u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+    // Clamping to match CPU behavior:
+    // gate: only upper bound (positive direction)
+    if (g > swiglu_limit) g = swiglu_limit;
+    // up: both directions (±limit)
+    if (u > swiglu_limit) u = swiglu_limit;
+    if (u < -swiglu_limit) u = -swiglu_limit;
     const float alpha = 1.702f; // SiLU approx
     g *= (1.0f / (1.0f + expf(-alpha * g)));
     g *= (u + 1.0f);
@@ -358,7 +395,7 @@ __global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
   const int row  = blockIdx.x * TM + wid;
   if (wid >= TM || row >= d) return;
 
-  float acc_all = 0.0f;
+  double acc_all = 0.0;  // Use double precision like CPU
 
   for (int k_base = 0; k_base < n; k_base += TK) {
     const int k_size = min(TK, n - k_base);
@@ -370,33 +407,17 @@ __global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
 
     const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
 
-    float acc = 0.0f;
-    int k = lane << 1;
-    const uint32_t* __restrict__ w32 = reinterpret_cast<const uint32_t*>(w_row);
-
-    // vectorized loop: 2 elems per step, step over wave by 2*64
-    for (; (k + 1) < k_size; k += (WF_SIZE << 1)) {
-      // each packed = [hi:bf16(k+1) | lo:bf16(k)]
-      uint32_t packed = w32[k >> 1];
-      bf16_t bf16_0, bf16_1;
-      bf16_0.x = (uint16_t)(packed & 0xFFFF);
-      bf16_1.x = (uint16_t)(packed >> 16);
-      float wx0 = bf16_to_f32(bf16_0);
-      float wx1 = bf16_to_f32(bf16_1);
-      // FMA with cached x
-      acc = fmaf(wx0, lds_x[k], acc);
-      acc = fmaf(wx1, lds_x[k + 1], acc);
+    double acc = 0.0;  // Use double precision like CPU
+    
+    // Direct bf16 operations without casting
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      bf16_t bf16_val = w_row[k];
+      double wx = (double)bf16_to_f32(bf16_val);
+      double xval = (double)lds_x[k];
+      acc += wx * xval;  // Double precision accumulation
     }
 
-    // tail (odd leftover)
-    if (k < k_size) {
-      uint16_t h = reinterpret_cast<const uint16_t*>(w_row)[k];
-      bf16_t bf16_h;
-      bf16_h.x = h;
-      acc = fmaf(bf16_to_f32(bf16_h), lds_x[k], acc);
-    }
-
-    // Wave reduction (width = 64)
+    // Wave reduction (width = 64) with double precision
     for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
       acc += __shfl_down(acc, off, WF_SIZE);
     }
@@ -405,7 +426,7 @@ __global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
     __syncthreads();
   }
 
-  if (lane == 0) y[row] = acc_all;
+  if (lane == 0) y[row] = (float)acc_all;  // Convert back to float for output
 }
 
 // FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
@@ -422,7 +443,7 @@ __global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
   const int row  = blockIdx.x * TM + wid;
   if (wid >= TM || row >= d) return;
 
-  float acc_all = 0.0f;
+  double acc_all = 0.0;  // Use double precision like CPU
 
   for (int k_base = 0; k_base < n; k_base += TK) {
     const int k_size = min(TK, n - k_base);
@@ -434,23 +455,14 @@ __global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
 
     const float* __restrict__ w_row = w + (size_t)row * n + k_base;
 
-    float acc = 0.0f;
+    double acc = 0.0;  // Use double precision like CPU
     int k = lane;
 
-    uintptr_t base = reinterpret_cast<uintptr_t>(w_row);
-    if ((((base + sizeof(float)*k) & 0xF) == 0)) {
-      for (; (k + 3) < k_size; k += (WF_SIZE << 2)) {
-        float4 wv = *reinterpret_cast<const float4*>(&w_row[k]);
-        float4 xv = *reinterpret_cast<const float4*>(&lds_x[k]);
-        acc = fmaf(wv.x, xv.x, acc);
-        acc = fmaf(wv.y, xv.y, acc);
-        acc = fmaf(wv.z, xv.z, acc);
-        acc = fmaf(wv.w, xv.w, acc);
-      }
-    }
-
+    // Simplified loop for double precision accumulation
     for (; k < k_size; k += WF_SIZE) {
-      acc = fmaf(w_row[k], lds_x[k], acc);
+      double wval = (double)w_row[k];
+      double xval = (double)lds_x[k];
+      acc += wval * xval;  // Double precision accumulation
     }
 
     for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
@@ -461,7 +473,7 @@ __global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
     __syncthreads();
   }
 
-  if (lane == 0) y[row] = acc_all;
+  if (lane == 0) y[row] = (float)acc_all;  // Convert back to float for output
 }
 
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
@@ -756,7 +768,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
       PROFILE_KERNEL_LAUNCH(
           "softmax_kernel(att)",
-          softmax_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+          softmax_kernel<<<1, 1>>>(
               d_att + h * S, pos + 2));
 
       dim3 gridVal((D + block.x - 1) / block.x);
@@ -795,13 +807,14 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                               d_router_score, d_b_router + l * E, E));
 
     // Top-k experts
+    size_t shared_mem_size = E * sizeof(GPUPair);
     PROFILE_KERNEL_LAUNCH("topk_kernel_1token",
-                          topk_kernel_1token<<<1, 1>>>(d_topk_v, d_topk_i,
+                          topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(d_topk_v, d_topk_i,
                                                        d_router_score, E,
                                                        p->experts_per_token));
     PROFILE_KERNEL_LAUNCH(
         "softmax_kernel(topk)",
-        softmax_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+        softmax_kernel<<<1, 1>>>(
             d_topk_v, p->experts_per_token));
 
     // Aggregate experts
