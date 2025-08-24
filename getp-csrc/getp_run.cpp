@@ -1,5 +1,6 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -8,6 +9,12 @@
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+#define TK 128
+#define TM 4
+#define BLOCK_SIZE 256
+#define LDS_PAD 8
+#define WF_SIZE 64
 
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \
@@ -18,6 +25,10 @@
       exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
+
+typedef struct __align__(2) {
+  uint16_t x;
+} bf16_t;
 
 static inline void debug_print_gpu_memory(const char *tag) {
   size_t free_b = 0, total_b = 0;
@@ -34,8 +45,6 @@ static inline void debug_print_gpu_memory(const char *tag) {
   fflush(stdout);
 }
 
-typedef uint16_t bf16_t;
-
 static inline bf16_t f32_to_bf16(float f) {
   union {
     float f;
@@ -45,15 +54,21 @@ static inline bf16_t f32_to_bf16(float f) {
   uint32_t lsb = (x >> 16) & 1;
   uint32_t rounding_bias = 0x00007FFF + lsb;
   x += rounding_bias;
-  bf16_t h = (bf16_t)(x >> 16);
-  return h;
+  bf16_t result;
+  result.x = (uint16_t)(x >> 16);
+  return result;
 }
 
-__device__ __forceinline__ float bf16_to_f32(bf16_t h) {
-  uint32_t x = ((uint32_t)h) << 16;
-  float f = __uint_as_float(x);
-  return f;
+__device__ __forceinline__ float bf16_to_f32(bf16_t val) {
+  union {
+    float f;
+    uint32_t i;
+  } u;
+  u.i = ((uint32_t)val.x) << 16;
+  return u.f;
 }
+
+inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 // Global GPU Buffers
 // Activations / temporaries (FP32)
@@ -330,30 +345,123 @@ __global__ void memset_zero_kernel(float *ptr, int size) {
 }
 
 // Matmul: W(d,n)[bf16] @ x(n)[f32] -> y(d)[f32]; FP32 accumulate
-__global__ void matmul_bf16_wxf32_yf32(float *y, const float *x,
-                                       const bf16_t *w, int n, int d) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x; // 0..d-1
-  if (row >= d)
-    return;
-  const bf16_t *wrow = w + (size_t)row * n;
-  float acc = 0.0f;
-  for (int j = 0; j < n; ++j) {
-    acc += bf16_to_f32(wrow[j]) * x[j];
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
+                                       const float * __restrict__ x,
+                                       const bf16_t * __restrict__ w,
+                                       int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;               // wave id in block: 0..TM-1
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  float acc_all = 0.0f;
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
+    }
+    __syncthreads();
+
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    float acc = 0.0f;
+    int k = lane << 1;
+    const uint32_t* __restrict__ w32 = reinterpret_cast<const uint32_t*>(w_row);
+
+    // vectorized loop: 2 elems per step, step over wave by 2*64
+    for (; (k + 1) < k_size; k += (WF_SIZE << 1)) {
+      // each packed = [hi:bf16(k+1) | lo:bf16(k)]
+      uint32_t packed = w32[k >> 1];
+      bf16_t bf16_0, bf16_1;
+      bf16_0.x = (uint16_t)(packed & 0xFFFF);
+      bf16_1.x = (uint16_t)(packed >> 16);
+      float wx0 = bf16_to_f32(bf16_0);
+      float wx1 = bf16_to_f32(bf16_1);
+      // FMA with cached x
+      acc = fmaf(wx0, lds_x[k], acc);
+      acc = fmaf(wx1, lds_x[k + 1], acc);
+    }
+
+    // tail (odd leftover)
+    if (k < k_size) {
+      uint16_t h = reinterpret_cast<const uint16_t*>(w_row)[k];
+      bf16_t bf16_h;
+      bf16_h.x = h;
+      acc = fmaf(bf16_to_f32(bf16_h), lds_x[k], acc);
+    }
+
+    // Wave reduction (width = 64)
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
   }
-  y[row] = acc;
+
+  if (lane == 0) y[row] = acc_all;
 }
 
-// Minimal FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
-__global__ void matmul_f32_wxf32_yf32(float *y, const float *x, const float *w,
+// FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
+                                      const float * __restrict__ x,
+                                      const float * __restrict__ w,
                                       int n, int d) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= d)
-    return;
-  const float *wr = w + (size_t)row * n;
-  float acc = 0.0f;
-  for (int j = 0; j < n; ++j)
-    acc += wr[j] * x[j];
-  y[row] = acc;
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  float acc_all = 0.0f;
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
+    }
+    __syncthreads();
+
+    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    float acc = 0.0f;
+    int k = lane;
+
+    uintptr_t base = reinterpret_cast<uintptr_t>(w_row);
+    if ((((base + sizeof(float)*k) & 0xF) == 0)) {
+      for (; (k + 3) < k_size; k += (WF_SIZE << 2)) {
+        float4 wv = *reinterpret_cast<const float4*>(&w_row[k]);
+        float4 xv = *reinterpret_cast<const float4*>(&lds_x[k]);
+        acc = fmaf(wv.x, xv.x, acc);
+        acc = fmaf(wv.y, xv.y, acc);
+        acc = fmaf(wv.z, xv.z, acc);
+        acc = fmaf(wv.w, xv.w, acc);
+      }
+    }
+
+    for (; k < k_size; k += WF_SIZE) {
+      acc = fmaf(w_row[k], lds_x[k], acc);
+    }
+
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
+  }
+
+  if (lane == 0) y[row] = acc_all;
 }
 
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
@@ -578,8 +686,9 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   const int E = p->n_experts;
   const int S = p->seq_len;
 
-  dim3 block(256);
-  dim3 gridH((H + block.x - 1) / block.x);
+  // Use optimized launch configurations
+  dim3 block = dim3(BLOCK_SIZE, 1, 1);
+  dim3 gridH = get_gemv_grid_dim(H);
 
   // x <- embedding[token] (BF16 -> FP32)
   PROFILE_KERNEL_LAUNCH("copy_embedding_bf16_row_kernel",
@@ -588,20 +697,21 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
   for (int l = 0; l < p->n_layers; ++l) {
     // RMSNorm (attn)
-    PROFILE_KERNEL_LAUNCH("rmsnorm_kernel(attn)",
-                          rmsnorm_kernel<<<1, 256, 256 * sizeof(double)>>>(
-                              d_t, d_x, d_rms_attn_w + l * H, H));
+    PROFILE_KERNEL_LAUNCH(
+        "rmsnorm_kernel(attn)",
+        rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
+            d_t, d_x, d_rms_attn_w + l * H, H));
 
     // QKV
     const int QKV_D = D * (Hq + 2 * Hk);
-    dim3 gridQKV((QKV_D + block.x - 1) / block.x);
+    dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH(
         "matmul_bf16_wxf32_yf32(QKV)",
         matmul_bf16_wxf32_yf32<<<gridQKV, block>>>(
             d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, H, QKV_D));
-    PROFILE_KERNEL_LAUNCH(
-        "add_bias_kernel(b_qkv)",
-        add_bias_kernel<<<gridQKV, block>>>(d_qkv, d_b_qkv + l * QKV_D, QKV_D));
+    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_qkv)",
+                          add_bias_kernel<<<get_gemv_grid_dim(QKV_D), block>>>(
+                              d_qkv, d_b_qkv + l * QKV_D, QKV_D));
 
     PROFILE_KERNEL_LAUNCH(
         "split_qkv_kernel",
@@ -644,9 +754,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
       HIP_CHECK(hipMemcpy(d_att + h * S + pos + 1, &sink_val, sizeof(float),
                           hipMemcpyHostToDevice));
 
-      PROFILE_KERNEL_LAUNCH("softmax_kernel(att)",
-                            softmax_kernel<<<1, 256, 256 * sizeof(float)>>>(
-                                d_att + h * S, pos + 2));
+      PROFILE_KERNEL_LAUNCH(
+          "softmax_kernel(att)",
+          softmax_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+              d_att + h * S, pos + 2));
 
       dim3 gridVal((D + block.x - 1) / block.x);
       PROFILE_KERNEL_LAUNCH(
@@ -656,24 +767,25 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     }
 
     const int O_N = D * Hq;
-    dim3 gridO((H + block.x - 1) / block.x);
+    dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH(
         "matmul_bf16_wxf32_yf32(W_o)",
         matmul_bf16_wxf32_yf32<<<gridO, block>>>(
             d_tb2, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, O_N, H));
-    PROFILE_KERNEL_LAUNCH(
-        "add_bias_kernel(b_o)",
-        add_bias_kernel<<<gridO, block>>>(d_tb2, d_b_o + l * H, H));
+    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_o)",
+                          add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
+                              d_tb2, d_b_o + l * H, H));
     PROFILE_KERNEL_LAUNCH("residual_add_kernel(attn)",
                           residual_add_kernel<<<gridH, block>>>(d_x, d_tb2, H));
 
     // FFN RMSNorm
-    PROFILE_KERNEL_LAUNCH("rmsnorm_kernel(ffn)",
-                          rmsnorm_kernel<<<1, 256, 256 * sizeof(double)>>>(
-                              d_t, d_x, d_rms_ffn_w + l * H, H));
+    PROFILE_KERNEL_LAUNCH(
+        "rmsnorm_kernel(ffn)",
+        rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
+            d_t, d_x, d_rms_ffn_w + l * H, H));
 
     // Router FP32: d_router_score(E) = W_router(E,H) @ d_t(H)
-    dim3 gridE((E + block.x - 1) / block.x);
+    dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH(
         "matmul_f32_wxf32_yf32(router)",
         matmul_f32_wxf32_yf32<<<gridE, block>>>(
@@ -687,9 +799,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                           topk_kernel_1token<<<1, 1>>>(d_topk_v, d_topk_i,
                                                        d_router_score, E,
                                                        p->experts_per_token));
-    PROFILE_KERNEL_LAUNCH("softmax_kernel(topk)",
-                          softmax_kernel<<<1, 256, 256 * sizeof(float)>>>(
-                              d_topk_v, p->experts_per_token));
+    PROFILE_KERNEL_LAUNCH(
+        "softmax_kernel(topk)",
+        softmax_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+            d_topk_v, p->experts_per_token));
 
     // Aggregate experts
     PROFILE_KERNEL_LAUNCH("memset_zero_kernel(e_agg)",
@@ -709,7 +822,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
       float ew = h_topk_v[kk];
       // MLP1: (2IM x H) @ d_t
       size_t off = ((size_t)l * E + e) * (size_t)(2 * IM) * (size_t)H;
-      dim3 gridM1((2 * IM + block.x - 1) / block.x);
+      dim3 gridM1 = get_gemv_grid_dim(2 * IM);
       PROFILE_KERNEL_LAUNCH(
           "matmul_bf16_wxf32_yf32(MLP1)",
           matmul_bf16_wxf32_yf32<<<gridM1, block>>>(
@@ -717,9 +830,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
       // Add bias b_mlp1
       size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
-      PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_mlp1)",
-                            add_bias_kernel<<<gridM1, block>>>(
-                                d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
+      PROFILE_KERNEL_LAUNCH(
+          "add_bias_kernel(b_mlp1)",
+          add_bias_kernel<<<get_gemv_grid_dim(2 * IM), block>>>(
+              d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
 
       // Split & SwiGLU
       dim3 gridIM((IM + block.x - 1) / block.x);
@@ -732,15 +846,16 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
       // MLP2: (H x IM) @ gate_up
       off = ((size_t)l * E + e) * (size_t)H * (size_t)IM;
-      PROFILE_KERNEL_LAUNCH("matmul_bf16_wxf32_yf32(MLP2)",
-                            matmul_bf16_wxf32_yf32<<<gridH, block>>>(
-                                d_tb2, d_gate_up, d_w_mlp2_bf16 + off, IM, H));
+      PROFILE_KERNEL_LAUNCH(
+          "matmul_bf16_wxf32_yf32(MLP2)",
+          matmul_bf16_wxf32_yf32<<<get_gemv_grid_dim(H), block>>>(
+              d_tb2, d_gate_up, d_w_mlp2_bf16 + off, IM, H));
 
       // Add b_mlp2, then weighted sum into e_agg
       size_t b2off = ((size_t)l * E + e) * (size_t)H;
-      PROFILE_KERNEL_LAUNCH(
-          "add_bias_kernel(b_mlp2)",
-          add_bias_kernel<<<gridH, block>>>(d_tb2, g_b_mlp2 + b2off, H));
+      PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_mlp2)",
+                            add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
+                                d_tb2, g_b_mlp2 + b2off, H));
       PROFILE_KERNEL_LAUNCH(
           "weighted_sum_kernel",
           weighted_sum_kernel<<<gridH, block>>>(d_e_agg, d_tb2, ew, H));
@@ -755,14 +870,15 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   }
 
   // Final RMSNorm
-  PROFILE_KERNEL_LAUNCH("rmsnorm_kernel(final)",
-                        rmsnorm_kernel<<<1, 256, 256 * sizeof(double)>>>(
-                            d_t, d_x, d_rms_out_w, H));
+  PROFILE_KERNEL_LAUNCH(
+      "rmsnorm_kernel(final)",
+      rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
+          d_t, d_x, d_rms_out_w, H));
   HIP_CHECK(hipMemcpy(d_x, d_t, H * sizeof(float), hipMemcpyDeviceToDevice));
 
   // LM head: (V x H) @ x -> logits(V)
   const int V = p->vocab_size;
-  dim3 gridV((V + block.x - 1) / block.x);
+  dim3 gridV = get_gemv_grid_dim(V);
   PROFILE_KERNEL_LAUNCH("matmul_bf16_wxf32_yf32(OUT)",
                         matmul_bf16_wxf32_yf32<<<gridV, block>>>(
                             d_logits, d_x, d_out_bf16, H, V));
@@ -796,7 +912,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   const char *first_piece = decode_piece(tokenizer, 200006, token);
   safe_printf(first_piece);
   fflush(stdout);
-  
+
   while (pos < steps) {
     float *d_log = gpu_forward(transformer, token, pos);
 
