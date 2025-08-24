@@ -138,6 +138,78 @@ __global__ void softmax_kernel(float *x, int size) {
   }
 }
 
+// Writes att[h*S + pos+1] = attn_sinks_layer[h] for all h in [0, Hq)
+__global__ void write_sinks_kernel(float* __restrict__ att,
+                                   const float* __restrict__ attn_sinks_layer,
+                                   int S, int pos, int Hq) {
+  int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h < Hq) {
+    att[(size_t)h * S + (pos + 1)] = attn_sinks_layer[h];
+  }
+}
+
+// att is [Hq, S] in row-major per head (stride S). For each head, softmax over t in [0, T)
+__global__ void softmax_heads_kernel(float* __restrict__ att,
+                                     int S, int T, int Hq) {
+  extern __shared__ double sdata[]; // use for reductions
+  int h = blockIdx.x;               // one block per head
+  if (h >= Hq) return;
+
+  float* x = att + (size_t)h * S;
+
+  // 1) compute max in double with deterministic tree reduction
+  double local_max = -INFINITY;
+  for (int t = threadIdx.x; t < T; t += blockDim.x) {
+    local_max = fmax(local_max, (double)x[t]);
+  }
+  
+  // Store local max to shared memory
+  sdata[threadIdx.x] = local_max;
+  __syncthreads();
+  
+  // Binary tree reduction for max
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      sdata[threadIdx.x] = fmax(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  
+  // Broadcast max value
+  double max_val = sdata[0];
+  __syncthreads();
+
+  // 2) write back (x[t] = expf((float)((double)x[t] - max))) and accumulate double sum
+  double local_sum = 0.0;
+  for (int t = threadIdx.x; t < T; t += blockDim.x) {
+    float ev = expf((float)((double)x[t] - max_val));
+    x[t] = ev;
+    local_sum += (double)ev;
+  }
+  
+  // Store local sum to shared memory
+  sdata[threadIdx.x] = local_sum;
+  __syncthreads();
+  
+  // Binary tree reduction for sum
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  
+  // Broadcast sum value
+  double sum_val = sdata[0];
+  __syncthreads();
+
+  // 3) normalize: x[t] *= (float)(1.0 / sum)
+  double inv_sum = 1.0 / sum_val;
+  for (int t = threadIdx.x; t < T; t += blockDim.x) {
+    x[t] = (float)((double)x[t] * inv_sum);
+  }
+}
+
 
 __global__ void add_bias_kernel(float *y, const float *b, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -275,6 +347,214 @@ __global__ void attention_values_kernel(
   }
 
   tb[(size_t)h * head_dim + i] = (float)acc;
+}
+
+// Computes tb[h, i] = sum_{t=0..T-1} att[h, t] * value_cache[t, base_v + i]
+// for all heads h in [0, Hq) and i in [0, D).
+template<int TILE_T>
+__global__ void attn_values_heads_kernel(
+    float* __restrict__ tb,           // [Hq, D]
+    const float* __restrict__ att,    // [Hq, S]
+    const float* __restrict__ value_cache, // [S, KV]
+    int Hq, int Hk, int D, int KV,    // KV = D * Hk
+    int S, int T                      // T = pos + 2
+) {
+  extern __shared__ double s_att[];   // size = TILE_T
+
+  const int h   = blockIdx.x;         // head id
+  const int tid = threadIdx.x;
+  if (h >= Hq) return;
+
+  // kv_mul = n_attn_heads / n_kv_heads
+  const int kv_mul = Hq / Hk;
+  const int base_v = (h / kv_mul) * D;
+
+  // i-dimension scheduling: each thread handles one i
+  int i_start = blockIdx.y * blockDim.x + tid;
+
+  // Accumulator in double
+  double acc = 0.0;
+
+  // Tile over time dimension
+  for (int t0 = 0; t0 < T; t0 += TILE_T) {
+    const int tile = min(TILE_T, T - t0);
+
+    // 1) Load att[h, t] into shared memory as double
+    for (int t = tid; t < tile; t += blockDim.x) {
+      s_att[t] = (double)att[(size_t)h * S + (t0 + t)];
+    }
+    __syncthreads();
+
+    // 2) Accumulate products for the assigned i
+    if (i_start < D) {
+      // base pointer for this i over time
+      const float* v_ptr = value_cache + (size_t)(t0) * KV + base_v + i_start;
+      for (int t = 0; t < tile; ++t) {
+        // value_cache layout: [t, KV]
+        // element: value_cache[t, base_v + i]
+        double vv = (double)v_ptr[t * (size_t)KV];
+        acc += s_att[t] * vv;
+      }
+    }
+    __syncthreads();
+  }
+
+  // 3) Write back
+  if (i_start < D) {
+    tb[(size_t)h * D + i_start] = (float)acc;
+  }
+}
+
+// Fused attention kernel: scores + sink + softmax + values in one pass
+template<int TILE_T>
+__global__ void attention_fused_kernel(
+    float* __restrict__ tb,                 // [Hq, D] out
+    const float* __restrict__ q,            // [Hq, D]
+    const float* __restrict__ key_cache,    // [S, KV] for layer l
+    const float* __restrict__ value_cache,  // [S, KV] for layer l
+    const float* __restrict__ attn_sinks_layer, // [Hq]
+    const float* __restrict__ mask,         // [S, S] or nullptr
+    int Hq, int Hk, int D, int KV,          // KV = D * Hk
+    int S, int pos                          // T_real = pos + 1
+) {
+  extern __shared__ double s_tile[]; // used for per-tile score/weight work
+  const int h   = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= Hq) return;
+
+  const int kv_mul = Hq / Hk;
+  const int base   = (h / kv_mul) * D;
+  const double scale = 1.0 / sqrt((double)D);
+
+  // Pointers
+  const float* qh = q + (size_t)h * D;    // [D]
+  const float* K  = key_cache;            // [S, KV]
+  const float* V  = value_cache;          // [S, KV]
+
+  const int T_real = pos + 1;             // indices t ∈ [0, T_real)
+  
+  // Shared memory layout: first TILE_T for logits/weights, then blockDim.x for reductions
+  double* s_logits = s_tile;
+  double* s_reduce = s_tile + TILE_T;
+  
+  // 1) Find global max over all logits and sink
+  double gmax = -INFINITY;
+
+  for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
+    const int tile = min(TILE_T, T_real - t0);
+    
+    // Compute logits for this tile
+    for (int tt = 0; tt < tile; ++tt) {
+      const int t = t0 + tt;
+      
+      // Compute Q·K dot product with all threads participating
+      double part = 0.0;
+      for (int i = tid; i < D; i += blockDim.x) {
+        const float k = K[(size_t)t * KV + base + i];
+        part += (double)qh[i] * (double)k;
+      }
+      
+      // Reduce to get full dot product
+      s_reduce[tid] = part;
+      __syncthreads();
+      for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        __syncthreads();
+      }
+      
+      // Apply scale and optional mask
+      double logit = s_reduce[0] * scale;
+      if (mask) {
+        logit += (double)mask[(size_t)pos * S + t];
+      }
+      
+      // Store logit and update local max
+      if (tid == 0) {
+        s_logits[tt] = logit;
+        gmax = fmax(gmax, logit);
+      }
+      __syncthreads();
+    }
+  }
+  
+  // Include sink in global max
+  const double sinkVal = (double)attn_sinks_layer[h];
+  if (tid == 0) {
+    gmax = fmax(gmax, sinkVal);
+    s_reduce[0] = gmax; // Broadcast gmax
+  }
+  __syncthreads();
+  gmax = s_reduce[0];
+
+  // 2) Second pass: compute sumExp and numerator accumulation
+  double sumExp = 0.0;
+  
+  // Each thread handles one output dimension i
+  const int i0 = tid;
+  double num_acc = 0.0;
+
+  for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
+    const int tile = min(TILE_T, T_real - t0);
+
+    // Recompute logits for this tile (same as pass 1)
+    for (int tt = 0; tt < tile; ++tt) {
+      const int t = t0 + tt;
+      
+      // Compute Q·K dot product
+      double part = 0.0;
+      for (int i = tid; i < D; i += blockDim.x) {
+        const float k = K[(size_t)t * KV + base + i];
+        part += (double)qh[i] * (double)k;
+      }
+      
+      // Reduce to get full dot product
+      s_reduce[tid] = part;
+      __syncthreads();
+      for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        __syncthreads();
+      }
+      
+      // Apply scale and optional mask
+      double logit = s_reduce[0] * scale;
+      if (mask) {
+        logit += (double)mask[(size_t)pos * S + t];
+      }
+      
+      // Compute unnormalized weight and accumulate sumExp
+      if (tid == 0) {
+        double w = exp(logit - gmax);
+        s_logits[tt] = w;  // Store weight as double
+        sumExp += w;
+      }
+      __syncthreads();
+    }
+
+    // Accumulate numerator for owned output dimension
+    if (i0 < D) {
+      for (int tt = 0; tt < tile; ++tt) {
+        const int t = t0 + tt;
+        const double w = s_logits[tt];  // Double precision weight
+        const float v = V[(size_t)t * KV + base + i0];
+        num_acc += w * (double)v;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Add sink contribution to denominator (but not numerator)
+  if (tid == 0) {
+    const double sinkExp = exp(sinkVal - gmax);
+    sumExp += sinkExp;
+    s_reduce[0] = 1.0 / sumExp; // Store inverse for broadcast
+  }
+  __syncthreads();
+  const double inv = s_reduce[0];
+
+  // Write final result
+  if (i0 < D) {
+    tb[(size_t)h * D + i0] = (float)(num_acc * inv);
+  }
 }
 
 
@@ -753,30 +1033,24 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
                         hipMemcpyDeviceToDevice));
 
-    for (int h = 0; h < Hq; ++h) {
-      dim3 gridAtt((pos + 1 + block.x - 1) / block.x);
-      PROFILE_KERNEL_LAUNCH(
-          "attention_scores_kernel",
-          attention_scores_kernel<<<gridAtt, block>>>(
-              d_att, d_q, d_key_cache + loff, h, pos, D, KV, Hq, Hk, S,
-              (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr));
-      float sink_val;
-      HIP_CHECK(hipMemcpy(&sink_val, d_attn_sinks + l * Hq + h, sizeof(float),
-                          hipMemcpyDeviceToHost));
-      HIP_CHECK(hipMemcpy(d_att + h * S + pos + 1, &sink_val, sizeof(float),
-                          hipMemcpyHostToDevice));
-
-      PROFILE_KERNEL_LAUNCH(
-          "softmax_kernel(att)",
-          softmax_kernel<<<1, 1>>>(
-              d_att + h * S, pos + 2));
-
-      dim3 gridVal((D + block.x - 1) / block.x);
-      PROFILE_KERNEL_LAUNCH(
-          "attention_values_kernel",
-          attention_values_kernel<<<gridVal, block>>>(
-              d_tb, d_att, d_value_cache + loff, h, pos, D, KV, Hq, Hk, S));
-    }
+    // Fused attention kernel: scores + sink + softmax + values in one pass
+    const int T_real = pos + 1;
+    const int TILE_T = 256;
+    dim3 grid(Hq);
+    dim3 block(256);
+    // Shared memory: TILE_T doubles for logits/weights + blockDim.x doubles for reductions
+    size_t shmem = (TILE_T + block.x) * sizeof(double);
+    
+    PROFILE_KERNEL_LAUNCH(
+        "attention_fused_kernel",
+        attention_fused_kernel<TILE_T><<<grid, block, shmem>>>(
+            d_tb,                      // [Hq, D]
+            d_q,                       // [Hq, D]
+            d_key_cache + loff,        // [S, KV] base for this layer
+            d_value_cache + loff,      // [S, KV]
+            d_attn_sinks + l * Hq,     // [Hq]
+            (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
+            Hq, Hk, D, KV, S, pos));
 
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
