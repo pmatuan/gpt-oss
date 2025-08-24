@@ -564,6 +564,56 @@ __global__ void residual_add_kernel(float *x, const float *residual, int size) {
     x[i] += residual[i];
 }
 
+// Fused matmul with bias and residual add: W(d,n)[bf16] @ x(n)[f32] + b(d)[f32] + residual(d)[f32] -> output(d)[f32]
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_bf16_wxf32_yf32_bias_residual(float * __restrict__ output,
+                                                     const float * __restrict__ x,
+                                                     const bf16_t * __restrict__ w,
+                                                     const float * __restrict__ b,
+                                                     const float * __restrict__ residual,
+                                                     int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;               // wave id in block: 0..TM-1
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  double acc_all = 0.0;  // Use double precision like CPU
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
+    }
+    __syncthreads();
+
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    double acc = 0.0;  // Use double precision like CPU
+    
+    // Direct bf16 operations without casting
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      bf16_t bf16_val = w_row[k];
+      double wx = (double)bf16_to_f32(bf16_val);
+      double xval = (double)lds_x[k];
+      acc += wx * xval;  // Double precision accumulation
+    }
+
+    // Wave reduction (width = 64) with double precision
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
+  }
+
+  if (lane == 0) output[row] = (float)acc_all + b[row] + residual[row];  // Add bias and residual
+}
+
 // Pair struct for GPU sorting (matching CPU implementation)
 typedef struct {
   float value;
@@ -655,6 +705,7 @@ __global__ void weighted_sum_kernel(float *e_agg, const float *expert_out,
     e_agg[i] += expert_out[i] * weight;
 }
 
+
 __global__ void memset_zero_kernel(float *ptr, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < size)
@@ -709,6 +760,55 @@ __global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
   if (lane == 0) y[row] = (float)acc_all;  // Convert back to float for output
 }
 
+// Fused matmul with bias: W(d,n)[bf16] @ x(n)[f32] + b(d)[f32] -> y(d)[f32]
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_bf16_wxf32_yf32_bias(float * __restrict__ y,
+                                            const float * __restrict__ x,
+                                            const bf16_t * __restrict__ w,
+                                            const float * __restrict__ b,
+                                            int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;               // wave id in block: 0..TM-1
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  double acc_all = 0.0;  // Use double precision like CPU
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
+    }
+    __syncthreads();
+
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    double acc = 0.0;  // Use double precision like CPU
+    
+    // Direct bf16 operations without casting
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      bf16_t bf16_val = w_row[k];
+      double wx = (double)bf16_to_f32(bf16_val);
+      double xval = (double)lds_x[k];
+      acc += wx * xval;  // Double precision accumulation
+    }
+
+    // Wave reduction (width = 64) with double precision
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
+  }
+
+  if (lane == 0) y[row] = (float)acc_all + b[row];  // Add bias
+}
+
 // FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
 __launch_bounds__(BLOCK_SIZE, 2)
 __global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
@@ -754,6 +854,54 @@ __global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
   }
 
   if (lane == 0) y[row] = (float)acc_all;  // Convert back to float for output
+}
+
+// Fused FP32 matmul with bias: W(d,n)[f32] @ x(n)[f32] + b(d)[f32] -> y(d)[f32]
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_f32_wxf32_yf32_bias(float * __restrict__ y,
+                                           const float * __restrict__ x,
+                                           const float * __restrict__ w,
+                                           const float * __restrict__ b,
+                                           int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  double acc_all = 0.0;  // Use double precision like CPU
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
+    }
+    __syncthreads();
+
+    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    double acc = 0.0;  // Use double precision like CPU
+    int k = lane;
+
+    // Simplified loop for double precision accumulation
+    for (; k < k_size; k += WF_SIZE) {
+      double wval = (double)w_row[k];
+      double xval = (double)lds_x[k];
+      acc += wval * xval;  // Double precision accumulation
+    }
+
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
+  }
+
+  if (lane == 0) y[row] = (float)acc_all + b[row];  // Add bias
 }
 
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
@@ -994,16 +1142,13 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
             d_t, d_x, d_rms_attn_w + l * H, H));
 
-    // QKV
+    // QKV with fused bias
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_bf16_wxf32_yf32(QKV)",
-        matmul_bf16_wxf32_yf32<<<gridQKV, block>>>(
-            d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, H, QKV_D));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_qkv)",
-                          add_bias_kernel<<<get_gemv_grid_dim(QKV_D), block>>>(
-                              d_qkv, d_b_qkv + l * QKV_D, QKV_D));
+        "matmul_bf16_wxf32_yf32_bias(QKV)",
+        matmul_bf16_wxf32_yf32_bias<<<gridQKV, block>>>(
+            d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, d_b_qkv + l * QKV_D, H, QKV_D));
 
     PROFILE_KERNEL_LAUNCH(
         "split_qkv_kernel",
@@ -1055,14 +1200,9 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_bf16_wxf32_yf32(W_o)",
-        matmul_bf16_wxf32_yf32<<<gridO, block>>>(
-            d_tb2, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, O_N, H));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_o)",
-                          add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
-                              d_tb2, d_b_o + l * H, H));
-    PROFILE_KERNEL_LAUNCH("residual_add_kernel(attn)",
-                          residual_add_kernel<<<gridH, block>>>(d_x, d_tb2, H));
+        "matmul_bf16_wxf32_yf32_bias_residual(W_o)",
+        matmul_bf16_wxf32_yf32_bias_residual<<<gridO, block>>>(
+            d_x, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, d_b_o + l * H, d_x, O_N, H));
 
     // FFN RMSNorm
     PROFILE_KERNEL_LAUNCH(
@@ -1070,15 +1210,12 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
             d_t, d_x, d_rms_ffn_w + l * H, H));
 
-    // Router FP32: d_router_score(E) = W_router(E,H) @ d_t(H)
+    // Router FP32 with fused bias: d_router_score(E) = W_router(E,H) @ d_t(H) + b_router
     dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_f32_wxf32_yf32(router)",
-        matmul_f32_wxf32_yf32<<<gridE, block>>>(
-            d_router_score, d_t, d_w_router + (size_t)l * H * E, H, E));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel(router_b)",
-                          add_bias_kernel<<<gridE, block>>>(
-                              d_router_score, d_b_router + l * E, E));
+        "matmul_f32_wxf32_yf32_bias(router)",
+        matmul_f32_wxf32_yf32_bias<<<gridE, block>>>(
+            d_router_score, d_t, d_w_router + (size_t)l * H * E, d_b_router + l * E, H, E));
 
     // Top-k experts
     size_t shared_mem_size = E * sizeof(GPUPair);
@@ -1091,9 +1228,8 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         softmax_kernel<<<1, 1>>>(
             d_topk_v, p->experts_per_token));
 
-    // Aggregate experts
-    PROFILE_KERNEL_LAUNCH("memset_zero_kernel(e_agg)",
-                          memset_zero_kernel<<<gridH, block>>>(d_e_agg, H));
+    // Zero-initialize expert aggregation buffer
+    HIP_CHECK(hipMemsetAsync(d_e_agg, 0, H * sizeof(float), 0));
 
     // Read topk to host (small)
     float *h_topk_v = (float *)malloc(p->experts_per_token * sizeof(float));
@@ -1107,20 +1243,14 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
       int e = h_topk_i[kk];
       float ew = h_topk_v[kk];
-      // MLP1: (2IM x H) @ d_t
+      // MLP1 with fused bias: (2IM x H) @ d_t + b_mlp1
       size_t off = ((size_t)l * E + e) * (size_t)(2 * IM) * (size_t)H;
+      size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
       dim3 gridM1 = get_gemv_grid_dim(2 * IM);
       PROFILE_KERNEL_LAUNCH(
-          "matmul_bf16_wxf32_yf32(MLP1)",
-          matmul_bf16_wxf32_yf32<<<gridM1, block>>>(
-              d_mlp1_out, d_t, d_w_mlp1_bf16 + off, H, 2 * IM));
-
-      // Add bias b_mlp1
-      size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
-      PROFILE_KERNEL_LAUNCH(
-          "add_bias_kernel(b_mlp1)",
-          add_bias_kernel<<<get_gemv_grid_dim(2 * IM), block>>>(
-              d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
+          "matmul_bf16_wxf32_yf32_bias(MLP1)",
+          matmul_bf16_wxf32_yf32_bias<<<gridM1, block>>>(
+              d_mlp1_out, d_t, d_w_mlp1_bf16 + off, g_b_mlp1 + b1off, H, 2 * IM));
 
       // Split & SwiGLU
       dim3 gridIM((IM + block.x - 1) / block.x);
@@ -1131,18 +1261,15 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                             swiglu_kernel<<<gridIM, block>>>(
                                 d_gate_up, d_gate, d_up, IM, p->swiglu_limit));
 
-      // MLP2: (H x IM) @ gate_up
+      // MLP2 with fused bias: (H x IM) @ gate_up + b_mlp2
       off = ((size_t)l * E + e) * (size_t)H * (size_t)IM;
-      PROFILE_KERNEL_LAUNCH(
-          "matmul_bf16_wxf32_yf32(MLP2)",
-          matmul_bf16_wxf32_yf32<<<get_gemv_grid_dim(H), block>>>(
-              d_tb2, d_gate_up, d_w_mlp2_bf16 + off, IM, H));
-
-      // Add b_mlp2, then weighted sum into e_agg
       size_t b2off = ((size_t)l * E + e) * (size_t)H;
-      PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_mlp2)",
-                            add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
-                                d_tb2, g_b_mlp2 + b2off, H));
+      PROFILE_KERNEL_LAUNCH(
+          "matmul_bf16_wxf32_yf32_bias(MLP2)",
+          matmul_bf16_wxf32_yf32_bias<<<get_gemv_grid_dim(H), block>>>(
+              d_tb2, d_gate_up, d_w_mlp2_bf16 + off, g_b_mlp2 + b2off, IM, H));
+
+      // Weighted sum into e_agg
       PROFILE_KERNEL_LAUNCH(
           "weighted_sum_kernel",
           weighted_sum_kernel<<<gridH, block>>>(d_e_agg, d_tb2, ew, H));
