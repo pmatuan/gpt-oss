@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <omp.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -904,6 +905,177 @@ __global__ void matmul_f32_wxf32_yf32_bias(float * __restrict__ y,
   if (lane == 0) y[row] = (float)acc_all + b[row];  // Add bias
 }
 
+
+// Async pipelined FP32->BF16 converter with overlapped CPU conversion and H2D transfers
+static void copy_fp32_to_bf16_device_async(const float *h_src, size_t count,
+                                           bf16_t *d_dst, int n_streams = 4,
+                                           size_t chunk_bytes = 64ULL * 1024 * 1024) {
+  if (count == 0) return;
+  
+  // Calculate chunk size in elements
+  const size_t chunk_elems = chunk_bytes / sizeof(bf16_t);
+  const size_t actual_chunk_elems = (chunk_elems > count) ? count : chunk_elems;
+  
+  // Try to allocate pinned buffers and streams
+  hipStream_t *streams = nullptr;
+  hipEvent_t *events = nullptr;
+  bf16_t **pinned_chunks = nullptr;
+  bool async_success = true;
+  
+  // Allocate stream array
+  streams = (hipStream_t*)malloc(n_streams * sizeof(hipStream_t));
+  if (!streams) async_success = false;
+  
+  // Allocate event array
+  if (async_success) {
+    events = (hipEvent_t*)malloc(n_streams * sizeof(hipEvent_t));
+    if (!events) async_success = false;
+  }
+  
+  // Allocate pinned buffer array
+  if (async_success) {
+    pinned_chunks = (bf16_t**)malloc(n_streams * sizeof(bf16_t*));
+    if (!pinned_chunks) async_success = false;
+    else {
+      for (int i = 0; i < n_streams; i++) pinned_chunks[i] = nullptr;
+    }
+  }
+  
+  // Create streams
+  if (async_success) {
+    for (int i = 0; i < n_streams; i++) {
+      hipError_t err = hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
+      if (err != hipSuccess) {
+        async_success = false;
+        break;
+      }
+    }
+  }
+  
+  // Create events
+  if (async_success) {
+    for (int i = 0; i < n_streams; i++) {
+      hipError_t err = hipEventCreateWithFlags(&events[i], hipEventDisableTiming);
+      if (err != hipSuccess) {
+        async_success = false;
+        break;
+      }
+    }
+  }
+  
+  // Allocate pinned host buffers
+  if (async_success) {
+    for (int i = 0; i < n_streams; i++) {
+      hipError_t err = hipHostMalloc((void**)&pinned_chunks[i], 
+                                     actual_chunk_elems * sizeof(bf16_t));
+      if (err != hipSuccess) {
+        async_success = false;
+        break;
+      }
+    }
+  }
+  
+  // If async allocation failed, fallback to synchronous
+  if (!async_success) {
+    // Cleanup any partial allocations
+    if (pinned_chunks) {
+      for (int i = 0; i < n_streams; i++) {
+        if (pinned_chunks[i]) {
+          (void)hipHostFree(pinned_chunks[i]); // Ignore return value in cleanup
+        }
+      }
+      free(pinned_chunks);
+    }
+    if (events) {
+      for (int i = 0; i < n_streams; i++) {
+        (void)hipEventDestroy(events[i]); // May fail silently if not created
+      }
+      free(events);
+    }
+    if (streams) {
+      for (int i = 0; i < n_streams; i++) {
+        (void)hipStreamDestroy(streams[i]); // May fail silently if not created
+      }
+      free(streams);
+    }
+    
+    // Fallback to synchronous copy
+    const size_t SYNC_CHUNK_ELEMS = 8 * 1024 * 1024; // 8M elems (~16MB) per chunk
+    bf16_t *h_chunk = nullptr;
+    HIP_CHECK(hipHostMalloc((void **)&h_chunk, SYNC_CHUNK_ELEMS * sizeof(bf16_t)));
+    size_t done = 0;
+    while (done < count) {
+      size_t todo = (count - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (count - done);
+      // convert
+      for (size_t i = 0; i < todo; ++i)
+        h_chunk[i] = f32_to_bf16(h_src[done + i]);
+      // copy
+      HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t),
+                          hipMemcpyHostToDevice));
+      done += todo;
+    }
+    HIP_CHECK(hipHostFree(h_chunk));
+    return;
+  }
+  
+  // Async pipeline
+  size_t done = 0;
+  int stream_idx = 0;
+  bool *buffer_ready = (bool*)calloc(n_streams, sizeof(bool));
+  
+  // Initialize all buffers as ready
+  for (int i = 0; i < n_streams; i++) {
+    buffer_ready[i] = true;
+  }
+  
+  while (done < count) {
+    size_t todo = (count - done > actual_chunk_elems) ? actual_chunk_elems : (count - done);
+    
+    // Wait for this buffer slot to be available
+    if (!buffer_ready[stream_idx]) {
+      HIP_CHECK(hipEventSynchronize(events[stream_idx]));
+      buffer_ready[stream_idx] = true;
+    }
+    
+    // Convert FP32 to BF16 on CPU (parallelized with OpenMP)
+    bf16_t *chunk = pinned_chunks[stream_idx];
+    
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < todo; ++i) {
+      chunk[i] = f32_to_bf16(h_src[done + i]);
+    }
+    
+    // Launch async H2D copy
+    HIP_CHECK(hipMemcpyAsync(d_dst + done, chunk, todo * sizeof(bf16_t),
+                             hipMemcpyHostToDevice, streams[stream_idx]));
+    
+    // Record event to track completion
+    HIP_CHECK(hipEventRecord(events[stream_idx], streams[stream_idx]));
+    buffer_ready[stream_idx] = false;
+    
+    done += todo;
+    stream_idx = (stream_idx + 1) % n_streams;
+  }
+  
+  // Wait for all transfers to complete
+  for (int i = 0; i < n_streams; i++) {
+    HIP_CHECK(hipEventSynchronize(events[i]));
+  }
+  
+  // Cleanup resources
+  free(buffer_ready);
+  
+  for (int i = 0; i < n_streams; i++) {
+    HIP_CHECK(hipHostFree(pinned_chunks[i]));
+    HIP_CHECK(hipEventDestroy(events[i]));
+    HIP_CHECK(hipStreamDestroy(streams[i]));
+  }
+  
+  free(pinned_chunks);
+  free(events);
+  free(streams);
+}
+
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
                                      bf16_t *d_dst) {
   const size_t CHUNK_ELEMS =
@@ -1039,29 +1211,54 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   debug_print_gpu_memory("after expert biases");
 
-  // Large BF16 weights
+  // Large BF16 weights - using async pipelined loading for performance
+  const int n_streams = 4;
+  const size_t chunk_bytes = 64ULL * 1024 * 1024; // 64 MiB per chunk
+  
   HIP_CHECK(
       hipMalloc(&d_token_embedding_table_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H,
-                           d_token_embedding_table_bf16);
+  {
+    PROFILE_SCOPE("token_embedding_table_async_load");
+    copy_fp32_to_bf16_device_async(w->token_embedding_table, (size_t)V * H,
+                                   d_token_embedding_table_bf16, n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(hipMalloc(&d_w_qkv_bf16, (size_t)L * QKV_D * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16);
+  {
+    PROFILE_SCOPE("w_qkv_async_load");
+    copy_fp32_to_bf16_device_async(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   const int O_N = D * Hq;
   HIP_CHECK(hipMalloc(&d_w_o_bf16, (size_t)L * H * O_N * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H * O_N, d_w_o_bf16);
+  {
+    PROFILE_SCOPE("w_o_async_load");
+    copy_fp32_to_bf16_device_async(w->w_o, (size_t)L * H * O_N, d_w_o_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(
       hipMalloc(&d_w_mlp1_bf16, (size_t)L * E * (2 * IM) * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E * (2 * IM) * H,
-                           d_w_mlp1_bf16);
+  {
+    PROFILE_SCOPE("w_mlp1_async_load");
+    copy_fp32_to_bf16_device_async(w->w_mlp1, (size_t)L * E * (2 * IM) * H,
+                                   d_w_mlp1_bf16, n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(hipMalloc(&d_w_mlp2_bf16, (size_t)L * E * H * IM * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16);
+  {
+    PROFILE_SCOPE("w_mlp2_async_load");
+    copy_fp32_to_bf16_device_async(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(hipMalloc(&d_out_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->out, (size_t)V * H, d_out_bf16);
+  {
+    PROFILE_SCOPE("out_async_load");
+    copy_fp32_to_bf16_device_async(w->out, (size_t)V * H, d_out_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   debug_print_gpu_memory("after large BF16 weights (model loaded)");
 }
