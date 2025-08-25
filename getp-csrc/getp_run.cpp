@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <omp.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -87,7 +88,6 @@ static Config *h_config = nullptr;
 // Kernels (FP32 activations)
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
                                int size) {
-  // Block-wide reduction for sum of squares
   extern __shared__ double s_rms[];
   double sum = 0.0;
   for (int i = threadIdx.x; i < size; i += blockDim.x) {
@@ -103,17 +103,13 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
   }
   double inv = rsqrt(s_rms[0] / (double)size + 1e-5);
 
-  // Apply scale
-  // TODO: can be optimize
   for (int i = threadIdx.x; i < size; i += blockDim.x) {
     o[i] = weight[i] * (float)(inv * (double)x[i]);
   }
 }
 
 __global__ void softmax_kernel(float *x, int size) {
-  // Single-threaded sequential implementation to match CPU exactly
   if (threadIdx.x == 0) {
-    // Find max value (sequential like CPU)
     double max_val = (double)x[0];
     for (int i = 1; i < size; i++) {
       double v = (double)x[i];
@@ -122,7 +118,6 @@ __global__ void softmax_kernel(float *x, int size) {
       }
     }
     
-    // Exp and sum (sequential like CPU)
     double sum = 0.0;
     for (int i = 0; i < size; i++) {
       float ev = expf((float)((double)x[i] - max_val));
@@ -130,91 +125,11 @@ __global__ void softmax_kernel(float *x, int size) {
       sum += (double)ev;
     }
     
-    // Normalize (sequential like CPU)
     double inv_sum = 1.0 / sum;
     for (int i = 0; i < size; i++) {
       x[i] = (float)((double)x[i] * inv_sum);
     }
   }
-}
-
-// Writes att[h*S + pos+1] = attn_sinks_layer[h] for all h in [0, Hq)
-__global__ void write_sinks_kernel(float* __restrict__ att,
-                                   const float* __restrict__ attn_sinks_layer,
-                                   int S, int pos, int Hq) {
-  int h = blockIdx.x * blockDim.x + threadIdx.x;
-  if (h < Hq) {
-    att[(size_t)h * S + (pos + 1)] = attn_sinks_layer[h];
-  }
-}
-
-// att is [Hq, S] in row-major per head (stride S). For each head, softmax over t in [0, T)
-__global__ void softmax_heads_kernel(float* __restrict__ att,
-                                     int S, int T, int Hq) {
-  extern __shared__ double sdata[]; // use for reductions
-  int h = blockIdx.x;               // one block per head
-  if (h >= Hq) return;
-
-  float* x = att + (size_t)h * S;
-
-  // 1) compute max in double with deterministic tree reduction
-  double local_max = -INFINITY;
-  for (int t = threadIdx.x; t < T; t += blockDim.x) {
-    local_max = fmax(local_max, (double)x[t]);
-  }
-  
-  // Store local max to shared memory
-  sdata[threadIdx.x] = local_max;
-  __syncthreads();
-  
-  // Binary tree reduction for max
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) {
-      sdata[threadIdx.x] = fmax(sdata[threadIdx.x], sdata[threadIdx.x + s]);
-    }
-    __syncthreads();
-  }
-  
-  // Broadcast max value
-  double max_val = sdata[0];
-  __syncthreads();
-
-  // 2) write back (x[t] = expf((float)((double)x[t] - max))) and accumulate double sum
-  double local_sum = 0.0;
-  for (int t = threadIdx.x; t < T; t += blockDim.x) {
-    float ev = expf((float)((double)x[t] - max_val));
-    x[t] = ev;
-    local_sum += (double)ev;
-  }
-  
-  // Store local sum to shared memory
-  sdata[threadIdx.x] = local_sum;
-  __syncthreads();
-  
-  // Binary tree reduction for sum
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) {
-      sdata[threadIdx.x] += sdata[threadIdx.x + s];
-    }
-    __syncthreads();
-  }
-  
-  // Broadcast sum value
-  double sum_val = sdata[0];
-  __syncthreads();
-
-  // 3) normalize: x[t] *= (float)(1.0 / sum)
-  double inv_sum = 1.0 / sum_val;
-  for (int t = threadIdx.x; t < T; t += blockDim.x) {
-    x[t] = (float)((double)x[t] * inv_sum);
-  }
-}
-
-
-__global__ void add_bias_kernel(float *y, const float *b, int size) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < size)
-    y[i] += b[i];
 }
 
 __global__ void copy_embedding_bf16_row_kernel(float *dst, const bf16_t *src,
@@ -289,120 +204,6 @@ __global__ void compute_cos_sin_kernel(float *cosv, float *sinv, int pos,
   float val = pos * inv_freq;
   cosv[i] = cosf(val) * concentration;
   sinv[i] = sinf(val) * concentration;
-}
-
-__global__ void attention_scores_kernel(
-    float *att,
-    const float *q,
-    const float *key_cache,
-    int h, int pos,
-    int head_dim, int kv_dim,
-    int n_attn_heads, int n_kv_heads,
-    int seq_len, const float *mask) {
-
-  int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t > pos || t >= seq_len) return;
-
-  const int kv_mul = n_attn_heads / n_kv_heads;
-  const float *k = key_cache + (size_t)t * kv_dim + (h / kv_mul) * head_dim;
-
-  double acc = 0.0;
-  const float *qh = q + (size_t)h * head_dim;
-  #pragma unroll
-  for (int i = 0; i < head_dim; ++i) {
-    acc += (double)qh[i] * (double)k[i];
-  }
-
-  const double scale = 1.0 / sqrt((double)head_dim);
-  double score = acc * scale;
-
-  if (mask) {
-    score += (double)mask[(size_t)pos * seq_len + t];
-  }
-
-  att[(size_t)h * seq_len + t] = (float)score;
-}
-
-__global__ void attention_values_kernel(
-    float *tb,
-    const float *att,
-    const float *value_cache,
-    int h, int pos,
-    int head_dim, int kv_dim,
-    int n_attn_heads, int n_kv_heads,
-    int seq_len) {
-
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= head_dim) return;
-
-  const int kv_mul = n_attn_heads / n_kv_heads;
-  const int base_v = (h / kv_mul) * head_dim;
-
-  double acc = 0.0;
-  const float *att_h = att + (size_t)h * seq_len;
-
-  for (int t = 0; t <= pos; ++t) {
-    const float *v = value_cache + (size_t)t * kv_dim + base_v;
-    acc += (double)att_h[t] * (double)v[i];
-  }
-
-  tb[(size_t)h * head_dim + i] = (float)acc;
-}
-
-// Computes tb[h, i] = sum_{t=0..T-1} att[h, t] * value_cache[t, base_v + i]
-// for all heads h in [0, Hq) and i in [0, D).
-template<int TILE_T>
-__global__ void attn_values_heads_kernel(
-    float* __restrict__ tb,           // [Hq, D]
-    const float* __restrict__ att,    // [Hq, S]
-    const float* __restrict__ value_cache, // [S, KV]
-    int Hq, int Hk, int D, int KV,    // KV = D * Hk
-    int S, int T                      // T = pos + 2
-) {
-  extern __shared__ double s_att[];   // size = TILE_T
-
-  const int h   = blockIdx.x;         // head id
-  const int tid = threadIdx.x;
-  if (h >= Hq) return;
-
-  // kv_mul = n_attn_heads / n_kv_heads
-  const int kv_mul = Hq / Hk;
-  const int base_v = (h / kv_mul) * D;
-
-  // i-dimension scheduling: each thread handles one i
-  int i_start = blockIdx.y * blockDim.x + tid;
-
-  // Accumulator in double
-  double acc = 0.0;
-
-  // Tile over time dimension
-  for (int t0 = 0; t0 < T; t0 += TILE_T) {
-    const int tile = min(TILE_T, T - t0);
-
-    // 1) Load att[h, t] into shared memory as double
-    for (int t = tid; t < tile; t += blockDim.x) {
-      s_att[t] = (double)att[(size_t)h * S + (t0 + t)];
-    }
-    __syncthreads();
-
-    // 2) Accumulate products for the assigned i
-    if (i_start < D) {
-      // base pointer for this i over time
-      const float* v_ptr = value_cache + (size_t)(t0) * KV + base_v + i_start;
-      for (int t = 0; t < tile; ++t) {
-        // value_cache layout: [t, KV]
-        // element: value_cache[t, base_v + i]
-        double vv = (double)v_ptr[t * (size_t)KV];
-        acc += s_att[t] * vv;
-      }
-    }
-    __syncthreads();
-  }
-
-  // 3) Write back
-  if (i_start < D) {
-    tb[(size_t)h * D + i_start] = (float)acc;
-  }
 }
 
 // Fused attention kernel: scores + sink + softmax + values in one pass
@@ -557,65 +358,94 @@ __global__ void attention_fused_kernel(
   }
 }
 
-
 __global__ void residual_add_kernel(float *x, const float *residual, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < size)
     x[i] += residual[i];
 }
 
-// Pair struct for GPU sorting (matching CPU implementation)
-typedef struct {
-  float value;
-  int index;
-} GPUPair;
+// Fused matmul with bias and residual add: W(d,n)[bf16] @ x(n)[f32] + b(d)[f32] + residual(d)[f32] -> output(d)[f32]
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_bf16_wxf32_yf32_bias_residual(float * __restrict__ output,
+                                                     const float * __restrict__ x,
+                                                     const bf16_t * __restrict__ w,
+                                                     const float * __restrict__ b,
+                                                     const float * __restrict__ residual,
+                                                     int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
 
-// Comparison function for GPU qsort (descending order)
-__device__ int gpu_compare_desc(const void *a, const void *b) {
-  const GPUPair *pa = (const GPUPair *)a;
-  const GPUPair *pb = (const GPUPair *)b;
-  if (pb->value > pa->value) return 1;
-  if (pb->value < pa->value) return -1;
-  return 0;
-}
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;               // wave id in block: 0..TM-1
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
 
-// GPU sorting function using bubble sort (since qsort not available on device)
-__device__ void gpu_sort_pairs(GPUPair *pairs, int n) {
-  for (int i = 0; i < n - 1; i++) {
-    for (int j = 0; j < n - i - 1; j++) {
-      if (pairs[j].value < pairs[j + 1].value) {
-        GPUPair temp = pairs[j];
-        pairs[j] = pairs[j + 1];
-        pairs[j + 1] = temp;
-      }
+  double acc_all = 0.0;  // Use double precision like CPU
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
     }
+    __syncthreads();
+
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    double acc = 0.0;  // Use double precision like CPU
+    
+    // Direct bf16 operations without casting
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      bf16_t bf16_val = w_row[k];
+      double wx = (double)bf16_to_f32(bf16_val);
+      double xval = (double)lds_x[k];
+      acc += wx * xval;  // Double precision accumulation
+    }
+
+    // Wave reduction (width = 64) with double precision
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
   }
+
+  if (lane == 0) output[row] = (float)acc_all + b[row] + residual[row];  // Add bias and residual
 }
 
 __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
-                                   const float *router_score, int num_experts,
-                                   int experts_per_token) {
-  // Allocate shared memory for pairs (assuming small number of experts)
-  extern __shared__ GPUPair pairs[];
-  
-  // Copy router scores to pairs array
-  for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
-    pairs[i].value = router_score[i];
-    pairs[i].index = i;
-  }
-  __syncthreads();
-  
-  // Sort pairs in descending order (only thread 0 does the sorting)
-  if (threadIdx.x == 0) {
-    gpu_sort_pairs(pairs, num_experts);
-  }
-  __syncthreads();
-  
-  // Extract top-k results
-  for (int i = threadIdx.x; i < experts_per_token; i += blockDim.x) {
-    topk_values[i] = pairs[i].value;
-    topk_indices[i] = pairs[i].index;
-  }
+                                   const float *router_score,
+                                   int num_experts, int experts_per_token) {
+    extern __shared__ float smem_scores[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < num_experts; i += blockDim.x) {
+        smem_scores[i] = router_score[i];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int k = 0; k < experts_per_token; k++) {
+            float max_val = -INFINITY;
+            int max_idx = -1;
+
+            for (int j = k; j < num_experts; j++) {
+                float v = smem_scores[j];
+                if (v > max_val) {
+                    max_val = v;
+                    max_idx = j;
+                }
+            }
+
+            float tmp = smem_scores[k];
+            smem_scores[k] = smem_scores[max_idx];
+            smem_scores[max_idx] = tmp;
+
+            topk_values[k] = smem_scores[k];
+            topk_indices[k] = max_idx;
+        }
+    }
 }
 
 __global__ void split_gate_up_kernel(float *gate, float *up,
@@ -653,12 +483,6 @@ __global__ void weighted_sum_kernel(float *e_agg, const float *expert_out,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < hidden_dim)
     e_agg[i] += expert_out[i] * weight;
-}
-
-__global__ void memset_zero_kernel(float *ptr, int size) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < size)
-    ptr[i] = 0.0f;
 }
 
 // Matmul: W(d,n)[bf16] @ x(n)[f32] -> y(d)[f32]; FP32 accumulate
@@ -709,12 +533,62 @@ __global__ void matmul_bf16_wxf32_yf32(float * __restrict__ y,
   if (lane == 0) y[row] = (float)acc_all;  // Convert back to float for output
 }
 
-// FP32 matmul: W(d,n)[f32] @ x(n)[f32] -> y(d)[f32]
+// Fused matmul with bias: W(d,n)[bf16] @ x(n)[f32] + b(d)[f32] -> y(d)[f32]
 __launch_bounds__(BLOCK_SIZE, 2)
-__global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
-                                      const float * __restrict__ x,
-                                      const float * __restrict__ w,
-                                      int n, int d) {
+__global__ void matmul_bf16_wxf32_yf32_bias(float * __restrict__ y,
+                                            const float * __restrict__ x,
+                                            const bf16_t * __restrict__ w,
+                                            const float * __restrict__ b,
+                                            int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;               // wave id in block: 0..TM-1
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  double acc_all = 0.0;  // Use double precision like CPU
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      lds_x[k] = x[k_base + k];
+    }
+    __syncthreads();
+
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+
+    double acc = 0.0;  // Use double precision like CPU
+    
+    // Direct bf16 operations without casting
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      bf16_t bf16_val = w_row[k];
+      double wx = (double)bf16_to_f32(bf16_val);
+      double xval = (double)lds_x[k];
+      acc += wx * xval;  // Double precision accumulation
+    }
+
+    // Wave reduction (width = 64) with double precision
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc += __shfl_down(acc, off, WF_SIZE);
+    }
+    if (lane == 0) acc_all += acc;
+
+    __syncthreads();
+  }
+
+  if (lane == 0) y[row] = (float)acc_all + b[row];  // Add bias
+}
+
+// Fused FP32 matmul with bias: W(d,n)[f32] @ x(n)[f32] + b(d)[f32] -> y(d)[f32]
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_f32_wxf32_yf32_bias(float * __restrict__ y,
+                                           const float * __restrict__ x,
+                                           const float * __restrict__ w,
+                                           const float * __restrict__ b,
+                                           int n, int d) {
   __shared__ float lds_x[TK + LDS_PAD];
 
   const int tid  = threadIdx.x;
@@ -753,31 +627,181 @@ __global__ void matmul_f32_wxf32_yf32(float * __restrict__ y,
     __syncthreads();
   }
 
-  if (lane == 0) y[row] = (float)acc_all;  // Convert back to float for output
+  if (lane == 0) y[row] = (float)acc_all + b[row];  // Add bias
 }
 
+
+// Async pipelined FP32->BF16 converter with overlapped CPU conversion and H2D transfers
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
-                                     bf16_t *d_dst) {
-  const size_t CHUNK_ELEMS =
-      (size_t)8 * 1024 * 1024; // 8M elems (~16MB) per chunk
-  bf16_t *h_chunk = nullptr;
-  HIP_CHECK(hipHostMalloc((void **)&h_chunk, CHUNK_ELEMS * sizeof(bf16_t)));
-  size_t done = 0;
-  while (done < count) {
-    size_t todo = (count - done > CHUNK_ELEMS) ? CHUNK_ELEMS : (count - done);
-    // convert
-    for (size_t i = 0; i < todo; ++i)
-      h_chunk[i] = f32_to_bf16(h_src[done + i]);
-    // copy
-    HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t),
-                        hipMemcpyHostToDevice));
-    done += todo;
+                                           bf16_t *d_dst, int n_streams = 4,
+                                           size_t chunk_bytes = 64ULL * 1024 * 1024) {
+  if (count == 0) return;
+  
+  // Calculate chunk size in elements
+  const size_t chunk_elems = chunk_bytes / sizeof(bf16_t);
+  const size_t actual_chunk_elems = (chunk_elems > count) ? count : chunk_elems;
+  
+  // Try to allocate pinned buffers and streams
+  hipStream_t *streams = nullptr;
+  hipEvent_t *events = nullptr;
+  bf16_t **pinned_chunks = nullptr;
+  bool async_success = true;
+  
+  // Allocate stream array
+  streams = (hipStream_t*)malloc(n_streams * sizeof(hipStream_t));
+  if (!streams) async_success = false;
+  
+  // Allocate event array
+  if (async_success) {
+    events = (hipEvent_t*)malloc(n_streams * sizeof(hipEvent_t));
+    if (!events) async_success = false;
   }
-  HIP_CHECK(hipHostFree(h_chunk));
+  
+  // Allocate pinned buffer array
+  if (async_success) {
+    pinned_chunks = (bf16_t**)malloc(n_streams * sizeof(bf16_t*));
+    if (!pinned_chunks) async_success = false;
+    else {
+      for (int i = 0; i < n_streams; i++) pinned_chunks[i] = nullptr;
+    }
+  }
+  
+  // Create streams
+  if (async_success) {
+    for (int i = 0; i < n_streams; i++) {
+      hipError_t err = hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
+      if (err != hipSuccess) {
+        async_success = false;
+        break;
+      }
+    }
+  }
+  
+  // Create events
+  if (async_success) {
+    for (int i = 0; i < n_streams; i++) {
+      hipError_t err = hipEventCreateWithFlags(&events[i], hipEventDisableTiming);
+      if (err != hipSuccess) {
+        async_success = false;
+        break;
+      }
+    }
+  }
+  
+  // Allocate pinned host buffers
+  if (async_success) {
+    for (int i = 0; i < n_streams; i++) {
+      hipError_t err = hipHostMalloc((void**)&pinned_chunks[i], 
+                                     actual_chunk_elems * sizeof(bf16_t));
+      if (err != hipSuccess) {
+        async_success = false;
+        break;
+      }
+    }
+  }
+  
+  // If async allocation failed, fallback to synchronous
+  if (!async_success) {
+    // Cleanup any partial allocations
+    if (pinned_chunks) {
+      for (int i = 0; i < n_streams; i++) {
+        if (pinned_chunks[i]) {
+          (void)hipHostFree(pinned_chunks[i]); // Ignore return value in cleanup
+        }
+      }
+      free(pinned_chunks);
+    }
+    if (events) {
+      for (int i = 0; i < n_streams; i++) {
+        (void)hipEventDestroy(events[i]); // May fail silently if not created
+      }
+      free(events);
+    }
+    if (streams) {
+      for (int i = 0; i < n_streams; i++) {
+        (void)hipStreamDestroy(streams[i]); // May fail silently if not created
+      }
+      free(streams);
+    }
+    
+    // Fallback to synchronous copy
+    const size_t SYNC_CHUNK_ELEMS = 8 * 1024 * 1024; // 8M elems (~16MB) per chunk
+    bf16_t *h_chunk = nullptr;
+    HIP_CHECK(hipHostMalloc((void **)&h_chunk, SYNC_CHUNK_ELEMS * sizeof(bf16_t)));
+    size_t done = 0;
+    while (done < count) {
+      size_t todo = (count - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (count - done);
+      // convert
+      for (size_t i = 0; i < todo; ++i)
+        h_chunk[i] = f32_to_bf16(h_src[done + i]);
+      // copy
+      HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t),
+                          hipMemcpyHostToDevice));
+      done += todo;
+    }
+    HIP_CHECK(hipHostFree(h_chunk));
+    return;
+  }
+  
+  // Async pipeline
+  size_t done = 0;
+  int stream_idx = 0;
+  bool *buffer_ready = (bool*)calloc(n_streams, sizeof(bool));
+  
+  // Initialize all buffers as ready
+  for (int i = 0; i < n_streams; i++) {
+    buffer_ready[i] = true;
+  }
+  
+  while (done < count) {
+    size_t todo = (count - done > actual_chunk_elems) ? actual_chunk_elems : (count - done);
+    
+    // Wait for this buffer slot to be available
+    if (!buffer_ready[stream_idx]) {
+      HIP_CHECK(hipEventSynchronize(events[stream_idx]));
+      buffer_ready[stream_idx] = true;
+    }
+    
+    // Convert FP32 to BF16 on CPU (parallelized with OpenMP)
+    bf16_t *chunk = pinned_chunks[stream_idx];
+    
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < todo; ++i) {
+      chunk[i] = f32_to_bf16(h_src[done + i]);
+    }
+    
+    // Launch async H2D copy
+    HIP_CHECK(hipMemcpyAsync(d_dst + done, chunk, todo * sizeof(bf16_t),
+                             hipMemcpyHostToDevice, streams[stream_idx]));
+    
+    // Record event to track completion
+    HIP_CHECK(hipEventRecord(events[stream_idx], streams[stream_idx]));
+    buffer_ready[stream_idx] = false;
+    
+    done += todo;
+    stream_idx = (stream_idx + 1) % n_streams;
+  }
+  
+  // Wait for all transfers to complete
+  for (int i = 0; i < n_streams; i++) {
+    HIP_CHECK(hipEventSynchronize(events[i]));
+  }
+  
+  // Cleanup resources
+  free(buffer_ready);
+  
+  for (int i = 0; i < n_streams; i++) {
+    HIP_CHECK(hipHostFree(pinned_chunks[i]));
+    HIP_CHECK(hipEventDestroy(events[i]));
+    HIP_CHECK(hipStreamDestroy(streams[i]));
+  }
+  
+  free(pinned_chunks);
+  free(events);
+  free(streams);
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-  PROFILE_FUNCTION();
   h_config = &transformer->config;
   HIP_CHECK(hipSetDevice(0));
 
@@ -891,29 +915,48 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   debug_print_gpu_memory("after expert biases");
 
-  // Large BF16 weights
+  // Large BF16 weights - using async pipelined loading for performance
+  const int n_streams = 4;
+  const size_t chunk_bytes = 64ULL * 1024 * 1024; // 64 MiB per chunk
+  
   HIP_CHECK(
       hipMalloc(&d_token_embedding_table_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H,
-                           d_token_embedding_table_bf16);
+  {
+    copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H,
+                                   d_token_embedding_table_bf16, n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(hipMalloc(&d_w_qkv_bf16, (size_t)L * QKV_D * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16);
+  {
+    copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   const int O_N = D * Hq;
   HIP_CHECK(hipMalloc(&d_w_o_bf16, (size_t)L * H * O_N * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H * O_N, d_w_o_bf16);
+  {
+    copy_fp32_to_bf16_device(w->w_o, (size_t)L * H * O_N, d_w_o_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(
       hipMalloc(&d_w_mlp1_bf16, (size_t)L * E * (2 * IM) * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E * (2 * IM) * H,
-                           d_w_mlp1_bf16);
+  {
+    copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E * (2 * IM) * H,
+                                   d_w_mlp1_bf16, n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(hipMalloc(&d_w_mlp2_bf16, (size_t)L * E * H * IM * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16);
+  {
+    copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   HIP_CHECK(hipMalloc(&d_out_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->out, (size_t)V * H, d_out_bf16);
+  {
+    copy_fp32_to_bf16_device(w->out, (size_t)V * H, d_out_bf16,
+                                   n_streams, chunk_bytes);
+  }
 
   debug_print_gpu_memory("after large BF16 weights (model loaded)");
 }
@@ -994,16 +1037,13 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
             d_t, d_x, d_rms_attn_w + l * H, H));
 
-    // QKV
+    // QKV with fused bias
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_bf16_wxf32_yf32(QKV)",
-        matmul_bf16_wxf32_yf32<<<gridQKV, block>>>(
-            d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, H, QKV_D));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_qkv)",
-                          add_bias_kernel<<<get_gemv_grid_dim(QKV_D), block>>>(
-                              d_qkv, d_b_qkv + l * QKV_D, QKV_D));
+        "matmul_bf16_wxf32_yf32_bias(QKV)",
+        matmul_bf16_wxf32_yf32_bias<<<gridQKV, block>>>(
+            d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, d_b_qkv + l * QKV_D, H, QKV_D));
 
     PROFILE_KERNEL_LAUNCH(
         "split_qkv_kernel",
@@ -1055,14 +1095,9 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_bf16_wxf32_yf32(W_o)",
-        matmul_bf16_wxf32_yf32<<<gridO, block>>>(
-            d_tb2, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, O_N, H));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_o)",
-                          add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
-                              d_tb2, d_b_o + l * H, H));
-    PROFILE_KERNEL_LAUNCH("residual_add_kernel(attn)",
-                          residual_add_kernel<<<gridH, block>>>(d_x, d_tb2, H));
+        "matmul_bf16_wxf32_yf32_bias_residual(W_o)",
+        matmul_bf16_wxf32_yf32_bias_residual<<<gridO, block>>>(
+            d_x, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, d_b_o + l * H, d_x, O_N, H));
 
     // FFN RMSNorm
     PROFILE_KERNEL_LAUNCH(
@@ -1070,30 +1105,33 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         rmsnorm_kernel<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
             d_t, d_x, d_rms_ffn_w + l * H, H));
 
-    // Router FP32: d_router_score(E) = W_router(E,H) @ d_t(H)
+    // Router FP32 with fused bias: d_router_score(E) = W_router(E,H) @ d_t(H) + b_router
     dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_f32_wxf32_yf32(router)",
-        matmul_f32_wxf32_yf32<<<gridE, block>>>(
-            d_router_score, d_t, d_w_router + (size_t)l * H * E, H, E));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel(router_b)",
-                          add_bias_kernel<<<gridE, block>>>(
-                              d_router_score, d_b_router + l * E, E));
+        "matmul_f32_wxf32_yf32_bias(router)",
+        matmul_f32_wxf32_yf32_bias<<<gridE, block>>>(
+            d_router_score, d_t, d_w_router + (size_t)l * H * E, d_b_router + l * E, H, E));
 
     // Top-k experts
-    size_t shared_mem_size = E * sizeof(GPUPair);
+    size_t shared_mem_size = E * sizeof(float);
+
     PROFILE_KERNEL_LAUNCH("topk_kernel_1token",
-                          topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(d_topk_v, d_topk_i,
-                                                       d_router_score, E,
-                                                       p->experts_per_token));
+        topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(
+            d_topk_v,
+            d_topk_i,
+            d_router_score,
+            E,
+            p->experts_per_token
+        )
+    );
+
     PROFILE_KERNEL_LAUNCH(
         "softmax_kernel(topk)",
         softmax_kernel<<<1, 1>>>(
             d_topk_v, p->experts_per_token));
 
-    // Aggregate experts
-    PROFILE_KERNEL_LAUNCH("memset_zero_kernel(e_agg)",
-                          memset_zero_kernel<<<gridH, block>>>(d_e_agg, H));
+    // Zero-initialize expert aggregation buffer
+    HIP_CHECK(hipMemsetAsync(d_e_agg, 0, H * sizeof(float), 0));
 
     // Read topk to host (small)
     float *h_topk_v = (float *)malloc(p->experts_per_token * sizeof(float));
@@ -1107,20 +1145,14 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
       int e = h_topk_i[kk];
       float ew = h_topk_v[kk];
-      // MLP1: (2IM x H) @ d_t
+      // MLP1 with fused bias: (2IM x H) @ d_t + b_mlp1
       size_t off = ((size_t)l * E + e) * (size_t)(2 * IM) * (size_t)H;
+      size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
       dim3 gridM1 = get_gemv_grid_dim(2 * IM);
       PROFILE_KERNEL_LAUNCH(
-          "matmul_bf16_wxf32_yf32(MLP1)",
-          matmul_bf16_wxf32_yf32<<<gridM1, block>>>(
-              d_mlp1_out, d_t, d_w_mlp1_bf16 + off, H, 2 * IM));
-
-      // Add bias b_mlp1
-      size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
-      PROFILE_KERNEL_LAUNCH(
-          "add_bias_kernel(b_mlp1)",
-          add_bias_kernel<<<get_gemv_grid_dim(2 * IM), block>>>(
-              d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
+          "matmul_bf16_wxf32_yf32_bias(MLP1)",
+          matmul_bf16_wxf32_yf32_bias<<<gridM1, block>>>(
+              d_mlp1_out, d_t, d_w_mlp1_bf16 + off, g_b_mlp1 + b1off, H, 2 * IM));
 
       // Split & SwiGLU
       dim3 gridIM((IM + block.x - 1) / block.x);
@@ -1131,18 +1163,15 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                             swiglu_kernel<<<gridIM, block>>>(
                                 d_gate_up, d_gate, d_up, IM, p->swiglu_limit));
 
-      // MLP2: (H x IM) @ gate_up
+      // MLP2 with fused bias: (H x IM) @ gate_up + b_mlp2
       off = ((size_t)l * E + e) * (size_t)H * (size_t)IM;
-      PROFILE_KERNEL_LAUNCH(
-          "matmul_bf16_wxf32_yf32(MLP2)",
-          matmul_bf16_wxf32_yf32<<<get_gemv_grid_dim(H), block>>>(
-              d_tb2, d_gate_up, d_w_mlp2_bf16 + off, IM, H));
-
-      // Add b_mlp2, then weighted sum into e_agg
       size_t b2off = ((size_t)l * E + e) * (size_t)H;
-      PROFILE_KERNEL_LAUNCH("add_bias_kernel(b_mlp2)",
-                            add_bias_kernel<<<get_gemv_grid_dim(H), block>>>(
-                                d_tb2, g_b_mlp2 + b2off, H));
+      PROFILE_KERNEL_LAUNCH(
+          "matmul_bf16_wxf32_yf32_bias(MLP2)",
+          matmul_bf16_wxf32_yf32_bias<<<get_gemv_grid_dim(H), block>>>(
+              d_tb2, d_gate_up, d_w_mlp2_bf16 + off, g_b_mlp2 + b2off, IM, H));
+
+      // Weighted sum into e_agg
       PROFILE_KERNEL_LAUNCH(
           "weighted_sum_kernel",
           weighted_sum_kernel<<<gridH, block>>>(d_e_agg, d_tb2, ew, H));
