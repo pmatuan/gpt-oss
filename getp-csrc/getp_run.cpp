@@ -67,6 +67,8 @@ static float *d_qkv, *d_q, *d_k, *d_v;
 static float *d_key_cache, *d_value_cache;
 static float *d_att, *d_logits, *d_mask;
 static float *d_cos_vals, *d_sin_vals;
+static int *d_token2row; // token -> physical row mapping for paged attention
+static int *d_nan_flag;  // debug flag for NaN/Inf detection
 
 // Small weights (keep FP32)
 static float *d_rms_attn_w, *d_rms_ffn_w;
@@ -849,6 +851,18 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipMalloc(&d_cos_vals, (D / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_sin_vals, (D / 2) * sizeof(float)));
 
+  // Allocate token2row and initialize to identity (no paging indirection by default)
+  HIP_CHECK(hipMalloc(&d_token2row, S * sizeof(int)));
+  {
+    int *h_token2row = (int *)malloc(S * sizeof(int));
+    for (int i = 0; i < S; ++i) h_token2row[i] = i;
+    HIP_CHECK(hipMemcpy(d_token2row, h_token2row, S * sizeof(int), hipMemcpyHostToDevice));
+    free(h_token2row);
+  }
+
+  // Allocate NaN flag
+  HIP_CHECK(hipMalloc(&d_nan_flag, sizeof(int)));
+
   if (h_config->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&d_mask, S * S * sizeof(float)));
     float *h_mask = (float *)malloc(S * S * sizeof(float));
@@ -988,6 +1002,10 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipFree(d_sin_vals));
   if (d_mask)
     HIP_CHECK(hipFree(d_mask));
+  if (d_token2row)
+    HIP_CHECK(hipFree(d_token2row));
+  if (d_nan_flag)
+    HIP_CHECK(hipFree(d_nan_flag));
 
   HIP_CHECK(hipFree(d_rms_attn_w));
   HIP_CHECK(hipFree(d_rms_ffn_w));
@@ -1083,16 +1101,17 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     // Shared memory: TILE_T doubles for logits/weights + blockDim.x doubles for reductions
     size_t shmem = (TILE_T + block.x) * sizeof(double);
     
-    PROFILE_KERNEL_LAUNCH(
-        "attention_fused_kernel",
-        attention_fused_kernel<TILE_T><<<grid, block, shmem>>>(
-            d_tb,                      // [Hq, D]
-            d_q,                       // [Hq, D]
-            d_key_cache + loff,        // [S, KV] base for this layer
-            d_value_cache + loff,      // [S, KV]
-            d_attn_sinks + l * Hq,     // [Hq]
-            (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
-            Hq, Hk, D, KV, S, pos));
+  PROFILE_KERNEL_LAUNCH(
+    "paged_attention_fused_kernel",
+    paged_attention_fused_kernel<TILE_T><<<grid, block, shmem>>>(
+      d_tb,                      // [Hq, D]
+      d_q,                       // [Hq, D]
+      d_key_cache + loff,        // [Rows, KV] base for this layer
+      d_value_cache + loff,      // [Rows, KV]
+      d_token2row,               // [S]
+      d_attn_sinks + l * Hq,     // [Hq]
+      (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
+      Hq, Hk, D, KV, S, pos));
 
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
