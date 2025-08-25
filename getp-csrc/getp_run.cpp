@@ -1,5 +1,7 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
+#include "../attention/attention.hpp"
+#include "../attention/attention.cpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
