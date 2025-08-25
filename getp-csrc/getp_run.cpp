@@ -1097,7 +1097,6 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-  PROFILE_FUNCTION();
   h_config = &transformer->config;
   HIP_CHECK(hipSetDevice(0));
 
@@ -1218,14 +1217,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(
       hipMalloc(&d_token_embedding_table_bf16, (size_t)V * H * sizeof(bf16_t)));
   {
-    PROFILE_SCOPE("token_embedding_table_async_load");
     copy_fp32_to_bf16_device_async(w->token_embedding_table, (size_t)V * H,
                                    d_token_embedding_table_bf16, n_streams, chunk_bytes);
   }
 
   HIP_CHECK(hipMalloc(&d_w_qkv_bf16, (size_t)L * QKV_D * H * sizeof(bf16_t)));
   {
-    PROFILE_SCOPE("w_qkv_async_load");
     copy_fp32_to_bf16_device_async(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16,
                                    n_streams, chunk_bytes);
   }
@@ -1233,7 +1230,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   const int O_N = D * Hq;
   HIP_CHECK(hipMalloc(&d_w_o_bf16, (size_t)L * H * O_N * sizeof(bf16_t)));
   {
-    PROFILE_SCOPE("w_o_async_load");
     copy_fp32_to_bf16_device_async(w->w_o, (size_t)L * H * O_N, d_w_o_bf16,
                                    n_streams, chunk_bytes);
   }
@@ -1241,21 +1237,18 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(
       hipMalloc(&d_w_mlp1_bf16, (size_t)L * E * (2 * IM) * H * sizeof(bf16_t)));
   {
-    PROFILE_SCOPE("w_mlp1_async_load");
     copy_fp32_to_bf16_device_async(w->w_mlp1, (size_t)L * E * (2 * IM) * H,
                                    d_w_mlp1_bf16, n_streams, chunk_bytes);
   }
 
   HIP_CHECK(hipMalloc(&d_w_mlp2_bf16, (size_t)L * E * H * IM * sizeof(bf16_t)));
   {
-    PROFILE_SCOPE("w_mlp2_async_load");
     copy_fp32_to_bf16_device_async(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16,
                                    n_streams, chunk_bytes);
   }
 
   HIP_CHECK(hipMalloc(&d_out_bf16, (size_t)V * H * sizeof(bf16_t)));
   {
-    PROFILE_SCOPE("out_async_load");
     copy_fp32_to_bf16_device_async(w->out, (size_t)V * H, d_out_bf16,
                                    n_streams, chunk_bytes);
   }
