@@ -716,6 +716,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMemcpy(d_token2row, h_token2row, S * sizeof(int), hipMemcpyHostToDevice));
     free(h_token2row);
   }
+  // Allocate NaN flag
+  HIP_CHECK(hipMalloc(&d_nan_flag, sizeof(int)));
 
   if (h_config->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&d_mask, S * S * sizeof(float)));
