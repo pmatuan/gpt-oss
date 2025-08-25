@@ -708,7 +708,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipMalloc(&d_cos_vals, (D / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_sin_vals, (D / 2) * sizeof(float)));
 
-  // Allocate token2row and initialize to identity (no paging indirection by default)
+   // Allocate token2row and initialize to identity (no paging indirection by default)
   HIP_CHECK(hipMalloc(&d_token2row, S * sizeof(int)));
   {
     int *h_token2row = (int *)malloc(S * sizeof(int));
@@ -716,8 +716,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMemcpy(d_token2row, h_token2row, S * sizeof(int), hipMemcpyHostToDevice));
     free(h_token2row);
   }
-  // NaN flag buffer
-  HIP_CHECK(hipMalloc(&d_nan_flag, sizeof(int)));
 
   if (h_config->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&d_mask, S * S * sizeof(float)));
@@ -948,6 +946,25 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
                         hipMemcpyDeviceToDevice));
+
+    // // Fused attention kernel: scores + sink + softmax + values in one pass
+    // const int T_real = pos + 1;
+    // const int TILE_T = 256;
+    // dim3 grid(Hq);
+    // dim3 block(256);
+    // // Shared memory: TILE_T doubles for logits/weights + blockDim.x doubles for reductions
+    // size_t shmem = (TILE_T + block.x) * sizeof(double);
+    
+    // PROFILE_KERNEL_LAUNCH(
+    //     "attention_fused_kernel",
+    //     attention_fused_kernel<TILE_T><<<grid, block, shmem>>>(
+    //         d_tb,                      // [Hq, D]
+    //         d_q,                       // [Hq, D]
+    //         d_key_cache + loff,        // [S, KV] base for this layer
+    //         d_value_cache + loff,      // [S, KV]
+    //         d_attn_sinks + l * Hq,     // [Hq]
+    //         (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
+    //         Hq, Hk, D, KV, S, pos));
 
     // Fused attention kernel: scores + sink + softmax + values in one pass
     const int T_real = pos + 1;

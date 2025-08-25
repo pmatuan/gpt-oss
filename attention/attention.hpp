@@ -3,18 +3,6 @@
 
 #include <hip/hip_runtime.h>
 
-// Interface only; implementations live in attention.cpp
-
-__global__ void attention_scores_kernel(
-    float *att, const float *q, const float *key_cache, int h, int pos,
-    int head_dim, int kv_dim, int n_attn_heads, int n_kv_heads, int seq_len,
-    const float *mask);
-
-__global__ void attention_values_kernel(
-    float *tb, const float *att, const float *value_cache, int h, int pos,
-    int head_dim, int kv_dim, int n_attn_heads, int n_kv_heads, int seq_len);
-
-
 // Fused attention kernel: scores + sink + softmax + values in one pass (self-attention style)
 // Template TILE_T for tile size, as in getp_run.cpp
 template<int TILE_T>

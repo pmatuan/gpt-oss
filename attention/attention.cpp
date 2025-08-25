@@ -1,41 +1,6 @@
 #include "attention.hpp"
 #include <math.h>
 
-__global__ void attention_scores_kernel(
-    float *att, const float *q, const float *key_cache, int h, int pos,
-    int head_dim, int kv_dim, int n_attn_heads, int n_kv_heads, int seq_len,
-    const float *mask) {
-  int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t > pos) return;
-
-  int kv_mul = n_attn_heads / n_kv_heads;
-  const float *k = key_cache + t * kv_dim + (h / kv_mul) * head_dim;
-
-  float score = 0.0f;
-  for (int i = 0; i < head_dim; ++i) {
-    score += q[h * head_dim + i] * k[i];
-  }
-  score *= rsqrtf((float)head_dim);
-  if (mask) score += mask[pos * seq_len + t];
-  att[h * seq_len + t] = score;
-}
-
-__global__ void attention_values_kernel(
-    float *tb, const float *att, const float *value_cache, int h, int pos,
-    int head_dim, int kv_dim, int n_attn_heads, int n_kv_heads, int seq_len) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= head_dim) return;
-
-  float res = 0.0f;
-  int kv_mul = n_attn_heads / n_kv_heads;
-  for (int t = 0; t <= pos; ++t) {
-    const float *v = value_cache + t * kv_dim + (h / kv_mul) * head_dim;
-    res += att[h * seq_len + t] * v[i];
-  }
-  tb[h * head_dim + i] = res;
-}
-
-
 // Fused attention kernel: scores + sink + softmax + values in one pass (self-attention style)
 // Template TILE_T for tile size, as in getp_run.cpp
 template<int TILE_T>
