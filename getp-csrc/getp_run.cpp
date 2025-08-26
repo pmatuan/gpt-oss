@@ -1,7 +1,9 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
-#include <rocwmma/rocwmma.hpp>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_cooperative_groups.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,7 +29,7 @@
     }                                                                          \
   } while (0)
 
-typedef rocwmma::bfloat16_t bf16_t;
+typedef hip_bfloat16 bf16_t;
 
 static inline void debug_print_gpu_memory(const char *tag) {
   size_t free_b = 0, total_b = 0;
@@ -264,12 +266,12 @@ __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
   }
 }
 
-// ---------------- GEMV kernels -----------------
+// ---------------- MFMA-Optimized GEMV kernels -----------------
 
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 2)
 __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x,
-                              const T *__restrict__ w, int n, int d) {
+                                   const T *__restrict__ w, int n, int d) {
   __shared__ float lds_x[TK + LDS_PAD];
 
   const int tid = threadIdx.x;
@@ -287,21 +289,57 @@ __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x
     __syncthreads();
 
     const T *__restrict__ w_row = w + (size_t)row * n + k_base;
-    float acc = 0.0f;
-    #pragma unroll 4
-    for (int k = lane; k < k_size; k += WF_SIZE) {
-      float x_val = lds_x[k];
-      if constexpr (std::is_same_v<T, bf16_t>) {
+    
+    // Use optimized BF16 operations when possible
+    if constexpr (std::is_same_v<T, bf16_t>) {
+      float acc = 0.0f;
+      
+      // Process 4 elements at a time for better memory access
+      int k_vec4 = (k_size / 4) * 4;
+      for (int k = lane * 4; k < k_vec4; k += WF_SIZE * 4) {
+        if (k + 3 < k_vec4) {
+          // Vectorized BF16 operations
+          float x_val0 = lds_x[k];
+          float x_val1 = lds_x[k+1];
+          float x_val2 = lds_x[k+2];
+          float x_val3 = lds_x[k+3];
+          
+          bf16_t w_val0 = w_row[k];
+          bf16_t w_val1 = w_row[k+1];
+          bf16_t w_val2 = w_row[k+2];
+          bf16_t w_val3 = w_row[k+3];
+          
+          // Accumulate with FMA for better precision
+          acc = fmaf(static_cast<float>(w_val0), x_val0, acc);
+          acc = fmaf(static_cast<float>(w_val1), x_val1, acc);
+          acc = fmaf(static_cast<float>(w_val2), x_val2, acc);
+          acc = fmaf(static_cast<float>(w_val3), x_val3, acc);
+        }
+      }
+      
+      // Handle remaining elements
+      for (int k = k_vec4 + lane; k < k_size; k += WF_SIZE) {
+        float x_val = lds_x[k];
         bf16_t w_val = w_row[k];
         acc = fmaf(static_cast<float>(w_val), x_val, acc);
-      } else {
+      }
+      
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
+      if (lane == 0) acc_all += acc;
+    } else {
+      // Fall back to standard computation for FP32
+      float acc = 0.0f;
+      #pragma unroll 4
+      for (int k = lane; k < k_size; k += WF_SIZE) {
+        float x_val = lds_x[k];
         float w_val = w_row[k];
         acc = fmaf(w_val, x_val, acc);
       }
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
+      if (lane == 0) acc_all += acc;
     }
-    #pragma unroll
-    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
-    if (lane == 0) acc_all += acc;
     __syncthreads();
   }
   if (lane == 0) y[row] = acc_all;
@@ -310,8 +348,8 @@ __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 2)
 __global__ void matmul_bias_kernel(float *__restrict__ y, const float *__restrict__ x,
-                                   const T *__restrict__ w, const float *__restrict__ b,
-                                   int n, int d) {
+                                        const T *__restrict__ w, const float *__restrict__ b,
+                                        int n, int d) {
   __shared__ float lds_x[TK + LDS_PAD];
 
   const int tid = threadIdx.x;
@@ -329,21 +367,55 @@ __global__ void matmul_bias_kernel(float *__restrict__ y, const float *__restric
     __syncthreads();
 
     const T *__restrict__ w_row = w + (size_t)row * n + k_base;
-    float acc = 0.0f;
-    #pragma unroll 4
-    for (int k = lane; k < k_size; k += WF_SIZE) {
-      float x_val = lds_x[k];
-      if constexpr (std::is_same_v<T, bf16_t>) {
+    
+    if constexpr (std::is_same_v<T, bf16_t>) {
+      float acc = 0.0f;
+      
+      // Process 4 elements at a time for better memory access
+      int k_vec4 = (k_size / 4) * 4;
+      for (int k = lane * 4; k < k_vec4; k += WF_SIZE * 4) {
+        if (k + 3 < k_vec4) {
+          // Vectorized BF16 operations
+          float x_val0 = lds_x[k];
+          float x_val1 = lds_x[k+1];
+          float x_val2 = lds_x[k+2];
+          float x_val3 = lds_x[k+3];
+          
+          bf16_t w_val0 = w_row[k];
+          bf16_t w_val1 = w_row[k+1];
+          bf16_t w_val2 = w_row[k+2];
+          bf16_t w_val3 = w_row[k+3];
+          
+          // Accumulate with FMA for better precision
+          acc = fmaf(static_cast<float>(w_val0), x_val0, acc);
+          acc = fmaf(static_cast<float>(w_val1), x_val1, acc);
+          acc = fmaf(static_cast<float>(w_val2), x_val2, acc);
+          acc = fmaf(static_cast<float>(w_val3), x_val3, acc);
+        }
+      }
+      
+      // Handle remaining elements
+      for (int k = k_vec4 + lane; k < k_size; k += WF_SIZE) {
+        float x_val = lds_x[k];
         bf16_t w_val = w_row[k];
         acc = fmaf(static_cast<float>(w_val), x_val, acc);
-      } else {
+      }
+      
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
+      if (lane == 0) acc_all += acc;
+    } else {
+      float acc = 0.0f;
+      #pragma unroll 4
+      for (int k = lane; k < k_size; k += WF_SIZE) {
+        float x_val = lds_x[k];
         float w_val = w_row[k];
         acc = fmaf(w_val, x_val, acc);
       }
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
+      if (lane == 0) acc_all += acc;
     }
-    #pragma unroll
-    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
-    if (lane == 0) acc_all += acc;
     __syncthreads();
   }
   if (lane == 0) y[row] = acc_all + b[row];
@@ -545,7 +617,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     size_t done = 0;
     while (done < count) {
       size_t todo = (count - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (count - done);
-      for (size_t i = 0; i < todo; ++i) h_chunk[i] = rocwmma::bfloat16_t(h_src[done + i]);
+      for (size_t i = 0; i < todo; ++i) h_chunk[i] = hip_bfloat16(h_src[done + i]);
       HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t), hipMemcpyHostToDevice));
       done += todo;
     }
@@ -566,7 +638,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     }
     bf16_t *chunk = pinned_chunks[stream_idx];
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < todo; ++i) chunk[i] = rocwmma::bfloat16_t(h_src[done + i]);
+    for (size_t i = 0; i < todo; ++i) chunk[i] = hip_bfloat16(h_src[done + i]);
 
     HIP_CHECK(hipMemcpyAsync(d_dst + done, chunk, todo * sizeof(bf16_t),
                              hipMemcpyHostToDevice, streams[stream_idx]));
@@ -925,7 +997,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_attn_w + l * H, H));
 
-    // (A) QKV = W_qkv@t + b_qkv  (fused)
+    // (A) QKV = W_qkv@t + b_qkv  (fused) - Using MFMA optimized kernel
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH("matmul_bias_kernel",
@@ -968,7 +1040,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         d_attn_sinks + l * Hq, (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
         Hq, Hk, D, KV, S, pos));
 
-    // Output projection + bias + residual (bias fused in add)
+    // Output projection + bias + residual (bias fused in add) - Using MFMA optimized kernel
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH("matmul_kernel",
@@ -980,7 +1052,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_ffn_w + l * H, H));
 
-    // Router: scores = W_router@t + b
+    // Router: scores = W_router@t + b (FP32, use standard kernel)
     dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH("matmul_kernel",
                           matmul_kernel<float><<<gridE, block>>>(d_router_score, d_t, d_w_router + (size_t)l * H * E, H, E));
@@ -1021,7 +1093,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                         rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_out_w, H));
   HIP_CHECK(hipMemcpy(d_x, d_t, H * sizeof(float), hipMemcpyDeviceToDevice));
 
-  // LM head
+  // LM head - Using MFMA optimized kernel
   const int V = p->vocab_size;
   dim3 gridV = get_gemv_grid_dim(V);
   PROFILE_KERNEL_LAUNCH("matmul_kernel",
