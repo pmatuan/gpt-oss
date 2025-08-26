@@ -1,6 +1,3 @@
-// getp_run.cpp (optimized)
-// Drop-in replacement.
-
 #include "../profiler.h"
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
@@ -14,7 +11,6 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-// Tuning knobs (unchanged)
 #define TK 128
 #define TM 4
 #define BLOCK_SIZE 256
@@ -31,7 +27,6 @@
     }                                                                          \
   } while (0)
 
-// BF16 alias from rocWMMA
 typedef rocwmma::bfloat16_t bf16_t;
 
 static inline void debug_print_gpu_memory(const char *tag) {
@@ -52,51 +47,47 @@ static inline void debug_print_gpu_memory(const char *tag) {
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 // ---------------- Global GPU Buffers ----------------
-// Activations / temporaries (FP32)
 static float *d_x, *d_t, *d_tb, *d_tb2;
 static float *d_router_score, *d_topk_v, *d_mlp1_out;
 static int *d_topk_i;
-static float *d_gate, *d_up, *d_gate_up, *d_e_agg;
+static float *d_gate_up, *d_e_agg;
 static float *d_qkv, *d_q, *d_k, *d_v;
 static float *d_key_cache, *d_value_cache;
 static float *d_att, *d_logits, *d_mask;
 static float *d_cos_vals, *d_sin_vals;
-static int *d_token2row; // token -> physical row mapping for paged attention
+static int *d_token2row;
 
-// Small weights (keep FP32)
+// Small FP32 weights
 static float *d_rms_attn_w, *d_rms_ffn_w;
 static float *d_b_qkv, *d_b_o, *d_attn_sinks;
 static float *d_w_router, *d_b_router;
 static float *d_rms_out_w;
 
-// Expert biases on device (FP32)
+// Expert biases FP32
 static float *g_b_mlp1 = nullptr;
 static float *g_b_mlp2 = nullptr;
 
-// Large weights (store BF16)
+// Large BF16 weights
 static bf16_t *d_token_embedding_table_bf16;
 static bf16_t *d_w_qkv_bf16, *d_w_o_bf16;
 static bf16_t *d_w_mlp1_bf16, *d_w_mlp2_bf16;
 static bf16_t *d_out_bf16;
 
-// Config pointer
 static Config *h_config = nullptr;
 
 // ======================= Compute Kernels =======================
 
-// RMSNorm with warp reductions (BLOCK_SIZE threads, WF_SIZE=64 per wave)
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
                                int size) {
   const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
-  const int wid = tid >> 6; // wave id in block
+  const int wid = tid >> 6;
 
   float sum = 0.0f;
   for (int i = tid; i < size; i += blockDim.x) {
     float v = x[i];
     sum += v * v;
   }
-  // Intra-wave reduction
   #pragma unroll
   for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
     sum += __shfl_down(sum, off, WF_SIZE);
@@ -108,7 +99,6 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
   float total = 0.f;
   if (tid < BLOCK_SIZE / WF_SIZE) total = warp_sums[tid];
 
-  // Reduce warp_sums with first wave
   if (wid == 0) {
     float t = (tid < BLOCK_SIZE / WF_SIZE) ? total : 0.f;
     #pragma unroll
@@ -125,7 +115,6 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
   }
 }
 
-// Softmax for small vectors (e.g., top-k routing). Single-CTA, low overhead.
 __global__ void softmax_kernel(float *x, int size) {
   if (threadIdx.x == 0) {
     double max_val = (double)x[0];
@@ -216,24 +205,22 @@ __global__ void residual_add_kernel(float *x, const float *residual, int size) {
   if (i < size) x[i] += residual[i];
 }
 
-// Fused: x = x + (y + b)
 __global__ void add_bias_residual_inplace_kernel(float *x, const float *y,
                                                  const float *b, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < size) x[i] = x[i] + (y[i] + b[i]);
 }
 
-// Optimized parallel top-k (K small) using CTA-wide argmax selections
+// --------- Device-only TopK (kept, used as step C foundation) ----------
 __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
                                    float *router_score, int num_experts,
                                    int experts_per_token) {
-  extern __shared__ float smem[]; // scores
+  extern __shared__ float smem[];
   float *scores = smem;
   const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
   const int wid = tid >> 6;
 
-  // Load scores to shared
   for (int i = tid; i < num_experts; i += blockDim.x) {
     scores[i] = router_score[i];
   }
@@ -245,12 +232,10 @@ __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
   for (int k = 0; k < experts_per_token; k++) {
     float local_best = -INFINITY;
     int   local_idx  = -1;
-    // Each thread scans its strided slice
     for (int i = tid; i < num_experts; i += blockDim.x) {
       float v = scores[i];
       if (v > local_best) { local_best = v; local_idx = i; }
     }
-    // Intra-wave argmax (val+idx)
     #pragma unroll
     for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
       float oVal = __shfl_down(local_best, off, WF_SIZE);
@@ -259,7 +244,7 @@ __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
     }
     if (lane == 0) { warp_vals[wid] = local_best; warp_idxs[wid] = local_idx; }
     __syncthreads();
-    // First wave reduces warp winners
+
     if (wid == 0) {
       float bVal = (lane < BLOCK_SIZE / WF_SIZE) ? warp_vals[lane] : -INFINITY;
       int   bIdx = (lane < BLOCK_SIZE / WF_SIZE) ? warp_idxs[lane] : -1;
@@ -272,42 +257,15 @@ __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
       if (lane == 0) {
         topk_values[k] = bVal;
         topk_indices[k] = bIdx;
-        if (bIdx >= 0) scores[bIdx] = -INFINITY; // mask selected
+        if (bIdx >= 0) scores[bIdx] = -INFINITY;
       }
     }
     __syncthreads();
   }
 }
 
-// Fused Split + SwiGLU: gate_up = SiLU(clamp(gate)) * (clamp(up) + 1)
-__global__ void fused_split_swiglu_kernel(float *gate_up, const float *mlp1_out,
-                                          int intermediate_dim, float swiglu_limit) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < intermediate_dim) {
-    float g = mlp1_out[2 * i];
-    float u = mlp1_out[2 * i + 1];
-    // Clamping (match CPU behavior)
-    if (g > swiglu_limit) g = swiglu_limit;        // only upper bound
-    if (u > swiglu_limit) u = swiglu_limit;        // both bounds
-    if (u < -swiglu_limit) u = -swiglu_limit;
-    const float alpha = 1.702f; // SiLU approx
-    g *= (1.0f / (1.0f + expf(-alpha * g)));
-    g *= (u + 1.0f);
-    gate_up[i] = g;
-  }
-}
+// ---------------- GEMV kernels -----------------
 
-// Fused: e_agg += (expert_out + bias) * weight
-__global__ void add_bias_weighted_sum_kernel(float *e_agg, const float *expert_out,
-                                             const float *bias, float weight, int hidden_dim) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < hidden_dim) {
-    e_agg[i] += (expert_out[i] + bias[i]) * weight;
-  }
-}
-
-// Optimized single-precision GEMV: W(d,n)[T] @ x(n)[f32] -> y(d)[f32]
-// T can be float or bf16_t (weights in BF16). Accumulation in FP32.
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 2)
 __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x,
@@ -316,7 +274,7 @@ __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x
 
   const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
-  const int wid = tid >> 6; // wave id in block: 0..TM-1
+  const int wid = tid >> 6;
   const int row = blockIdx.x * TM + wid;
   if (wid >= TM || row >= d) return;
 
@@ -325,14 +283,10 @@ __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x
   for (int k_base = 0; k_base < n; k_base += TK) {
     const int k_size = min(TK, n - k_base);
 
-    // Cooperative load of input vector chunk to LDS
-    for (int k = lane; k < k_size; k += WF_SIZE) {
-      lds_x[k] = x[k_base + k];
-    }
+    for (int k = lane; k < k_size; k += WF_SIZE) lds_x[k] = x[k_base + k];
     __syncthreads();
 
     const T *__restrict__ w_row = w + (size_t)row * n + k_base;
-
     float acc = 0.0f;
     #pragma unroll 4
     for (int k = lane; k < k_size; k += WF_SIZE) {
@@ -345,19 +299,188 @@ __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x
         acc = fmaf(w_val, x_val, acc);
       }
     }
-
-    // Intra-wave reduction
     #pragma unroll
-    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
-      acc += __shfl_down(acc, off, WF_SIZE);
-    }
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
     if (lane == 0) acc_all += acc;
     __syncthreads();
   }
   if (lane == 0) y[row] = acc_all;
 }
 
-// ==================== FP32->BF16 Async Host->Device ====================
+template <typename T>
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void matmul_bias_kernel(float *__restrict__ y, const float *__restrict__ x,
+                                   const T *__restrict__ w, const float *__restrict__ b,
+                                   int n, int d) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int row = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  float acc_all = 0.0f;
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    for (int k = lane; k < k_size; k += WF_SIZE) lds_x[k] = x[k_base + k];
+    __syncthreads();
+
+    const T *__restrict__ w_row = w + (size_t)row * n + k_base;
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      float x_val = lds_x[k];
+      if constexpr (std::is_same_v<T, bf16_t>) {
+        bf16_t w_val = w_row[k];
+        acc = fmaf(static_cast<float>(w_val), x_val, acc);
+      } else {
+        float w_val = w_row[k];
+        acc = fmaf(w_val, x_val, acc);
+      }
+    }
+    #pragma unroll
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
+    if (lane == 0) acc_all += acc;
+    __syncthreads();
+  }
+  if (lane == 0) y[row] = acc_all + b[row];
+}
+
+template <typename T>
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void mlp1_fused_kernel(float *__restrict__ gate_up,
+                                  const float *__restrict__ x,
+                                  const T *__restrict__ w_mlp1_all,
+                                  const float *__restrict__ b_mlp1_all,
+                                  const int *__restrict__ topk_i,
+                                  int k_index, int l_layer, int E,
+                                  int H, int IM, float swiglu_limit) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int i = blockIdx.x * TM + wid; // output index in [0..IM)
+  if (wid >= TM || i >= IM) return;
+
+  // read expert id from device
+  const int e = topk_i[k_index];
+
+  float acc_g_all = 0.0f;
+  float acc_u_all = 0.0f;
+
+  // Offsets
+  const size_t base_rows = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)(2 * IM);
+  const size_t off_gate = (base_rows + (size_t)(2 * i + 0)) * (size_t)H;
+  const size_t off_up   = (base_rows + (size_t)(2 * i + 1)) * (size_t)H;
+
+  for (int k_base = 0; k_base < H; k_base += TK) {
+    const int k_size = min(TK, H - k_base);
+    for (int k = lane; k < k_size; k += WF_SIZE) lds_x[k] = x[k_base + k];
+    __syncthreads();
+
+    const T *__restrict__ wg = w_mlp1_all + off_gate + k_base;
+    const T *__restrict__ wu = w_mlp1_all + off_up + k_base;
+
+    float acc_g = 0.0f, acc_u = 0.0f;
+    #pragma unroll 4
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      float xv = lds_x[k];
+      float wgk = std::is_same_v<T, bf16_t> ? (float)wg[k] : (float)((const float *)wg)[k];
+      float wuk = std::is_same_v<T, bf16_t> ? (float)wu[k] : (float)((const float *)wu)[k];
+      acc_g = fmaf(wgk, xv, acc_g);
+      acc_u = fmaf(wuk, xv, acc_u);
+    }
+    #pragma unroll
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      acc_g += __shfl_down(acc_g, off, WF_SIZE);
+      acc_u += __shfl_down(acc_u, off, WF_SIZE);
+    }
+    if (lane == 0) { acc_g_all += acc_g; acc_u_all += acc_u; }
+    __syncthreads();
+  }
+
+  if (lane == 0) {
+    // Add bias
+    const size_t bbase = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)(2 * IM);
+    float g = acc_g_all + b_mlp1_all[bbase + (size_t)(2 * i + 0)];
+    float u = acc_u_all + b_mlp1_all[bbase + (size_t)(2 * i + 1)];
+
+    // Clamp (match previous kernel)
+    if (g > swiglu_limit) g = swiglu_limit;
+    if (u > swiglu_limit) u = swiglu_limit;
+    if (u < -swiglu_limit) u = -swiglu_limit;
+
+    // SiLU approx then * (u + 1)
+    const float alpha = 1.702f;
+    g *= (1.0f / (1.0f + expf(-alpha * g)));
+    g *= (u + 1.0f);
+
+    gate_up[i] = g;
+  }
+}
+
+template <typename T>
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void mlp2_bias_weighted_accum_kernel(float *__restrict__ e_agg,
+                                                const float *__restrict__ gate_up,
+                                                const T *__restrict__ w_mlp2_all,
+                                                const float *__restrict__ b_mlp2_all,
+                                                const int *__restrict__ topk_i,
+                                                const float *__restrict__ topk_v,
+                                                int k_index, int l_layer, int E,
+                                                int IM, int H) {
+  __shared__ float lds_x[TK + LDS_PAD];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int row = blockIdx.x * TM + wid; // output index in [0..H)
+  if (wid >= TM || row >= H) return;
+
+  const int e = topk_i[k_index];
+  const float weight = topk_v[k_index];
+
+  float acc_all = 0.0f;
+
+  const size_t base = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)H * (size_t)IM;
+  const T *__restrict__ w_row_base = w_mlp2_all + (size_t)row * (size_t)IM + base;
+
+  for (int k_base = 0; k_base < IM; k_base += TK) {
+    const int k_size = min(TK, IM - k_base);
+    for (int k = lane; k < k_size; k += WF_SIZE) lds_x[k] = gate_up[k_base + k];
+    __syncthreads();
+
+    const T *__restrict__ w_row = w_row_base + k_base;
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (int k = lane; k < k_size; k += WF_SIZE) {
+      float x_val = lds_x[k];
+      if constexpr (std::is_same_v<T, bf16_t>) {
+        bf16_t w_val = w_row[k];
+        acc = fmaf((float)w_val, x_val, acc);
+      } else {
+        float w_val = ((const float *)w_row)[k];
+        acc = fmaf(w_val, x_val, acc);
+      }
+    }
+    #pragma unroll
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) acc += __shfl_down(acc, off, WF_SIZE);
+    if (lane == 0) acc_all += acc;
+    __syncthreads();
+  }
+
+  if (lane == 0) {
+    const size_t bbase = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)H;
+    float y = acc_all + b_mlp2_all[bbase + (size_t)row];
+    e_agg[row] += y * weight;
+  }
+}
+
+// =================== FP32->BF16 Async Host->Device ====================
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
                                      bf16_t *d_dst, int n_streams = 4,
                                      size_t chunk_bytes = 64ULL * 1024 * 1024) {
@@ -380,9 +503,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
   if (async_success) {
     pinned_chunks = (bf16_t **)malloc(n_streams * sizeof(bf16_t *));
     if (!pinned_chunks) async_success = false;
-    else {
-      for (int i = 0; i < n_streams; i++) pinned_chunks[i] = nullptr;
-    }
+    else { for (int i = 0; i < n_streams; i++) pinned_chunks[i] = nullptr; }
   }
   if (async_success) {
     for (int i = 0; i < n_streams; i++) {
@@ -406,9 +527,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
 
   if (!async_success) {
     if (pinned_chunks) {
-      for (int i = 0; i < n_streams; i++) {
-        if (pinned_chunks[i]) { (void)hipHostFree(pinned_chunks[i]); }
-      }
+      for (int i = 0; i < n_streams; i++) { if (pinned_chunks[i]) { (void)hipHostFree(pinned_chunks[i]); } }
       free(pinned_chunks);
     }
     if (events) {
@@ -420,7 +539,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
       free(streams);
     }
 
-    const size_t SYNC_CHUNK_ELEMS = 8 * 1024 * 1024; // ~16MB
+    const size_t SYNC_CHUNK_ELEMS = 8 * 1024 * 1024;
     bf16_t *h_chunk = nullptr;
     HIP_CHECK(hipHostMalloc((void **)&h_chunk, SYNC_CHUNK_ELEMS * sizeof(bf16_t)));
     size_t done = 0;
@@ -467,25 +586,21 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
   free(pinned_chunks); free(events); free(streams);
 }
 
-// =================== Fused Paged Attention (Optimized) ===================
-// token2row[t] gives the physical row in key_cache/value_cache for logical token t.
-// We pre-load Q_h into shared once per block/head, use warp-level reductions for dots.
 template<int TILE_T>
 __global__ void paged_attention_fused_kernel(
-    float* __restrict__ tb,                 // [Hq, D] out
-    const float* __restrict__ q,            // [Hq, D]
-    const float* __restrict__ key_cache,    // [Rows, KV]
-    const float* __restrict__ value_cache,  // [Rows, KV]
-    const int* __restrict__ token2row,      // [S]
-    const float* __restrict__ attn_sinks_layer, // [Hq]
-    const float* __restrict__ mask,         // [S, S] or nullptr
-    int Hq, int Hk, int D, int KV,          // KV = D * Hk
-    int S, int pos                          // T_real = pos + 1
-) {
+    float* __restrict__ tb,
+    const float* __restrict__ q,
+    const float* __restrict__ key_cache,
+    const float* __restrict__ value_cache,
+    const int* __restrict__ token2row,
+    const float* __restrict__ attn_sinks_layer,
+    const float* __restrict__ mask,
+    int Hq, int Hk, int D, int KV,
+    int S, int pos) {
+
   extern __shared__ unsigned char smem_raw[];
-  // Layout: [TILE_T doubles][blockDim.x doubles][D floats]
   double* s_logits = reinterpret_cast<double*>(smem_raw);
-  double* s_warp   = s_logits + TILE_T;              // also used to broadcast scalars
+  double* s_warp   = s_logits + TILE_T;
   float*  s_q      = reinterpret_cast<float*>(s_warp + blockDim.x);
 
   const int h   = blockIdx.x;
@@ -496,62 +611,47 @@ __global__ void paged_attention_fused_kernel(
   const int base   = (h / kv_mul) * D;
   const double scale = 1.0 / sqrt((double)D);
 
-  const float* __restrict__ qh = q + (size_t)h * D;    // [D]
-  const float* __restrict__ K  = key_cache;            // [Rows, KV]
-  const float* __restrict__ V  = value_cache;          // [Rows, KV]
+  const float* __restrict__ qh = q + (size_t)h * D;
+  const float* __restrict__ K  = key_cache;
+  const float* __restrict__ V  = value_cache;
 
-  const int T_real = pos + 1;             // indices t ∈ [0, T_real)
+  const int T_real = pos + 1;
 
-  // Preload Q_h into shared once
-  for (int i = tid; i < D; i += blockDim.x) {
-    s_q[i] = qh[i];
-  }
+  for (int i = tid; i < D; i += blockDim.x) s_q[i] = qh[i];
   __syncthreads();
 
-  // Streaming softmax state
-  double m_run = -INFINITY;  // running max
-  double s_run = 0.0;        // running denominator sum
+  double m_run = -INFINITY;
+  double s_run = 0.0;
 
   const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;                       // warp id
+  const int wid  = tid >> 6;
   const int warp_count = (blockDim.x + WF_SIZE - 1) / WF_SIZE;
 
-  // numerator accumulator for output dim "tid" (only if tid<D)
   double num_acc = 0.0;
 
   for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
     const int tile = min(TILE_T, T_real - t0);
     double tile_max = -INFINITY;
 
-    // 1) Compute logits for this tile with warp-level reduction
     for (int tt = 0; tt < tile; ++tt) {
       const int t = t0 + tt;
       int row = token2row[t];
       if (row < 0) row = 0; else if (row >= S) row = S - 1;
 
-      // dot(q_h, k_row)
       float partf = 0.0f;
       for (int i = tid; i < D; i += blockDim.x) {
         const float k = K[(size_t)row * KV + base + i];
         partf = fmaf(s_q[i], k, partf);
       }
-      // reduce within warp
       #pragma unroll
-      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
-        partf += __shfl_down(partf, off, WF_SIZE);
-      }
-      if (lane == 0) {
-        s_warp[wid] = (double)partf;
-      }
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) partf += __shfl_down(partf, off, WF_SIZE);
+      if (lane == 0) s_warp[wid] = (double)partf;
       __syncthreads();
 
-      // first warp reduces cross-warp partials
       if (wid == 0) {
         double sum = (lane < warp_count) ? s_warp[lane] : 0.0;
         #pragma unroll
-        for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
-          sum += __shfl_down(sum, off, WF_SIZE);
-        }
+        for (int off = WF_SIZE >> 1; off > 0; off >>= 1) sum += __shfl_down(sum, off, WF_SIZE);
         if (lane == 0) {
           double logit = sum * scale;
           if (mask) logit += (double)mask[(size_t)pos * S + t];
@@ -563,14 +663,13 @@ __global__ void paged_attention_fused_kernel(
       __syncthreads();
     }
 
-    // 2) Rescale running sums to new base m_new = max(m_run, tile_max)
     if (tid == 0) {
       double m_new = fmax(m_run, tile_max);
       double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
-      s_run *= scale_old;           // rescale denominator
-      s_warp[0] = m_new;            // broadcast m_new
-      s_warp[1] = scale_old;        // broadcast scaling for numerator
-      s_warp[2] = exp(tile_max - m_new); // factor to convert tile-local weights to base m_new
+      s_run *= scale_old;
+      s_warp[0] = m_new;
+      s_warp[1] = scale_old;
+      s_warp[2] = exp(tile_max - m_new);
     }
     __syncthreads();
     const double m_new = s_warp[0];
@@ -578,12 +677,11 @@ __global__ void paged_attention_fused_kernel(
     const double factor = s_warp[2];
     num_acc *= num_scale;
 
-    // 3) Compute tile weights relative to tile_max, transform to base m_new, and accumulate
     if (tid < D) {
       for (int tt = 0; tt < tile; ++tt) {
         if (tid == 0) {
           double w_local = exp(s_logits[tt] - (double)tile_max);
-          s_logits[tt] = w_local * factor; // weight in base m_new
+          s_logits[tt] = w_local * factor;
           s_run += s_logits[tt];
         }
         __syncthreads();
@@ -595,7 +693,6 @@ __global__ void paged_attention_fused_kernel(
         __syncthreads();
       }
     } else {
-      // Ensure s_run computed properly even if this thread doesn't own an output dim
       for (int tt = 0; tt < tile; ++tt) {
         if (tid == 0) {
           double w_local = exp(s_logits[tt] - (double)tile_max);
@@ -610,18 +707,17 @@ __global__ void paged_attention_fused_kernel(
     __syncthreads();
   }
 
-  // 4) Add sink to denominator (not numerator), adjust base if needed
   const double sinkVal = (double)attn_sinks_layer[h];
   if (tid == 0) {
     double m_new = fmax(m_run, sinkVal);
     double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
     s_run = s_run * scale_old + exp(sinkVal - m_new);
-    s_warp[0] = 1.0 / s_run; // broadcast inverse denominator
-    s_warp[1] = scale_old;   // broadcast final rescale for numerator
+    s_warp[0] = 1.0 / s_run;
+    s_warp[1] = scale_old;
   }
   __syncthreads();
   double inv = s_warp[0];
-  if (!isfinite(inv)) inv = 0.0; // guard
+  if (!isfinite(inv)) inv = 0.0;
   const double final_scale = s_warp[1];
   num_acc *= final_scale;
   if (tid < D) tb[(size_t)h * D + tid] = (float)(num_acc * inv);
@@ -645,7 +741,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   debug_print_gpu_memory("before allocations");
 
-  // ---------------- Activations ----------------
+  // Activations
   HIP_CHECK(hipMalloc(&d_x, H * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_t, H * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_tb, D * Hq * sizeof(float)));
@@ -655,9 +751,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipMalloc(&d_topk_v, h_config->experts_per_token * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_topk_i, h_config->experts_per_token * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&d_mlp1_out, 2 * IM * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate, IM * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_up, IM * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_mlp1_out, 2 * IM * sizeof(float))); // (kept for debug options)
   HIP_CHECK(hipMalloc(&d_gate_up, IM * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_e_agg, H * sizeof(float)));
 
@@ -674,7 +768,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipMalloc(&d_cos_vals, (D / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_sin_vals, (D / 2) * sizeof(float)));
 
-  // token2row identity
   HIP_CHECK(hipMalloc(&d_token2row, S * sizeof(int)));
   {
     int *h_token2row = (int *)malloc(S * sizeof(int));
@@ -699,10 +792,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   debug_print_gpu_memory("after activations");
 
-  // ---------------- Weights ----------------
+  // Weights (small FP32)
   TransformerWeights *w = &transformer->weights;
 
-  // Small FP32 weights
   HIP_CHECK(hipMalloc(&d_rms_attn_w, L * H * sizeof(float)));
   HIP_CHECK(hipMemcpy(d_rms_attn_w, w->rms_attn_w, L * H * sizeof(float), hipMemcpyHostToDevice));
 
@@ -738,9 +830,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   debug_print_gpu_memory("after expert biases");
 
-  // Large BF16 weights (async host->device with CPU FP32->BF16 conversion)
+  // Large BF16 weights
   const int n_streams = 4;
-  const size_t chunk_bytes = 64ULL * 1024 * 1024; // 64 MiB
+  const size_t chunk_bytes = 64ULL * 1024 * 1024;
 
   HIP_CHECK(hipMalloc(&d_token_embedding_table_bf16, (size_t)V * H * sizeof(bf16_t)));
   copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H, d_token_embedding_table_bf16, n_streams, chunk_bytes);
@@ -773,8 +865,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipFree(d_topk_v));
   HIP_CHECK(hipFree(d_topk_i));
   HIP_CHECK(hipFree(d_mlp1_out));
-  HIP_CHECK(hipFree(d_gate));
-  HIP_CHECK(hipFree(d_up));
   HIP_CHECK(hipFree(d_gate_up));
   HIP_CHECK(hipFree(d_e_agg));
   HIP_CHECK(hipFree(d_qkv));
@@ -826,7 +916,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   dim3 block = dim3(BLOCK_SIZE, 1, 1);
   dim3 gridH = get_gemv_grid_dim(H);
 
-  // x <- embedding[token] (BF16 -> FP32)
+  // Embedding (BF16 -> FP32)
   PROFILE_KERNEL_LAUNCH("copy_embedding_bf16_row_kernel",
                         copy_embedding_bf16_row_kernel<<<gridH, block>>>(d_x, d_token_embedding_table_bf16, token, H));
 
@@ -835,13 +925,13 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_attn_w + l * H, H));
 
-    // QKV matmul
+    // (A) QKV = W_qkv@t + b_qkv  (fused)
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
-    PROFILE_KERNEL_LAUNCH("matmul_kernel",
-                          matmul_kernel<bf16_t><<<gridQKV, block>>>(d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H, H, QKV_D));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel",
-                          add_bias_kernel<<<gridQKV, block>>>(d_qkv, d_b_qkv + l * QKV_D, QKV_D));
+    PROFILE_KERNEL_LAUNCH("matmul_bias_kernel",
+                          matmul_bias_kernel<bf16_t><<<gridQKV, block>>>(d_qkv, d_t,
+                            d_w_qkv_bf16 + (size_t)l * QKV_D * H,
+                            d_b_qkv + l * QKV_D, H, QKV_D));
 
     PROFILE_KERNEL_LAUNCH("split_qkv_kernel",
                           split_qkv_kernel<<<gridQKV, block>>>(d_q, d_k, d_v, d_qkv, Hq, Hk, D));
@@ -863,12 +953,11 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float), hipMemcpyDeviceToDevice));
 
-    // Fused attention (paged) - optimized
+    // Attention
     const int TILE_T = 256;
     dim3 grid(Hq);
-    // choose block size: multiple of 64, cap at 256, not exceeding D too much
-    int blockAttn = (D <= 256) ? (( (D + WF_SIZE - 1) / WF_SIZE) * WF_SIZE) : 256;
-    if (blockAttn < WF_SIZE) blockAttn = WF_SIZE; // safety
+    int blockAttn = (D <= 256) ? (((D + WF_SIZE - 1) / WF_SIZE) * WF_SIZE) : 256;
+    if (blockAttn < WF_SIZE) blockAttn = WF_SIZE;
     dim3 blockA(blockAttn);
     size_t shmem = (size_t)TILE_T * sizeof(double)
                  + (size_t)blockAttn * sizeof(double)
@@ -879,7 +968,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         d_attn_sinks + l * Hq, (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
         Hq, Hk, D, KV, S, pos));
 
-    // Output projection + bias + residual (fused)
+    // Output projection + bias + residual (bias fused in add)
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH("matmul_kernel",
@@ -891,59 +980,36 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_ffn_w + l * H, H));
 
-    // Router matmul: d_router_score(E) = W_router(E,H) @ d_t(H)
+    // Router: scores = W_router@t + b
     dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH("matmul_kernel",
                           matmul_kernel<float><<<gridE, block>>>(d_router_score, d_t, d_w_router + (size_t)l * H * E, H, E));
     PROFILE_KERNEL_LAUNCH("add_bias_kernel",
                           add_bias_kernel<<<gridE, block>>>(d_router_score, d_b_router + l * E, E));
 
-    // Top-k experts (CTA-wide argmax K times)
+    // Top-k on device
     size_t shared_mem_size = E * sizeof(float);
     PROFILE_KERNEL_LAUNCH("topk_kernel_1token",
                           topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(d_topk_v, d_topk_i, d_router_score, E, p->experts_per_token));
     PROFILE_KERNEL_LAUNCH("softmax_kernel",
                           softmax_kernel<<<1, 1>>>(d_topk_v, p->experts_per_token));
 
-    // Zero-init expert aggregation
+    // Zero e_agg
     HIP_CHECK(hipMemsetAsync(d_e_agg, 0, H * sizeof(float), 0));
 
-    // Read topk to host (small)
-    float *h_topk_v = (float *)malloc(p->experts_per_token * sizeof(float));
-    int *h_topk_i = (int *)malloc(p->experts_per_token * sizeof(int));
-    HIP_CHECK(hipMemcpy(h_topk_v, d_topk_v, p->experts_per_token * sizeof(float), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_topk_i, d_topk_i, p->experts_per_token * sizeof(int), hipMemcpyDeviceToHost));
-
+    // (B)+(C): For each k in topk (remain on device): MLP1 fused, then MLP2 fused accumulate
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
-      int e = h_topk_i[kk];
-      float ew = h_topk_v[kk];
+      // MLP1 fused: gate_up (IM)
+      dim3 gridIM = get_gemv_grid_dim(IM);
+      PROFILE_KERNEL_LAUNCH("mlp1_fused_kernel",
+        mlp1_fused_kernel<bf16_t><<<gridIM, block>>>(d_gate_up, d_t,
+          d_w_mlp1_bf16, g_b_mlp1, d_topk_i, kk, l, E, H, IM, p->swiglu_limit));
 
-      // MLP1: (2IM x H) @ d_t + bias
-      size_t off1 = ((size_t)l * E + e) * (size_t)(2 * IM) * (size_t)H;
-      size_t b1off = ((size_t)l * E + e) * (size_t)(2 * IM);
-      dim3 gridM1 = get_gemv_grid_dim(2 * IM);
-      PROFILE_KERNEL_LAUNCH("matmul_kernel",
-                            matmul_kernel<bf16_t><<<gridM1, block>>>(d_mlp1_out, d_t, d_w_mlp1_bf16 + off1, H, 2 * IM));
-      PROFILE_KERNEL_LAUNCH("add_bias_kernel",
-                            add_bias_kernel<<<gridM1, block>>>(d_mlp1_out, g_b_mlp1 + b1off, 2 * IM));
-
-      // SwiGLU (fused split + activation)
-      dim3 gridIM((IM + block.x - 1) / block.x);
-      PROFILE_KERNEL_LAUNCH("fused_split_swiglu_kernel",
-                            fused_split_swiglu_kernel<<<gridIM, block>>>(d_gate_up, d_mlp1_out, IM, p->swiglu_limit));
-
-      // MLP2: (H x IM) @ gate_up
-      size_t off2 = ((size_t)l * E + e) * (size_t)H * (size_t)IM;
-      size_t b2off = ((size_t)l * E + e) * (size_t)H;
-      PROFILE_KERNEL_LAUNCH("matmul_kernel",
-                            matmul_kernel<bf16_t><<<gridH, block>>>(d_tb2, d_gate_up, d_w_mlp2_bf16 + off2, IM, H));
-
-      // e_agg += (MLP2_out + bias2) * ew  (fused)
-      PROFILE_KERNEL_LAUNCH("add_bias_weighted_sum_kernel",
-                            add_bias_weighted_sum_kernel<<<gridH, block>>>(d_e_agg, d_tb2, g_b_mlp2 + b2off, ew, H));
+      // MLP2 + bias + weighted accumulate to e_agg
+      PROFILE_KERNEL_LAUNCH("mlp2_bias_weighted_accum_kernel",
+        mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block>>>(d_e_agg, d_gate_up,
+          d_w_mlp2_bf16, g_b_mlp2, d_topk_i, d_topk_v, kk, l, E, IM, H));
     }
-    free(h_topk_v);
-    free(h_topk_i);
 
     // Residual add (x += e_agg)
     PROFILE_KERNEL_LAUNCH("residual_add_kernel",
@@ -955,7 +1021,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                         rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_out_w, H));
   HIP_CHECK(hipMemcpy(d_x, d_t, H * sizeof(float), hipMemcpyDeviceToDevice));
 
-  // LM head: (V x H) @ x -> logits(V)
+  // LM head
   const int V = p->vocab_size;
   dim3 gridV = get_gemv_grid_dim(V);
   PROFILE_KERNEL_LAUNCH("matmul_kernel",
@@ -985,7 +1051,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   int token = prompt_tokens[0];
   int pos = 0;
 
-  // Print the very first token (kept as original behavior)
   const char *first_piece = decode_piece(tokenizer, 200006, token);
   safe_printf(first_piece);
   fflush(stdout);
