@@ -48,9 +48,10 @@ inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 // ---------------- Global GPU Buffers ----------------
 static float *d_x, *d_t, *d_tb, *d_tb2;
-static float *d_router_score, *d_topk_v, *d_mlp1_out;
+static float *d_router_score, *d_topk_v;
 static int *d_topk_i;
-static float *d_gate_up, *d_e_agg;
+static float *d_gate_up4;          // IM * 4
+static float *d_e_agg, *d_e_agg4;  // H and H * 4
 static float *d_qkv, *d_q, *d_k, *d_v;
 static float *d_key_cache, *d_value_cache;
 static float *d_att, *d_logits, *d_mask;
@@ -60,7 +61,7 @@ static int *d_token2row;
 // Small FP32 weights
 static float *d_rms_attn_w, *d_rms_ffn_w;
 static float *d_b_qkv, *d_b_o, *d_attn_sinks;
-static float *d_w_router, *d_b_router;
+static float *d_w_router, *d_b_router;   // router stays FP32
 static float *d_rms_out_w;
 
 // Expert biases FP32
@@ -72,6 +73,9 @@ static bf16_t *d_token_embedding_table_bf16;
 static bf16_t *d_w_qkv_bf16, *d_w_o_bf16;
 static bf16_t *d_w_mlp1_bf16, *d_w_mlp2_bf16;
 static bf16_t *d_out_bf16;
+
+// 4 streams for 4 experts
+static hipStream_t mlp_streams[4];
 
 static Config *h_config = nullptr;
 
@@ -211,7 +215,7 @@ __global__ void add_bias_residual_inplace_kernel(float *x, const float *y,
   if (i < size) x[i] = x[i] + (y[i] + b[i]);
 }
 
-// --------- Device-only TopK (kept, used as step C foundation) ----------
+// --------- Device-only TopK ----------
 __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
                                    float *router_score, int num_experts,
                                    int experts_per_token) {
@@ -366,13 +370,11 @@ __global__ void mlp1_fused_kernel(float *__restrict__ gate_up,
   const int i = blockIdx.x * TM + wid; // output index in [0..IM)
   if (wid >= TM || i >= IM) return;
 
-  // read expert id from device
   const int e = topk_i[k_index];
 
   float acc_g_all = 0.0f;
   float acc_u_all = 0.0f;
 
-  // Offsets
   const size_t base_rows = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)(2 * IM);
   const size_t off_gate = (base_rows + (size_t)(2 * i + 0)) * (size_t)H;
   const size_t off_up   = (base_rows + (size_t)(2 * i + 1)) * (size_t)H;
@@ -383,7 +385,7 @@ __global__ void mlp1_fused_kernel(float *__restrict__ gate_up,
     __syncthreads();
 
     const T *__restrict__ wg = w_mlp1_all + off_gate + k_base;
-    const T *__restrict__ wu = w_mlp1_all + off_up + k_base;
+    const T *__restrict__ wu = w_mlp1_all + off_up   + k_base;
 
     float acc_g = 0.0f, acc_u = 0.0f;
     #pragma unroll 4
@@ -404,17 +406,14 @@ __global__ void mlp1_fused_kernel(float *__restrict__ gate_up,
   }
 
   if (lane == 0) {
-    // Add bias
     const size_t bbase = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)(2 * IM);
     float g = acc_g_all + b_mlp1_all[bbase + (size_t)(2 * i + 0)];
     float u = acc_u_all + b_mlp1_all[bbase + (size_t)(2 * i + 1)];
 
-    // Clamp (match previous kernel)
     if (g > swiglu_limit) g = swiglu_limit;
     if (u > swiglu_limit) u = swiglu_limit;
     if (u < -swiglu_limit) u = -swiglu_limit;
 
-    // SiLU approx then * (u + 1)
     const float alpha = 1.702f;
     g *= (1.0f / (1.0f + expf(-alpha * g)));
     g *= (u + 1.0f);
@@ -425,7 +424,7 @@ __global__ void mlp1_fused_kernel(float *__restrict__ gate_up,
 
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 2)
-__global__ void mlp2_bias_weighted_accum_kernel(float *__restrict__ e_agg,
+__global__ void mlp2_bias_weighted_accum_kernel(float *__restrict__ e_agg_e,
                                                 const float *__restrict__ gate_up,
                                                 const T *__restrict__ w_mlp2_all,
                                                 const float *__restrict__ b_mlp2_all,
@@ -476,7 +475,18 @@ __global__ void mlp2_bias_weighted_accum_kernel(float *__restrict__ e_agg,
   if (lane == 0) {
     const size_t bbase = ((size_t)l_layer * (size_t)E + (size_t)e) * (size_t)H;
     float y = acc_all + b_mlp2_all[bbase + (size_t)row];
-    e_agg[row] += y * weight;
+    e_agg_e[row] = y * weight;
+  }
+}
+
+__global__ void sum4_kernel(float *dst, const float *src4, int H) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < H) {
+    const float *e0 = src4 + 0 * H;
+    const float *e1 = src4 + 1 * H;
+    const float *e2 = src4 + 2 * H;
+    const float *e3 = src4 + 3 * H;
+    dst[i] = e0[i] + e1[i] + e2[i] + e3[i];
   }
 }
 
@@ -586,6 +596,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
   free(pinned_chunks); free(events); free(streams);
 }
 
+// =================== Fused Paged Attention (Optimized) ===================
 template<int TILE_T>
 __global__ void paged_attention_fused_kernel(
     float* __restrict__ tb,
@@ -748,12 +759,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipMalloc(&d_tb2, H * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&d_router_score, E * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_topk_v, h_config->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_topk_i, h_config->experts_per_token * sizeof(int)));
+  HIP_CHECK(hipMalloc(&d_topk_v, 4 * sizeof(float))); // experts_per_token=4
+  HIP_CHECK(hipMalloc(&d_topk_i, 4 * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&d_mlp1_out, 2 * IM * sizeof(float))); // (kept for debug options)
-  HIP_CHECK(hipMalloc(&d_gate_up, IM * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate_up4, 4 * IM * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_e_agg, H * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_e_agg4, 4 * H * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&d_qkv, (D * (Hq + 2 * Hk)) * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_q, Hq * D * sizeof(float)));
@@ -831,27 +842,32 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   debug_print_gpu_memory("after expert biases");
 
   // Large BF16 weights
-  const int n_streams = 4;
+  const int n_streams_cvt = 4;
   const size_t chunk_bytes = 64ULL * 1024 * 1024;
 
   HIP_CHECK(hipMalloc(&d_token_embedding_table_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H, d_token_embedding_table_bf16, n_streams, chunk_bytes);
+  copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H, d_token_embedding_table_bf16, n_streams_cvt, chunk_bytes);
 
   HIP_CHECK(hipMalloc(&d_w_qkv_bf16, (size_t)L * QKV_D * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16, n_streams, chunk_bytes);
+  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H, d_w_qkv_bf16, n_streams_cvt, chunk_bytes);
 
   const int O_N = D * Hq;
   HIP_CHECK(hipMalloc(&d_w_o_bf16, (size_t)L * H * O_N * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H * O_N, d_w_o_bf16, n_streams, chunk_bytes);
+  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H * O_N, d_w_o_bf16, n_streams_cvt, chunk_bytes);
 
   HIP_CHECK(hipMalloc(&d_w_mlp1_bf16, (size_t)L * E * (2 * IM) * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E * (2 * IM) * H, d_w_mlp1_bf16, n_streams, chunk_bytes);
+  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E * (2 * IM) * H, d_w_mlp1_bf16, n_streams_cvt, chunk_bytes);
 
   HIP_CHECK(hipMalloc(&d_w_mlp2_bf16, (size_t)L * E * H * IM * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16, n_streams, chunk_bytes);
+  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E * H * IM, d_w_mlp2_bf16, n_streams_cvt, chunk_bytes);
 
   HIP_CHECK(hipMalloc(&d_out_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->out, (size_t)V * H, d_out_bf16, n_streams, chunk_bytes);
+  copy_fp32_to_bf16_device(w->out, (size_t)V * H, d_out_bf16, n_streams_cvt, chunk_bytes);
+
+  // Create 4 streams for experts
+  for (int s = 0; s < 4; ++s) {
+    HIP_CHECK(hipStreamCreateWithFlags(&mlp_streams[s], hipStreamNonBlocking));
+  }
 
   debug_print_gpu_memory("after large BF16 weights (model loaded)");
 }
@@ -864,9 +880,9 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipFree(d_router_score));
   HIP_CHECK(hipFree(d_topk_v));
   HIP_CHECK(hipFree(d_topk_i));
-  HIP_CHECK(hipFree(d_mlp1_out));
-  HIP_CHECK(hipFree(d_gate_up));
+  HIP_CHECK(hipFree(d_gate_up4));
   HIP_CHECK(hipFree(d_e_agg));
+  HIP_CHECK(hipFree(d_e_agg4));
   HIP_CHECK(hipFree(d_qkv));
   HIP_CHECK(hipFree(d_q));
   HIP_CHECK(hipFree(d_k));
@@ -898,6 +914,10 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipFree(d_w_mlp1_bf16));
   HIP_CHECK(hipFree(d_w_mlp2_bf16));
   HIP_CHECK(hipFree(d_out_bf16));
+
+  for (int s = 0; s < 4; ++s) {
+    (void)hipStreamDestroy(mlp_streams[s]);
+  }
 }
 
 // ============================ Forward ============================
@@ -913,6 +933,12 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   const int E = p->n_experts;
   const int S = p->seq_len;
 
+  // enforce experts_per_token == 4
+  if (p->experts_per_token != 4) {
+    fprintf(stderr, "This build expects experts_per_token == 4\n");
+    exit(EXIT_FAILURE);
+  }
+
   dim3 block = dim3(BLOCK_SIZE, 1, 1);
   dim3 gridH = get_gemv_grid_dim(H);
 
@@ -925,7 +951,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_attn_w + l * H, H));
 
-    // (A) QKV = W_qkv@t + b_qkv  (fused)
+    // QKV = W_qkv@t + b_qkv  (fused)
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH("matmul_bias_kernel",
@@ -953,7 +979,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float), hipMemcpyDeviceToDevice));
 
-    // Attention
+    // Attention (optimized)
     const int TILE_T = 256;
     dim3 grid(Hq);
     int blockAttn = (D <= 256) ? (((D + WF_SIZE - 1) / WF_SIZE) * WF_SIZE) : 256;
@@ -968,7 +994,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         d_attn_sinks + l * Hq, (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
         Hq, Hk, D, KV, S, pos));
 
-    // Output projection + bias + residual (bias fused in add)
+    // Output projection + bias + residual
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH("matmul_kernel",
@@ -980,36 +1006,45 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_ffn_w + l * H, H));
 
-    // Router: scores = W_router@t + b
+    // Router fused: scores = W_router@t + b
     dim3 gridE = get_gemv_grid_dim(E);
-    PROFILE_KERNEL_LAUNCH("matmul_kernel",
-                          matmul_kernel<float><<<gridE, block>>>(d_router_score, d_t, d_w_router + (size_t)l * H * E, H, E));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel",
-                          add_bias_kernel<<<gridE, block>>>(d_router_score, d_b_router + l * E, E));
+    PROFILE_KERNEL_LAUNCH("matmul_bias_kernel(router)",
+                          matmul_bias_kernel<float><<<gridE, block>>>(d_router_score, d_t,
+                            d_w_router + (size_t)l * H * E, d_b_router + l * E, H, E));
 
-    // Top-k on device
+    // Top-k on device (K=4)
     size_t shared_mem_size = E * sizeof(float);
     PROFILE_KERNEL_LAUNCH("topk_kernel_1token",
-                          topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(d_topk_v, d_topk_i, d_router_score, E, p->experts_per_token));
+                          topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(d_topk_v, d_topk_i, d_router_score, E, 4));
     PROFILE_KERNEL_LAUNCH("softmax_kernel",
-                          softmax_kernel<<<1, 1>>>(d_topk_v, p->experts_per_token));
+                          softmax_kernel<<<1, 1>>>(d_topk_v, 4));
 
-    // Zero e_agg
-    HIP_CHECK(hipMemsetAsync(d_e_agg, 0, H * sizeof(float), 0));
-
-    // (B)+(C): For each k in topk (remain on device): MLP1 fused, then MLP2 fused accumulate
-    for (int kk = 0; kk < p->experts_per_token; ++kk) {
-      // MLP1 fused: gate_up (IM)
-      dim3 gridIM = get_gemv_grid_dim(IM);
-      PROFILE_KERNEL_LAUNCH("mlp1_fused_kernel",
-        mlp1_fused_kernel<bf16_t><<<gridIM, block>>>(d_gate_up, d_t,
-          d_w_mlp1_bf16, g_b_mlp1, d_topk_i, kk, l, E, H, IM, p->swiglu_limit));
-
-      // MLP2 + bias + weighted accumulate to e_agg
-      PROFILE_KERNEL_LAUNCH("mlp2_bias_weighted_accum_kernel",
-        mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block>>>(d_e_agg, d_gate_up,
-          d_w_mlp2_bf16, g_b_mlp2, d_topk_i, d_topk_v, kk, l, E, IM, H));
+    // Zero per-expert buffers (overlap with streams)
+    for (int kk = 0; kk < 4; ++kk) {
+      HIP_CHECK(hipMemsetAsync(d_e_agg4 + kk * H, 0, H * sizeof(float), mlp_streams[kk]));
     }
+
+    // (B)+(C) per expert in its own stream: MLP1 fused -> MLP2 fused (write to d_e_agg4[kk])
+    dim3 gridIM = get_gemv_grid_dim(IM);
+    for (int kk = 0; kk < 4; ++kk) {
+      // gate_up buffer per expert
+      float *gate_ptr = d_gate_up4 + kk * IM;
+
+      // MLP1 fused
+      mlp1_fused_kernel<bf16_t><<<gridIM, block, 0, mlp_streams[kk]>>>(
+        gate_ptr, d_t, d_w_mlp1_bf16, g_b_mlp1, d_topk_i,
+        kk, l, E, H, IM, p->swiglu_limit);
+
+      // MLP2 fused -> e_agg4[kk]
+      mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block, 0, mlp_streams[kk]>>>(
+        d_e_agg4 + kk * H, gate_ptr, d_w_mlp2_bf16, g_b_mlp2,
+        d_topk_i, d_topk_v, kk, l, E, IM, H);
+    }
+
+    // Wait 4 streams, then sum 4 experts deterministically
+    for (int kk = 0; kk < 4; ++kk) HIP_CHECK(hipStreamSynchronize(mlp_streams[kk]));
+    PROFILE_KERNEL_LAUNCH("sum4_kernel",
+                          sum4_kernel<<<gridH, block>>>(d_e_agg, d_e_agg4, H));
 
     // Residual add (x += e_agg)
     PROFILE_KERNEL_LAUNCH("residual_add_kernel",
