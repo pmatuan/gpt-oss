@@ -919,13 +919,11 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   // Embedding (BF16 -> FP32)
   PROFILE_KERNEL_LAUNCH("copy_embedding_bf16_row_kernel",
                         copy_embedding_bf16_row_kernel<<<gridH, block>>>(d_x, d_token_embedding_table_bf16, token, H));
-  HIP_CHECK(hipStreamSynchronize(0));
 
   for (int l = 0; l < p->n_layers; ++l) {
     // RMSNorm (attn)
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_attn_w + l * H, H));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     // (A) QKV = W_qkv@t + b_qkv  (fused)
     const int QKV_D = D * (Hq + 2 * Hk);
@@ -934,11 +932,9 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                           matmul_bias_kernel<bf16_t><<<gridQKV, block>>>(d_qkv, d_t,
                             d_w_qkv_bf16 + (size_t)l * QKV_D * H,
                             d_b_qkv + l * QKV_D, H, QKV_D));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     PROFILE_KERNEL_LAUNCH("split_qkv_kernel",
                           split_qkv_kernel<<<gridQKV, block>>>(d_q, d_k, d_v, d_qkv, Hq, Hk, D));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     int loff = l * S * KV;
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float), hipMemcpyDeviceToDevice));
@@ -948,14 +944,12 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     PROFILE_KERNEL_LAUNCH("compute_cos_sin_kernel",
                           compute_cos_sin_kernel<<<gridR, block>>>(d_cos_vals, d_sin_vals, pos, p->rope_theta, D,
                                              p->rope_scaling_factor, p->initial_context_length));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     dim3 gridApplyQ(Hq), gridApplyK(Hk);
     PROFILE_KERNEL_LAUNCH("apply_rotary_emb_kernel",
                           apply_rotary_emb_kernel<<<gridApplyQ, D / 2>>>(d_q, d_cos_vals, d_sin_vals, Hq, D));
     PROFILE_KERNEL_LAUNCH("apply_rotary_emb_kernel",
                           apply_rotary_emb_kernel<<<gridApplyK, D / 2>>>(d_k, d_cos_vals, d_sin_vals, Hk, D));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float), hipMemcpyDeviceToDevice));
 
@@ -973,7 +967,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         d_tb, d_q, d_key_cache + loff, d_value_cache + loff, d_token2row,
         d_attn_sinks + l * Hq, (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr,
         Hq, Hk, D, KV, S, pos));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     // Output projection + bias + residual (bias fused in add)
     const int O_N = D * Hq;
@@ -982,12 +975,10 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                           matmul_kernel<bf16_t><<<gridO, block>>>(d_tb2, d_tb, d_w_o_bf16 + (size_t)l * H * O_N, O_N, H));
     PROFILE_KERNEL_LAUNCH("add_bias_residual_inplace_kernel",
                           add_bias_residual_inplace_kernel<<<gridO, block>>>(d_x, d_tb2, d_b_o + l * H, H));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     // FFN RMSNorm
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_ffn_w + l * H, H));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     // Router: scores = W_router@t + b
     dim3 gridE = get_gemv_grid_dim(E);
@@ -995,7 +986,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                           matmul_kernel<float><<<gridE, block>>>(d_router_score, d_t, d_w_router + (size_t)l * H * E, H, E));
     PROFILE_KERNEL_LAUNCH("add_bias_kernel_router",
                           add_bias_kernel<<<gridE, block>>>(d_router_score, d_b_router + l * E, E));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     // Top-k on device
     size_t shared_mem_size = E * sizeof(float);
@@ -1003,7 +993,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                           topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(d_topk_v, d_topk_i, d_router_score, E, p->experts_per_token));
     PROFILE_KERNEL_LAUNCH("softmax_kernel",
                           softmax_kernel<<<1, 1>>>(d_topk_v, p->experts_per_token));
-    HIP_CHECK(hipStreamSynchronize(0));
 
     // Zero e_agg
     HIP_CHECK(hipMemsetAsync(d_e_agg, 0, H * sizeof(float), 0));
@@ -1015,25 +1004,21 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
       PROFILE_KERNEL_LAUNCH("mlp1_fused_kernel",
         mlp1_fused_kernel<bf16_t><<<gridIM, block>>>(d_gate_up, d_t,
           d_w_mlp1_bf16, g_b_mlp1, d_topk_i, kk, l, E, H, IM, p->swiglu_limit));
-      HIP_CHECK(hipStreamSynchronize(0));
 
       // MLP2 + bias + weighted accumulate to e_agg
       PROFILE_KERNEL_LAUNCH("mlp2_bias_weighted_accum_kernel",
         mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block>>>(d_e_agg, d_gate_up,
           d_w_mlp2_bf16, g_b_mlp2, d_topk_i, d_topk_v, kk, l, E, IM, H));
-      HIP_CHECK(hipStreamSynchronize(0));
     }
 
     // Residual add (x += e_agg)
     PROFILE_KERNEL_LAUNCH("residual_add_kernel",
                           residual_add_kernel<<<gridH, block>>>(d_x, d_e_agg, H));
-    HIP_CHECK(hipStreamSynchronize(0));
   }
 
   // Final RMSNorm
   PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                         rmsnorm_kernel<<<1, BLOCK_SIZE>>>(d_t, d_x, d_rms_out_w, H));
-  HIP_CHECK(hipStreamSynchronize(0));
   HIP_CHECK(hipMemcpy(d_x, d_t, H * sizeof(float), hipMemcpyDeviceToDevice));
 
   // LM head
@@ -1041,7 +1026,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   dim3 gridV = get_gemv_grid_dim(V);
   PROFILE_KERNEL_LAUNCH("matmul_kernel",
                         matmul_kernel<bf16_t><<<gridV, block>>>(d_logits, d_x, d_out_bf16, H, V));
-  HIP_CHECK(hipStreamSynchronize(0));
 
   return d_logits;
 }
