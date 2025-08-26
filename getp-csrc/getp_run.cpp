@@ -1,8 +1,8 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
-#include "matmul_kernels.cpp"
-#include "attention_kernels.cpp"
-#include "utility_kernels.cpp"
+#include "matmul.cpp"
+#include "attention.cpp"
+#include "utility.cpp"
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_cooperative_groups.h>
 #include <hip/hip_fp16.h>
