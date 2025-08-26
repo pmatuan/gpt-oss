@@ -1,3 +1,6 @@
+// getp_run.cpp (optimized)
+// Drop-in replacement.
+
 #include "../profiler.h"
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
@@ -11,6 +14,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
+// Tuning knobs (unchanged)
 #define TK 128
 #define TM 4
 #define BLOCK_SIZE 256
@@ -77,6 +81,8 @@ static bf16_t *d_out_bf16;
 
 // Config pointer
 static Config *h_config = nullptr;
+
+// ======================= Compute Kernels =======================
 
 // RMSNorm with warp reductions (BLOCK_SIZE threads, WF_SIZE=64 per wave)
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
@@ -351,7 +357,7 @@ __global__ void matmul_kernel(float *__restrict__ y, const float *__restrict__ x
   if (lane == 0) y[row] = acc_all;
 }
 
-// ---------------- Async pipelined FP32->BF16 converter ----------------
+// ==================== FP32->BF16 Async Host->Device ====================
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
                                      bf16_t *d_dst, int n_streams = 4,
                                      size_t chunk_bytes = 64ULL * 1024 * 1024) {
@@ -461,8 +467,9 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
   free(pinned_chunks); free(events); free(streams);
 }
 
-// Paged fused attention kernel: scores + sink + softmax + values with KV indirection
+// =================== Fused Paged Attention (Optimized) ===================
 // token2row[t] gives the physical row in key_cache/value_cache for logical token t.
+// We pre-load Q_h into shared once per block/head, use warp-level reductions for dots.
 template<int TILE_T>
 __global__ void paged_attention_fused_kernel(
     float* __restrict__ tb,                 // [Hq, D] out
@@ -475,7 +482,12 @@ __global__ void paged_attention_fused_kernel(
     int Hq, int Hk, int D, int KV,          // KV = D * Hk
     int S, int pos                          // T_real = pos + 1
 ) {
-  extern __shared__ double s_tile[]; // used for per-tile logits/weights
+  extern __shared__ unsigned char smem_raw[];
+  // Layout: [TILE_T doubles][blockDim.x doubles][D floats]
+  double* s_logits = reinterpret_cast<double*>(smem_raw);
+  double* s_warp   = s_logits + TILE_T;              // also used to broadcast scalars
+  float*  s_q      = reinterpret_cast<float*>(s_warp + blockDim.x);
+
   const int h   = blockIdx.x;
   const int tid = threadIdx.x;
   if (h >= Hq) return;
@@ -484,51 +496,69 @@ __global__ void paged_attention_fused_kernel(
   const int base   = (h / kv_mul) * D;
   const double scale = 1.0 / sqrt((double)D);
 
-  // Pointers
-  const float* qh = q + (size_t)h * D;    // [D]
-  const float* K  = key_cache;            // [Rows, KV]
-  const float* V  = value_cache;          // [Rows, KV]
+  const float* __restrict__ qh = q + (size_t)h * D;    // [D]
+  const float* __restrict__ K  = key_cache;            // [Rows, KV]
+  const float* __restrict__ V  = value_cache;          // [Rows, KV]
 
   const int T_real = pos + 1;             // indices t ∈ [0, T_real)
-  // Shared memory layout: first TILE_T for logits/weights, then blockDim.x for reductions/broadcasts
-  double* s_logits = s_tile;              // [TILE_T]
-  double* s_reduce = s_tile + TILE_T;     // [blockDim.x]
+
+  // Preload Q_h into shared once
+  for (int i = tid; i < D; i += blockDim.x) {
+    s_q[i] = qh[i];
+  }
+  __syncthreads();
 
   // Streaming softmax state
   double m_run = -INFINITY;  // running max
   double s_run = 0.0;        // running denominator sum
-  const int i0 = tid;        // output dim owned by this thread
-  double num_acc = 0.0;      // running numerator for dim i0
+
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;                       // warp id
+  const int warp_count = (blockDim.x + WF_SIZE - 1) / WF_SIZE;
+
+  // numerator accumulator for output dim "tid" (only if tid<D)
+  double num_acc = 0.0;
 
   for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
     const int tile = min(TILE_T, T_real - t0);
-
-    // 1) Compute logits for this tile and track tile_max
     double tile_max = -INFINITY;
+
+    // 1) Compute logits for this tile with warp-level reduction
     for (int tt = 0; tt < tile; ++tt) {
       const int t = t0 + tt;
       int row = token2row[t];
-      // Clamp row to valid range to avoid OOB/NaNs if mapping is invalid
       if (row < 0) row = 0; else if (row >= S) row = S - 1;
-      // Dot(Q_h, K_row)
-      double part = 0.0;
+
+      // dot(q_h, k_row)
+      float partf = 0.0f;
       for (int i = tid; i < D; i += blockDim.x) {
         const float k = K[(size_t)row * KV + base + i];
-        part += (double)qh[i] * (double)k;
+        partf = fmaf(s_q[i], k, partf);
       }
-      // Block reduction to get full dot
-      s_reduce[tid] = part;
+      // reduce within warp
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+        partf += __shfl_down(partf, off, WF_SIZE);
+      }
+      if (lane == 0) {
+        s_warp[wid] = (double)partf;
+      }
       __syncthreads();
-      for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
-        __syncthreads();
-      }
-  double logit = s_reduce[0] * scale;
-      if (mask) logit += (double)mask[(size_t)pos * S + t];
-  if (!isfinite(logit)) logit = -1e30; // guard
-      if (tid == 0) {
-        s_logits[tt] = logit;          // store logit for this tt
-        tile_max = fmax(tile_max, logit);
+
+      // first warp reduces cross-warp partials
+      if (wid == 0) {
+        double sum = (lane < warp_count) ? s_warp[lane] : 0.0;
+        #pragma unroll
+        for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+          sum += __shfl_down(sum, off, WF_SIZE);
+        }
+        if (lane == 0) {
+          double logit = sum * scale;
+          if (mask) logit += (double)mask[(size_t)pos * S + t];
+          if (!isfinite(logit)) logit = -1e30;
+          s_logits[tt] = logit;
+          tile_max = fmax(tile_max, logit);
+        }
       }
       __syncthreads();
     }
@@ -537,22 +567,20 @@ __global__ void paged_attention_fused_kernel(
     if (tid == 0) {
       double m_new = fmax(m_run, tile_max);
       double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
-      s_run *= scale_old;          // rescale denominator
-      s_reduce[0] = m_new;         // broadcast m_new
-      s_reduce[1] = scale_old;     // broadcast scaling for numerator
-      s_reduce[2] = exp(tile_max - m_new); // factor to convert tile-local weights to base m_new
+      s_run *= scale_old;           // rescale denominator
+      s_warp[0] = m_new;            // broadcast m_new
+      s_warp[1] = scale_old;        // broadcast scaling for numerator
+      s_warp[2] = exp(tile_max - m_new); // factor to convert tile-local weights to base m_new
     }
     __syncthreads();
-    const double m_new = s_reduce[0];
-    const double num_scale = s_reduce[1];
-    const double factor = s_reduce[2];
-    // Rescale numerator for this thread
+    const double m_new = s_warp[0];
+    const double num_scale = s_warp[1];
+    const double factor = s_warp[2];
     num_acc *= num_scale;
 
     // 3) Compute tile weights relative to tile_max, transform to base m_new, and accumulate
-    if (i0 < D) {
+    if (tid < D) {
       for (int tt = 0; tt < tile; ++tt) {
-        // Thread 0 computes and stores weight; others read it
         if (tid == 0) {
           double w_local = exp(s_logits[tt] - (double)tile_max);
           s_logits[tt] = w_local * factor; // weight in base m_new
@@ -562,23 +590,22 @@ __global__ void paged_attention_fused_kernel(
         const int t = t0 + tt;
         int row = token2row[t];
         if (row < 0) row = 0; else if (row >= S) row = S - 1;
-        const float v = V[(size_t)row * KV + base + i0];
+        const float v = V[(size_t)row * KV + base + tid];
         num_acc += s_logits[tt] * (double)v;
         __syncthreads();
       }
     } else {
-      // Even if this thread doesn't own an output dim, we still need s_run computed by tid 0
-  for (int tt = 0; tt < tile; ++tt) {
+      // Ensure s_run computed properly even if this thread doesn't own an output dim
+      for (int tt = 0; tt < tile; ++tt) {
         if (tid == 0) {
           double w_local = exp(s_logits[tt] - (double)tile_max);
-          s_logits[tt] = w_local * factor; // weight in base m_new
+          s_logits[tt] = w_local * factor;
           s_run += s_logits[tt];
         }
         __syncthreads();
       }
     }
     __syncthreads();
-    // Update running max
     if (tid == 0) m_run = m_new;
     __syncthreads();
   }
@@ -589,18 +616,18 @@ __global__ void paged_attention_fused_kernel(
     double m_new = fmax(m_run, sinkVal);
     double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
     s_run = s_run * scale_old + exp(sinkVal - m_new);
-    s_reduce[0] = 1.0 / s_run; // broadcast inverse denominator
-    s_reduce[1] = scale_old;   // broadcast final rescale for numerator
+    s_warp[0] = 1.0 / s_run; // broadcast inverse denominator
+    s_warp[1] = scale_old;   // broadcast final rescale for numerator
   }
   __syncthreads();
-  double inv = s_reduce[0];
+  double inv = s_warp[0];
   if (!isfinite(inv)) inv = 0.0; // guard
-  const double final_scale = s_reduce[1];
+  const double final_scale = s_warp[1];
   num_acc *= final_scale;
-  if (i0 < D) tb[(size_t)h * D + i0] = (float)(num_acc * inv);
+  if (tid < D) tb[(size_t)h * D + tid] = (float)(num_acc * inv);
 }
 
-// ---------------- Init / Finish ----------------
+// ======================== Init / Finish ========================
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   h_config = &transformer->config;
   HIP_CHECK(hipSetDevice(0));
@@ -783,7 +810,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipFree(d_out_bf16));
 }
 
-// ---------------- Forward ----------------
+// ============================ Forward ============================
 float *gpu_forward(Transformer *transformer, int token, int pos) {
   PROFILE_FUNCTION();
   const Config *p = h_config;
@@ -836,11 +863,16 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float), hipMemcpyDeviceToDevice));
 
-    // Fused attention (paged)
+    // Fused attention (paged) - optimized
     const int TILE_T = 256;
     dim3 grid(Hq);
-    dim3 blockA(256);
-    size_t shmem = (TILE_T + blockA.x) * sizeof(double);
+    // choose block size: multiple of 64, cap at 256, not exceeding D too much
+    int blockAttn = (D <= 256) ? (( (D + WF_SIZE - 1) / WF_SIZE) * WF_SIZE) : 256;
+    if (blockAttn < WF_SIZE) blockAttn = WF_SIZE; // safety
+    dim3 blockA(blockAttn);
+    size_t shmem = (size_t)TILE_T * sizeof(double)
+                 + (size_t)blockAttn * sizeof(double)
+                 + (size_t)D * sizeof(float);
     PROFILE_KERNEL_LAUNCH("paged_attention_fused_kernel",
                           paged_attention_fused_kernel<TILE_T><<<grid, blockA, shmem>>>(
         d_tb, d_q, d_key_cache + loff, d_value_cache + loff, d_token2row,
@@ -932,7 +964,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
   return d_logits;
 }
 
-// ---------------- Greedy / Sampling Loop ----------------
+// ================= Greedy / Sampling Loop =================
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps) {
