@@ -1,6 +1,5 @@
 #include "../profiler.h"
 #include "getp_eval.cpp"
-#include "../attention/attention.cpp"
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
 #include <math.h>
@@ -46,11 +45,6 @@ static inline void debug_print_gpu_memory(const char *tag) {
   fflush(stdout);
 }
 
-static inline bf16_t f32_to_bf16(float f) { return rocwmma::bfloat16_t(f); }
-__device__ __forceinline__ float bf16_to_f32(bf16_t val) {
-  return static_cast<float>(val);
-}
-
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 // ---------------- Global GPU Buffers ----------------
@@ -84,7 +78,6 @@ static bf16_t *d_out_bf16;
 // Config pointer
 static Config *h_config = nullptr;
 
-// ---------------- Kernels (optimized) ----------------
 // RMSNorm with warp reductions (BLOCK_SIZE threads, WF_SIZE=64 per wave)
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
                                int size) {
@@ -146,7 +139,7 @@ __global__ void copy_embedding_bf16_row_kernel(float *dst, const bf16_t *src,
                                                int token, int hidden_dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < hidden_dim) {
-    dst[i] = bf16_to_f32(src[(size_t)token * hidden_dim + i]);
+    dst[i] = static_cast<float>(src[(size_t)token * hidden_dim + i]);
   }
 }
 
@@ -427,7 +420,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     size_t done = 0;
     while (done < count) {
       size_t todo = (count - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (count - done);
-      for (size_t i = 0; i < todo; ++i) h_chunk[i] = f32_to_bf16(h_src[done + i]);
+      for (size_t i = 0; i < todo; ++i) h_chunk[i] = rocwmma::bfloat16_t(h_src[done + i]);
       HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t), hipMemcpyHostToDevice));
       done += todo;
     }
@@ -448,7 +441,7 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     }
     bf16_t *chunk = pinned_chunks[stream_idx];
     #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < todo; ++i) chunk[i] = f32_to_bf16(h_src[done + i]);
+    for (size_t i = 0; i < todo; ++i) chunk[i] = rocwmma::bfloat16_t(h_src[done + i]);
 
     HIP_CHECK(hipMemcpyAsync(d_dst + done, chunk, todo * sizeof(bf16_t),
                              hipMemcpyHostToDevice, streams[stream_idx]));
@@ -466,6 +459,145 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     HIP_CHECK(hipStreamDestroy(streams[i]));
   }
   free(pinned_chunks); free(events); free(streams);
+}
+
+// Paged fused attention kernel: scores + sink + softmax + values with KV indirection
+// token2row[t] gives the physical row in key_cache/value_cache for logical token t.
+template<int TILE_T>
+__global__ void paged_attention_fused_kernel(
+    float* __restrict__ tb,                 // [Hq, D] out
+    const float* __restrict__ q,            // [Hq, D]
+    const float* __restrict__ key_cache,    // [Rows, KV]
+    const float* __restrict__ value_cache,  // [Rows, KV]
+    const int* __restrict__ token2row,      // [S]
+    const float* __restrict__ attn_sinks_layer, // [Hq]
+    const float* __restrict__ mask,         // [S, S] or nullptr
+    int Hq, int Hk, int D, int KV,          // KV = D * Hk
+    int S, int pos                          // T_real = pos + 1
+) {
+  extern __shared__ double s_tile[]; // used for per-tile logits/weights
+  const int h   = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= Hq) return;
+
+  const int kv_mul = Hq / Hk;
+  const int base   = (h / kv_mul) * D;
+  const double scale = 1.0 / sqrt((double)D);
+
+  // Pointers
+  const float* qh = q + (size_t)h * D;    // [D]
+  const float* K  = key_cache;            // [Rows, KV]
+  const float* V  = value_cache;          // [Rows, KV]
+
+  const int T_real = pos + 1;             // indices t ∈ [0, T_real)
+  // Shared memory layout: first TILE_T for logits/weights, then blockDim.x for reductions/broadcasts
+  double* s_logits = s_tile;              // [TILE_T]
+  double* s_reduce = s_tile + TILE_T;     // [blockDim.x]
+
+  // Streaming softmax state
+  double m_run = -INFINITY;  // running max
+  double s_run = 0.0;        // running denominator sum
+  const int i0 = tid;        // output dim owned by this thread
+  double num_acc = 0.0;      // running numerator for dim i0
+
+  for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
+    const int tile = min(TILE_T, T_real - t0);
+
+    // 1) Compute logits for this tile and track tile_max
+    double tile_max = -INFINITY;
+    for (int tt = 0; tt < tile; ++tt) {
+      const int t = t0 + tt;
+      int row = token2row[t];
+      // Clamp row to valid range to avoid OOB/NaNs if mapping is invalid
+      if (row < 0) row = 0; else if (row >= S) row = S - 1;
+      // Dot(Q_h, K_row)
+      double part = 0.0;
+      for (int i = tid; i < D; i += blockDim.x) {
+        const float k = K[(size_t)row * KV + base + i];
+        part += (double)qh[i] * (double)k;
+      }
+      // Block reduction to get full dot
+      s_reduce[tid] = part;
+      __syncthreads();
+      for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        __syncthreads();
+      }
+  double logit = s_reduce[0] * scale;
+      if (mask) logit += (double)mask[(size_t)pos * S + t];
+  if (!isfinite(logit)) logit = -1e30; // guard
+      if (tid == 0) {
+        s_logits[tt] = logit;          // store logit for this tt
+        tile_max = fmax(tile_max, logit);
+      }
+      __syncthreads();
+    }
+
+    // 2) Rescale running sums to new base m_new = max(m_run, tile_max)
+    if (tid == 0) {
+      double m_new = fmax(m_run, tile_max);
+      double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
+      s_run *= scale_old;          // rescale denominator
+      s_reduce[0] = m_new;         // broadcast m_new
+      s_reduce[1] = scale_old;     // broadcast scaling for numerator
+      s_reduce[2] = exp(tile_max - m_new); // factor to convert tile-local weights to base m_new
+    }
+    __syncthreads();
+    const double m_new = s_reduce[0];
+    const double num_scale = s_reduce[1];
+    const double factor = s_reduce[2];
+    // Rescale numerator for this thread
+    num_acc *= num_scale;
+
+    // 3) Compute tile weights relative to tile_max, transform to base m_new, and accumulate
+    if (i0 < D) {
+      for (int tt = 0; tt < tile; ++tt) {
+        // Thread 0 computes and stores weight; others read it
+        if (tid == 0) {
+          double w_local = exp(s_logits[tt] - (double)tile_max);
+          s_logits[tt] = w_local * factor; // weight in base m_new
+          s_run += s_logits[tt];
+        }
+        __syncthreads();
+        const int t = t0 + tt;
+        int row = token2row[t];
+        if (row < 0) row = 0; else if (row >= S) row = S - 1;
+        const float v = V[(size_t)row * KV + base + i0];
+        num_acc += s_logits[tt] * (double)v;
+        __syncthreads();
+      }
+    } else {
+      // Even if this thread doesn't own an output dim, we still need s_run computed by tid 0
+  for (int tt = 0; tt < tile; ++tt) {
+        if (tid == 0) {
+          double w_local = exp(s_logits[tt] - (double)tile_max);
+          s_logits[tt] = w_local * factor; // weight in base m_new
+          s_run += s_logits[tt];
+        }
+        __syncthreads();
+      }
+    }
+    __syncthreads();
+    // Update running max
+    if (tid == 0) m_run = m_new;
+    __syncthreads();
+  }
+
+  // 4) Add sink to denominator (not numerator), adjust base if needed
+  const double sinkVal = (double)attn_sinks_layer[h];
+  if (tid == 0) {
+    double m_new = fmax(m_run, sinkVal);
+    double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
+    s_run = s_run * scale_old + exp(sinkVal - m_new);
+    s_reduce[0] = 1.0 / s_run; // broadcast inverse denominator
+    s_reduce[1] = scale_old;   // broadcast final rescale for numerator
+  }
+  __syncthreads();
+  double inv = s_reduce[0];
+  if (!isfinite(inv)) inv = 0.0; // guard
+  const double final_scale = s_reduce[1];
+  num_acc *= final_scale;
+  if (i0 < D) tb[(size_t)h * D + i0] = (float)(num_acc * inv);
 }
 
 // ---------------- Init / Finish ----------------
