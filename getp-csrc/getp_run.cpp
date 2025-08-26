@@ -119,16 +119,16 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight,
 
 __global__ void softmax_kernel(float *x, int size) {
   if (threadIdx.x == 0) {
-    double max_val = (double)x[0];
-    for (int i = 1; i < size; i++) max_val = fmax(max_val, (double)x[i]);
-    double sum = 0.0;
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) max_val = fmax(max_val, x[i]);
+    float sum = 0.0;
     for (int i = 0; i < size; i++) {
-      float ev = expf((float)((double)x[i] - max_val));
+      float ev = expf(x[i] - max_val);
       x[i] = ev;
-      sum += (double)ev;
+      sum += ev;
     }
-    double inv_sum = 1.0 / sum;
-    for (int i = 0; i < size; i++) x[i] = (float)((double)x[i] * inv_sum);
+    float inv_sum = 1.0 / sum;
+    for (int i = 0; i < size; i++) x[i] = x[i] * inv_sum;
   }
 }
 
@@ -671,8 +671,8 @@ __global__ void paged_attention_fused_kernel(
     int S, int pos) {
 
   extern __shared__ unsigned char smem_raw[];
-  double* s_logits = reinterpret_cast<double*>(smem_raw);
-  double* s_warp   = s_logits + TILE_T;
+  float*  s_logits = reinterpret_cast<float*>(smem_raw);
+  float*  s_warp   = s_logits + TILE_T;
   float*  s_q      = reinterpret_cast<float*>(s_warp + blockDim.x);
 
   const int h   = blockIdx.x;
@@ -681,7 +681,7 @@ __global__ void paged_attention_fused_kernel(
 
   const int kv_mul = Hq / Hk;
   const int base   = (h / kv_mul) * D;
-  const double scale = 1.0 / sqrt((double)D);
+  const float scale = 1.0f / sqrtf((float)D);
 
   const float* __restrict__ qh = q + (size_t)h * D;
   const float* __restrict__ K  = key_cache;
@@ -692,18 +692,18 @@ __global__ void paged_attention_fused_kernel(
   for (int i = tid; i < D; i += blockDim.x) s_q[i] = qh[i];
   __syncthreads();
 
-  double m_run = -INFINITY;
-  double s_run = 0.0;
+  float m_run = -INFINITY;
+  float s_run = 0.0f;
 
   const int lane = tid & (WF_SIZE - 1);
   const int wid  = tid >> 6;
   const int warp_count = (blockDim.x + WF_SIZE - 1) / WF_SIZE;
 
-  double num_acc = 0.0;
+  float num_acc = 0.0f;
 
   for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
     const int tile = min(TILE_T, T_real - t0);
-    double tile_max = -INFINITY;
+    float tile_max = -INFINITY;
 
     for (int tt = 0; tt < tile; ++tt) {
       const int t = t0 + tt;
@@ -717,17 +717,17 @@ __global__ void paged_attention_fused_kernel(
       }
       #pragma unroll
       for (int off = WF_SIZE >> 1; off > 0; off >>= 1) partf += __shfl_down(partf, off, WF_SIZE);
-      if (lane == 0) s_warp[wid] = (double)partf;
+      if (lane == 0) s_warp[wid] = partf;
       __syncthreads();
 
       if (wid == 0) {
-        double sum = (lane < warp_count) ? s_warp[lane] : 0.0;
+        float sum = (lane < warp_count) ? s_warp[lane] : 0.0f;
         #pragma unroll
         for (int off = WF_SIZE >> 1; off > 0; off >>= 1) sum += __shfl_down(sum, off, WF_SIZE);
         if (lane == 0) {
-          double logit = sum * scale;
-          if (mask) logit += (double)mask[(size_t)pos * S + t];
-          if (!isfinite(logit)) logit = -1e30;
+          float logit = sum * scale;
+          if (mask) logit += mask[(size_t)pos * S + t];
+          if (!isfinite(logit)) logit = -1e30f;
           s_logits[tt] = logit;
           tile_max = fmax(tile_max, logit);
         }
@@ -736,23 +736,23 @@ __global__ void paged_attention_fused_kernel(
     }
 
     if (tid == 0) {
-      double m_new = fmax(m_run, tile_max);
-      double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
+      float m_new = fmax(m_run, tile_max);
+      float scale_old = isfinite(m_run) ? expf(m_run - m_new) : 0.0f;
       s_run *= scale_old;
       s_warp[0] = m_new;
       s_warp[1] = scale_old;
-      s_warp[2] = exp(tile_max - m_new);
+      s_warp[2] = expf(tile_max - m_new);
     }
     __syncthreads();
-    const double m_new = s_warp[0];
-    const double num_scale = s_warp[1];
-    const double factor = s_warp[2];
+    const float m_new = s_warp[0];
+    const float num_scale = s_warp[1];
+    const float factor = s_warp[2];
     num_acc *= num_scale;
 
     if (tid < D) {
       for (int tt = 0; tt < tile; ++tt) {
         if (tid == 0) {
-          double w_local = exp(s_logits[tt] - (double)tile_max);
+          float w_local = expf(s_logits[tt] - tile_max);
           s_logits[tt] = w_local * factor;
           s_run += s_logits[tt];
         }
@@ -761,13 +761,13 @@ __global__ void paged_attention_fused_kernel(
         int row = token2row[t];
         if (row < 0) row = 0; else if (row >= S) row = S - 1;
         const float v = V[(size_t)row * KV + base + tid];
-        num_acc += s_logits[tt] * (double)v;
+        num_acc += s_logits[tt] * v;
         __syncthreads();
       }
     } else {
       for (int tt = 0; tt < tile; ++tt) {
         if (tid == 0) {
-          double w_local = exp(s_logits[tt] - (double)tile_max);
+          float w_local = expf(s_logits[tt] - tile_max);
           s_logits[tt] = w_local * factor;
           s_run += s_logits[tt];
         }
@@ -779,20 +779,20 @@ __global__ void paged_attention_fused_kernel(
     __syncthreads();
   }
 
-  const double sinkVal = (double)attn_sinks_layer[h];
+  const float sinkVal = attn_sinks_layer[h];
   if (tid == 0) {
-    double m_new = fmax(m_run, sinkVal);
-    double scale_old = isfinite(m_run) ? exp(m_run - m_new) : 0.0;
-    s_run = s_run * scale_old + exp(sinkVal - m_new);
-    s_warp[0] = 1.0 / s_run;
+    float m_new = fmax(m_run, sinkVal);
+    float scale_old = isfinite(m_run) ? expf(m_run - m_new) : 0.0f;
+    s_run = s_run * scale_old + expf(sinkVal - m_new);
+    s_warp[0] = 1.0f / s_run;
     s_warp[1] = scale_old;
   }
   __syncthreads();
-  double inv = s_warp[0];
-  if (!isfinite(inv)) inv = 0.0;
-  const double final_scale = s_warp[1];
+  float inv = s_warp[0];
+  if (!isfinite(inv)) inv = 0.0f;
+  const float final_scale = s_warp[1];
   num_acc *= final_scale;
-  if (tid < D) tb[(size_t)h * D + tid] = (float)(num_acc * inv);
+  if (tid < D) tb[(size_t)h * D + tid] = (num_acc * inv);
 }
 
 // ======================== Init / Finish ========================
@@ -1031,8 +1031,8 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     int blockAttn = (D <= 256) ? (((D + WF_SIZE - 1) / WF_SIZE) * WF_SIZE) : 256;
     if (blockAttn < WF_SIZE) blockAttn = WF_SIZE;
     dim3 blockA(blockAttn);
-    size_t shmem = (size_t)TILE_T * sizeof(double)
-                 + (size_t)blockAttn * sizeof(double)
+    size_t shmem = (size_t)TILE_T * sizeof(float)
+                 + (size_t)blockAttn * sizeof(float)
                  + (size_t)D * sizeof(float);
     PROFILE_KERNEL_LAUNCH("paged_attention_fused_kernel",
                           paged_attention_fused_kernel<TILE_T><<<grid, blockA, shmem>>>(
