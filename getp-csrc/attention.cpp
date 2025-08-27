@@ -1,148 +1,133 @@
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 #include <math.h>
 
-#define BLOCK_SIZE 256
+typedef hip_bfloat16 bf16_t;
+
 #define WF_SIZE 64
 
-template <int TILE_T, int HEADS_PER_BLOCK>
-__launch_bounds__(BLOCK_SIZE, 2) __global__ void attention_kernel(
-    float *__restrict__ tb,                     // [Hq, D]
-    const float *__restrict__ q,                // [Hq, D]
-    const float *__restrict__ key_cache,        // [S, KV] per layer
-    const float *__restrict__ value_cache,      // [S, KV] per layer
-    const int *__restrict__ token2row,          // [S]
-    const float *__restrict__ attn_sinks_layer, // [Hq]
-    const float *__restrict__ mask,             // [S,S] or nullptr
-    int Hq, int Hk, int D, int KV,              // dims
-    int S, int pos) {
-
-  extern __shared__ float smem[];
-  const int warp_count = (blockDim.x + 63) / 64;
+// Optimized fused decode-time attention kernel for all heads (B=1) - FP32 only
+__launch_bounds__(64, 8)  
+__global__ void attention_kernel(
+    float* __restrict__ out_tb,       // [Hq*D], concatenated heads output
+    const float* __restrict__ q,      // [Hq*D], FP32 (already rotary-applied)
+    const float* __restrict__ k_cache, // [S*KV], FP32 for this layer
+    const float* __restrict__ v_cache, // [S*KV], FP32 for this layer
+    const float* __restrict__ attn_sinks,    // [L*Hq], same as current code
+    int layer_idx, int pos, int D, int Hq, int Hk, int S,
+    const float* __restrict__ mask
+) {
+  const int head = blockIdx.x;
+  const int lane = threadIdx.x;
   
-  // Each block processes HEADS_PER_BLOCK heads
-  const int heads_start = blockIdx.x * HEADS_PER_BLOCK;
-  const int heads_end = min(heads_start + HEADS_PER_BLOCK, Hq);
-  const int actual_heads = heads_end - heads_start;
+  if (head >= Hq) return;
   
-  if (heads_start >= Hq) return;
-  
-  const float scale = 1.0f / sqrtf((float)D);
+  const int kv_dim = Hk * D;
   const int kv_mul = Hq / Hk;
-  const int tid = threadIdx.x;
-  const int lane = tid & 63;
-  const int wid = tid >> 6;
+  const int kv_head = head / kv_mul;
+  const float rsqrt_D = rsqrtf((float)D);
   
-  // Shared memory: queries for all heads in this block + reduction space
-  float *s_q_all = smem; // [HEADS_PER_BLOCK * D]
-  float *s_red = s_q_all + HEADS_PER_BLOCK * D; // reduction space
+  // Use dynamic shared memory for attention scores
+  extern __shared__ float s_att[];
   
-  // Load all queries for heads in this block
-  for (int local_h = 0; local_h < actual_heads; ++local_h) {
-    const int global_h = heads_start + local_h;
-    float *s_q_h = s_q_all + local_h * D;
-    for (int i = tid; i < D; i += blockDim.x) {
-      s_q_h[i] = q[global_h * D + i];
+  // Step 1: Compute attention scores with vectorized memory access
+  // Each thread computes scores for multiple time steps
+  for (int t = lane; t <= pos; t += WF_SIZE) {
+    const float* k_ptr = k_cache + t * kv_dim + kv_head * D;
+    const float* q_ptr = q + head * D;
+    
+    // Vectorized dot product using float4
+    float score = 0.0f;
+    const int D4 = D >> 2;
+    const float4* k4 = reinterpret_cast<const float4*>(k_ptr);
+    const float4* q4 = reinterpret_cast<const float4*>(q_ptr);
+    
+    // Process 4 elements at a time
+    for (int d4 = 0; d4 < D4; ++d4) {
+      float4 k_vec = k4[d4];
+      float4 q_vec = q4[d4];
+      score = fmaf(q_vec.x, k_vec.x, score);
+      score = fmaf(q_vec.y, k_vec.y, score);
+      score = fmaf(q_vec.z, k_vec.z, score);
+      score = fmaf(q_vec.w, k_vec.w, score);
     }
+    
+    // Handle remaining elements if D is not divisible by 4
+    const int remainder = D - (D4 << 2);
+    for (int d = D4 << 2; d < D; ++d) {
+      score = fmaf(q_ptr[d], k_ptr[d], score);
+    }
+    
+    score *= rsqrt_D;
+    
+    // Apply mask if provided
+    if (mask) {
+      score += mask[pos * S + t];
+    }
+    
+    s_att[t] = score;
   }
   __syncthreads();
   
-  // Each warp processes one head
-  if (wid < actual_heads) {
-    const int global_h = heads_start + wid;
-    const int base = (global_h / kv_mul) * D;
-    float *s_q_h = s_q_all + wid * D;
+  // Add sink score at position pos+1 (matches original behavior)
+  if (lane == 0) {
+    float sink_score = attn_sinks[layer_idx * Hq + head];
+    s_att[pos + 1] = sink_score;
+  }
+  __syncthreads();
+  
+  // Step 2: Optimized softmax with fewer synchronizations
+  const int att_size = pos + 2; // scores from 0 to pos+1 inclusive
+  
+  // Find max with warp-level reduction
+  float maxv = -INFINITY;
+  for (int i = lane; i < att_size; i += WF_SIZE) {
+    maxv = fmaxf(maxv, s_att[i]);
+  }
+  // Warp reduction for max
+  #pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    maxv = fmaxf(maxv, __shfl_down(maxv, off, WF_SIZE));
+  }
+  maxv = __shfl(maxv, 0, WF_SIZE);
+  
+  // Compute exp and sum in single pass
+  float sum = 0.0f;
+  for (int i = lane; i < att_size; i += WF_SIZE) {
+    float v = expf(s_att[i] - maxv);
+    s_att[i] = v;
+    sum += v;
+  }
+  // Warp reduction for sum
+  #pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    sum += __shfl_down(sum, off, WF_SIZE);
+  }
+  sum = __shfl(sum, 0, WF_SIZE);
+  
+  // Normalize with precomputed inverse
+  float inv_sum = 1.0f / sum;
+  for (int i = lane; i < att_size; i += WF_SIZE) {
+    s_att[i] *= inv_sum;
+  }
+  __syncthreads();
+  
+  // Step 3: Vectorized attention output computation
+  // Each thread handles multiple output dimensions
+  const int threads_per_dim = min(WF_SIZE, D);
+  if (lane < threads_per_dim) {
+    const int dims_per_thread = (D + threads_per_dim - 1) / threads_per_dim;
+    const int start_dim = lane * dims_per_thread;
+    const int end_dim = min(start_dim + dims_per_thread, D);
     
-    // Online softmax state
-    float m_run = -INFINITY;
-    float s_run = 0.0f;
-    float acc = (lane < D) ? 0.0f : 0.0f;
-    
-    const int T_real = pos + 1;
-    
-    // Process sequence tokens in tiles  
-    for (int t0 = 0; t0 < T_real; t0 += TILE_T) {
-      const int tile = min(TILE_T, T_real - t0);
-      
-      for (int tt = 0; tt < tile; ++tt) {
-        const int t = t0 + tt;
-        int row = token2row[t];
-        if (row < 0) row = 0;
-        else if (row >= S) row = S - 1;
-        
-        // Compute Q·K for this token
-        float part = 0.0f;
-        const float *Krow = key_cache + (size_t)row * KV + base;
-        
-        const int D4 = D >> 2;
-        const float4 *K4 = reinterpret_cast<const float4 *>(Krow);
-        const float4 *Q4 = reinterpret_cast<const float4 *>(s_q_h);
-        
-        for (int i4 = lane; i4 < D4; i4 += 64) {
-          float4 k4 = K4[i4];
-          float4 q4 = Q4[i4];
-          part = fmaf(q4.x, k4.x, part);
-          part = fmaf(q4.y, k4.y, part);
-          part = fmaf(q4.z, k4.z, part);
-          part = fmaf(q4.w, k4.w, part);
-        }
-        
-        // Warp reduction for attention score
-        #pragma unroll
-        for (int off = 32; off > 0; off >>= 1) {
-          part += __shfl_down(part, off, 64);
-        }
-        
-        // Lane 0 computes logit and updates softmax state
-        if (lane == 0) {
-          float logit = part * scale;
-          if (mask) {
-            logit += mask[(size_t)pos * S + t];
-          }
-          if (!isfinite(logit)) logit = -1e30f;
-          
-          // Online softmax update
-          float m_new = fmaxf(m_run, logit);
-          float scale_old = isfinite(m_run) ? expf(m_run - m_new) : 0.0f;
-          float w = expf(logit - m_new);
-          
-          s_run = s_run * scale_old + w;
-          
-          // Store values for broadcasting
-          s_red[wid * 4 + 0] = scale_old;
-          s_red[wid * 4 + 1] = w;
-          s_red[wid * 4 + 2] = m_new;
-          
-          m_run = m_new;
-        }
-        
-        // Broadcast softmax values to all threads in warp
-        float scale_old_b = s_red[wid * 4 + 0];
-        float w_b = s_red[wid * 4 + 1];
-        
-        // Update output accumulator
-        if (lane < D) {
-          const float v = value_cache[(size_t)row * KV + base + lane];
-          acc = acc * scale_old_b + w_b * v;
-        }
+    for (int d = start_dim; d < end_dim; ++d) {
+      float result = 0.0f;
+      // Only accumulate from actual time steps 0..pos, not the sink at pos+1
+      for (int t = 0; t <= pos; ++t) {
+        const float* v_ptr = v_cache + t * kv_dim + kv_head * D;
+        result = fmaf(s_att[t], v_ptr[d], result);
       }
-    }
-    
-    // Apply attention sink
-    if (lane == 0) {
-      const float sinkVal = attn_sinks_layer[global_h];
-      float m_new = fmaxf(m_run, sinkVal);
-      float scale_old = isfinite(m_run) ? expf(m_run - m_new) : 0.0f;
-      float w_sink = expf(sinkVal - m_new);
-      float denom = s_run * scale_old + w_sink;
-      float inv = (isfinite(denom) && denom > 0.0f) ? (1.0f / denom) : 0.0f;
-      
-      s_red[wid * 4 + 0] = scale_old * inv;
-    }
-    
-    // Final normalization and write output
-    if (lane < D) {
-      float final_scale = s_red[wid * 4 + 0];
-      tb[global_h * D + lane] = acc * final_scale;
+      out_tb[head * D + d] = result;
     }
   }
 }

@@ -325,29 +325,23 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
                         hipMemcpyDeviceToDevice));
 
-    // --- Attention (Optimized Fused Multi-Head) ---
+    // --- Attention (Optimized Fused Single-Pass FP32) ---
     {
-      // Optimized fused kernel that processes multiple heads per block for better GPU utilization
-      const int HEADS_PER_BLOCK = 4; // Process 4 heads per block (tunable)
-      const int num_blocks = (Hq + HEADS_PER_BLOCK - 1) / HEADS_PER_BLOCK;
-      dim3 grid(num_blocks);
-
-      int blockAttn = BLOCK_SIZE; // Use full block size for better occupancy
-      dim3 blockA(blockAttn);
-
-      // Shared memory: [HEADS_PER_BLOCK * D] for queries + reduction space
-      size_t shmem_fused = HEADS_PER_BLOCK * D * sizeof(float) + 
-                           HEADS_PER_BLOCK * 4 * sizeof(float); // reduction space
+      // Use highly optimized fused attention kernel - one block per head
+      dim3 grid(Hq);
+      dim3 block(WF_SIZE); // 64 threads per block for optimal warp utilization
+      
+      // Shared memory for attention scores: pos + 2 elements (pos+1 for sink)
+      size_t shmem_size = (pos + 2) * sizeof(float);
 
       PROFILE_KERNEL_LAUNCH(
           "attention_kernel",
-          attention_kernel<BLOCK_SIZE, HEADS_PER_BLOCK><<<grid, blockA, shmem_fused>>>(
+          attention_kernel<<<grid, block, shmem_size>>>(
               d_tb, d_q,
-              d_key_cache + loff,   // [S, KV] for this layer
-              d_value_cache + loff, // [S, KV] for this layer
-              d_token2row, d_attn_sinks + l * Hq,
-              (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr, Hq,
-              Hk, D, KV, S, pos));
+              d_key_cache + loff,   // [S, KV] FP32 for this layer - no conversion overhead
+              d_value_cache + loff, // [S, KV] FP32 for this layer - no conversion overhead
+              d_attn_sinks, l, pos, D, Hq, Hk, S,
+              (p->sliding_window > 0 && (l % 2 == 0)) ? d_mask : nullptr));
     }
 
     // Output projection + bias + residual (bias fused in add) - Using MFMA
