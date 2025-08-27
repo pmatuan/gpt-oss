@@ -325,9 +325,8 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
                         hipMemcpyDeviceToDevice));
 
-    // --- Attention (Optimized Fused Single-Pass FP32) ---
+    // --- Attention ---
     {
-      // Use highly optimized fused attention kernel - one block per head
       dim3 grid(Hq);
       dim3 block(WF_SIZE); // 64 threads per block for optimal warp utilization
       

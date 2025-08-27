@@ -6,7 +6,7 @@ typedef hip_bfloat16 bf16_t;
 
 #define WF_SIZE 64
 
-// Optimized fused decode-time attention kernel for all heads (B=1) - FP32 only
+// Optimized fused decode-time attention kernel for all heads (B=1)
 __launch_bounds__(64, 8)  
 __global__ void attention_kernel(
     float* __restrict__ out_tb,       // [Hq*D], concatenated heads output
