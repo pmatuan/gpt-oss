@@ -477,12 +477,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     const char *piece = decode_piece(tokenizer, token, next);
     size_t piece_len = strlen(piece);
     
-    // Expand buffer if needed
-    if (buffer_pos + piece_len + 1 >= buffer_size) {
-      buffer_size *= 2;
-      output_buffer = (char *)realloc(output_buffer, buffer_size);
-    }
-    
     memcpy(output_buffer + buffer_pos, piece, piece_len);
     buffer_pos += piece_len;
 
