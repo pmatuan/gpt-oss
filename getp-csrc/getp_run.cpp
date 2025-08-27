@@ -59,8 +59,22 @@ struct GPUWeightBuffersBF16 {
   bf16_t *d_out_bf16;
 };
 
-struct ModelConfig {
-  Config *h_config;
+
+
+struct PromptCtx {
+  int idx;               // original order
+  const char *input_seq; // input text
+  int *prompt_tokens;    // tokenized prompt buffer
+  int num_prompt_tokens;
+  int *output_tokens;
+  char *output_buffer; // accumulate decoded pieces
+  int pos;                   // decode position (overall steps)
+  int token;                 // current token
+  bool finished;             // reached EOS or step limit
+  PromptCtx()
+      : idx(0), input_seq(nullptr), prompt_tokens(nullptr),
+        num_prompt_tokens(0), output_tokens(nullptr), output_buffer(nullptr), 
+        pos(0), token(0), finished(false) {}
 };
 
 // Global instances
@@ -68,23 +82,23 @@ static GPUActivationBuffers gpu_activations;
 static GPUWeightBuffersFP32 gpu_weights_fp32;
 static GPUExpertBiasBuffers gpu_expert_bias = {nullptr, nullptr};
 static GPUWeightBuffersBF16 gpu_weights_bf16;
-static ModelConfig model_config = {nullptr};
+static Config *model_config = nullptr;
 
 // ======================== Init / Finish ========================
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-  model_config.h_config = &transformer->config;
+  model_config = &transformer->config;
   HIP_CHECK(hipSetDevice(0));
 
-  const int H = model_config.h_config->hidden_dim;
-  const int V = model_config.h_config->vocab_size;
-  const int L = model_config.h_config->n_layers;
-  const int E = model_config.h_config->n_experts;
-  const int D = model_config.h_config->head_dim;
-  const int Hq = model_config.h_config->n_attn_heads;
-  const int Hk = model_config.h_config->n_kv_heads;
+  const int H = model_config->hidden_dim;
+  const int V = model_config->vocab_size;
+  const int L = model_config->n_layers;
+  const int E = model_config->n_experts;
+  const int D = model_config->head_dim;
+  const int Hq = model_config->n_attn_heads;
+  const int Hk = model_config->n_kv_heads;
   const int KV = D * Hk;
-  const int S = model_config.h_config->seq_len;
-  const int IM = model_config.h_config->intermediate_dim;
+  const int S = model_config->seq_len;
+  const int IM = model_config->intermediate_dim;
 
   debug_print_gpu_memory("before allocations");
 
@@ -95,8 +109,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   HIP_CHECK(hipMalloc(&gpu_activations.d_tb2, H * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&gpu_activations.d_router_score, E * sizeof(float)));
-  HIP_CHECK(hipMalloc(&gpu_activations.d_topk_v, model_config.h_config->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&gpu_activations.d_topk_i, model_config.h_config->experts_per_token * sizeof(int)));
+  HIP_CHECK(hipMalloc(&gpu_activations.d_topk_v, model_config->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&gpu_activations.d_topk_i, model_config->experts_per_token * sizeof(int)));
 
   HIP_CHECK(hipMalloc(&gpu_activations.d_mlp1_out,
                       2 * IM * sizeof(float))); // (kept for debug options)
@@ -126,13 +140,13 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     free(h_token2row);
   }
 
-  if (model_config.h_config->sliding_window > 0) {
+  if (model_config->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&gpu_activations.d_mask, S * S * sizeof(float)));
     float *h_mask = (float *)malloc(S * S * sizeof(float));
     for (int i = 0; i < S; ++i) {
       for (int j = 0; j < S; ++j) {
         h_mask[i * S + j] =
-            (i - j >= model_config.h_config->sliding_window) ? -INFINITY : 0.0f;
+            (i - j >= model_config->sliding_window) ? -INFINITY : 0.0f;
       }
     }
     HIP_CHECK(hipMemcpy(gpu_activations.d_mask, h_mask, S * S * sizeof(float),
@@ -279,7 +293,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 // ============================ Forward ============================
 float *gpu_forward(Transformer *transformer, int token, int pos) {
   PROFILE_FUNCTION();
-  const Config *p = model_config.h_config;
+  const Config *p = model_config;
   const int H = p->hidden_dim;
   const int D = p->head_dim;
   const int Hq = p->n_attn_heads;
