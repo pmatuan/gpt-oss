@@ -5,7 +5,7 @@
 #define WF_SIZE 64
 
 template <int TILE_T, int HEADS_PER_BLOCK>
-__launch_bounds__(BLOCK_SIZE, 2) __global__ void attention_decode_fused_kernel(
+__launch_bounds__(BLOCK_SIZE, 2) __global__ void attention_kernel(
     float *__restrict__ tb,                     // [Hq, D]
     const float *__restrict__ q,                // [Hq, D]
     const float *__restrict__ key_cache,        // [S, KV] per layer

@@ -340,8 +340,8 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                            HEADS_PER_BLOCK * 4 * sizeof(float); // reduction space
 
       PROFILE_KERNEL_LAUNCH(
-          "attention_decode_fused_kernel",
-          attention_decode_fused_kernel<BLOCK_SIZE, HEADS_PER_BLOCK><<<grid, blockA, shmem_fused>>>(
+          "attention_kernel",
+          attention_kernel<BLOCK_SIZE, HEADS_PER_BLOCK><<<grid, blockA, shmem_fused>>>(
               d_tb, d_q,
               d_key_cache + loff,   // [S, KV] for this layer
               d_value_cache + loff, // [S, KV] for this layer
