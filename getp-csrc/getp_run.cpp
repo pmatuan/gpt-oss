@@ -325,27 +325,23 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
     HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
                         hipMemcpyDeviceToDevice));
 
-    // --- Attention ---
+    // --- Attention (Optimized Fused Multi-Head) ---
     {
-      dim3 grid(Hq);
+      // Optimized fused kernel that processes multiple heads per block for better GPU utilization
+      const int HEADS_PER_BLOCK = 4; // Process 4 heads per block (tunable)
+      const int num_blocks = (Hq + HEADS_PER_BLOCK - 1) / HEADS_PER_BLOCK;
+      dim3 grid(num_blocks);
 
-      int blockAttn = (D <= BLOCK_SIZE)
-                          ? (((D + WF_SIZE - 1) / WF_SIZE) * WF_SIZE)
-                          : BLOCK_SIZE;
-      if (blockAttn < WF_SIZE)
-        blockAttn = WF_SIZE;
-      if (blockAttn > BLOCK_SIZE)
-        blockAttn = BLOCK_SIZE;
+      int blockAttn = BLOCK_SIZE; // Use full block size for better occupancy
       dim3 blockA(blockAttn);
 
-      const int warp_count = (blockAttn + WF_SIZE - 1) / WF_SIZE;
-      // shared mem: s_q[D] + s_red[warp_count + safety]
-      size_t shmem_stream =
-          (size_t)D * sizeof(float) + (size_t)(warp_count + 8) * sizeof(float);
+      // Shared memory: [HEADS_PER_BLOCK * D] for queries + reduction space
+      size_t shmem_fused = HEADS_PER_BLOCK * D * sizeof(float) + 
+                           HEADS_PER_BLOCK * 4 * sizeof(float); // reduction space
 
       PROFILE_KERNEL_LAUNCH(
-          "attention_kernel",
-          attention_kernel<BLOCK_SIZE><<<grid, blockA, shmem_stream>>>(
+          "attention_decode_fused_kernel",
+          attention_decode_fused_kernel<BLOCK_SIZE, HEADS_PER_BLOCK><<<grid, blockA, shmem_fused>>>(
               d_tb, d_q,
               d_key_cache + loff,   // [S, KV] for this layer
               d_value_cache + loff, // [S, KV] for this layer
