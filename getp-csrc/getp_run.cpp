@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <algorithm>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -564,18 +566,86 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   PROFILE_FUNCTION();
   long long num_token_out = 0;
+  
+  if (requests->num_reqs == 0) {
+    return 0;
+  }
 
-  for (int i = 0; i < requests->num_reqs; ++i) {
-    PromptCtx ctx;
-    ctx.idx = i;
-    ctx.input_seq = get_str_req_ptr(requests, i);
-    ctx.output_tokens = get_tok_gen_ptr(requests, i);
-    ctx.max_steps = requests->max_seq_len;
-    ctx.sampler = sampler;
+  // Calculate memory requirements and batch size
+  const Config &cfg = transformer->config;
+  size_t single_ctx_memory = calculate_prompt_ctx_memory_requirement(cfg);
+  size_t available_memory = get_available_gpu_memory();
+  
+  // Calculate maximum batch size based on GPU memory
+  int max_batch_size = max(1, (int)(available_memory / single_ctx_memory));
+  
+  // Don't exceed the number of requests
+  max_batch_size = min(max_batch_size, requests->num_reqs);
+  
+  // Show memory breakdown
+  size_t struct_mem = sizeof(PromptCtx);
+  size_t logits_mem = cfg.vocab_size * sizeof(float);
+  size_t prompt_tokens_mem = 1003 * sizeof(int); // avg estimate
+  size_t output_buffer_mem = cfg.seq_len * 256ULL;
+  
+  printf("[DEBUG] PromptCtx memory breakdown:\n");
+  printf("[DEBUG]   - Struct size: %zu bytes\n", struct_mem);
+  printf("[DEBUG]   - h_logits buffer: %.2f MB (%d vocab * 4 bytes)\n", 
+         (double)logits_mem / (1024.0*1024.0), cfg.vocab_size);
+  printf("[DEBUG]   - prompt_tokens buffer: %.2f KB (estimated)\n", 
+         (double)prompt_tokens_mem / 1024.0);
+  printf("[DEBUG]   - output_buffer: %.2f MB (%d seq_len * 256)\n", 
+         (double)output_buffer_mem / (1024.0*1024.0), cfg.seq_len);
+  printf("[DEBUG]   - Total per context: %.2f MB\n", 
+         (double)single_ctx_memory / (1024.0*1024.0));
+  printf("[DEBUG] Maximum batch size: %d (can process %d prompts in parallel)\n", 
+         max_batch_size, max_batch_size);
+  printf("[DEBUG] Total requests: %d\n", requests->num_reqs);
+  
+  int processed = 0;
+  while (processed < requests->num_reqs) {
+    int current_batch_size = min(max_batch_size, requests->num_reqs - processed);
+    
+    printf("[DEBUG] Processing batch of %d prompts (requests %d-%d)\n", 
+           current_batch_size, processed, processed + current_batch_size - 1);
+    
+    // Allocate contexts for this batch
+    PromptCtx *batch_contexts = new PromptCtx[current_batch_size];
+    
+    // Process batch sequentially (GPU doesn't support true parallel inference)
+    for (int i = 0; i < current_batch_size; ++i) {
+      int req_idx = processed + i;
+      PromptCtx &ctx = batch_contexts[i];
+      ctx.idx = req_idx;
+      ctx.input_seq = get_str_req_ptr(requests, req_idx);
+      ctx.output_tokens = get_tok_gen_ptr(requests, req_idx);
+      ctx.max_steps = requests->max_seq_len;
+      ctx.sampler = sampler;
 
-    num_token_out += simple_getp_generate(transformer, tokenizer, ctx);
-
-    free_prompt_ctx_heap_buffers(ctx);
+      printf("[DEBUG] Processing request %d/%d in current batch\n", i+1, current_batch_size);
+      long long tokens_generated = simple_getp_generate(transformer, tokenizer, ctx);
+      num_token_out += tokens_generated;
+      printf("[DEBUG] Request %d generated %lld tokens\n", req_idx, tokens_generated);
+    }
+    
+    // Print outputs in order
+    printf("\n[BATCH OUTPUT START]\n");
+    for (int i = 0; i < current_batch_size; ++i) {
+      printf("[Request %d]: ", processed + i);
+      safe_printf(batch_contexts[i].output_buffer);
+      printf("\n");
+      fflush(stdout);
+    }
+    printf("[BATCH OUTPUT END]\n\n");
+    
+    // Clean up batch resources
+    for (int i = 0; i < current_batch_size; ++i) {
+      free_prompt_ctx_heap_buffers(batch_contexts[i]);
+    }
+    
+    delete[] batch_contexts;
+    
+    processed += current_batch_size;
   }
 
   return num_token_out;
