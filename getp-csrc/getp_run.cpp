@@ -438,13 +438,21 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     exit(EXIT_FAILURE);
   }
 
+  // Buffer to accumulate all output text for batch printing
+  size_t buffer_size = steps * 256; // Estimate buffer size
+  char *output_buffer = (char *)malloc(buffer_size);
+  size_t buffer_pos = 0;
+
   int next;
   int token = prompt_tokens[0];
   int pos = 0;
 
   const char *first_piece = decode_piece(tokenizer, 200006, token);
-  safe_printf(first_piece);
-  fflush(stdout);
+  size_t first_len = strlen(first_piece);
+  if (buffer_pos + first_len < buffer_size) {
+    memcpy(output_buffer + buffer_pos, first_piece, first_len);
+    buffer_pos += first_len;
+  }
 
   while (pos < steps) {
     float *d_log = gpu_forward(transformer, token, pos);
@@ -467,13 +475,28 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       break;
 
     const char *piece = decode_piece(tokenizer, token, next);
-    safe_printf(piece);
-    fflush(stdout);
+    size_t piece_len = strlen(piece);
+    
+    // Expand buffer if needed
+    if (buffer_pos + piece_len + 1 >= buffer_size) {
+      buffer_size *= 2;
+      output_buffer = (char *)realloc(output_buffer, buffer_size);
+    }
+    
+    memcpy(output_buffer + buffer_pos, piece, piece_len);
+    buffer_pos += piece_len;
 
     token = next;
     free(h_logits);
   }
+
+  // Null terminate and print all at once
+  output_buffer[buffer_pos] = '\0';
+  safe_printf(output_buffer);
   printf("\n");
+  fflush(stdout);
+
+  free(output_buffer);
   output_tokens[pos - num_prompt_tokens + 1] = -1;
   free(prompt_tokens);
   return pos - num_prompt_tokens + 1;
