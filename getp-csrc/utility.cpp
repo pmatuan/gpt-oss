@@ -7,8 +7,8 @@
 
 typedef hip_bfloat16 bf16_t;
 
-#define TM 4
-#define BLOCK_SIZE 256
+#define TM 8
+#define BLOCK_SIZE 512
 #define WF_SIZE 64
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \
