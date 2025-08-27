@@ -20,6 +20,16 @@ typedef hip_bfloat16 bf16_t;
     }                                                                          \
   } while (0)
 
+#define HIP_CHECK_DEVICE(call, device_id)                                     \
+  do {                                                                        \
+    hipError_t error = call;                                                  \
+    if (error != hipSuccess) {                                                \
+      fprintf(stderr, "HIP error on device %d at %s:%d - %s\n", device_id,    \
+              __FILE__, __LINE__, hipGetErrorString(error));                  \
+      exit(EXIT_FAILURE);                                                     \
+    }                                                                         \
+  } while (0)
+
 static inline void debug_print_gpu_memory(const char *tag) {
   size_t free_b = 0, total_b = 0;
   hipError_t err = hipMemGetInfo(&free_b, &total_b);
@@ -91,6 +101,15 @@ __global__ void softmax_kernel(float *x, int size) {
     float inv_sum = 1.0 / sum;
     for (int i = 0; i < size; i++)
       x[i] = x[i] * inv_sum;
+  }
+}
+
+// Replace non-finite values (NaN/Inf) with a provided replacement
+__global__ void sanitize_finite_kernel(float *x, int size, float replacement) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    float v = x[i];
+    if (!isfinite(v)) x[i] = replacement;
   }
 }
 
@@ -261,9 +280,12 @@ __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
 }
 
 static void copy_fp32_to_bf16_device(const float *h_src, size_t count, bf16_t *d_dst,
+                                     hipStream_t stream, int device_id,
                                      int n_streams, size_t chunk_bytes) {
   if (count == 0)
     return;
+
+  HIP_CHECK_DEVICE(hipSetDevice(device_id), device_id);
 
   const size_t chunk_elems = chunk_bytes / sizeof(bf16_t);
   const size_t actual_chunk_elems = (chunk_elems > count) ? count : chunk_elems;
