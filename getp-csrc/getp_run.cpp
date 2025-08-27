@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <algorithm>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -552,10 +551,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   ensure_buffer_capacity(ctx, 1);
   ctx.output_buffer[ctx.buffer_pos] = '\0';
-
-  safe_printf(ctx.output_buffer);
-  printf("\n");
-  fflush(stdout);
 
   ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
 
