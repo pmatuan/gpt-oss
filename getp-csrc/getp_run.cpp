@@ -297,33 +297,22 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
         <<<gridQKV, block>>>(d_qkv, d_t, d_w_qkv_bf16 + (size_t)l * QKV_D * H,
                              d_b_qkv + l * QKV_D, H, QKV_D));
 
-    PROFILE_KERNEL_LAUNCH(
-        "split_qkv_kernel",
-        split_qkv_kernel<<<gridQKV, block>>>(d_q, d_k, d_v, d_qkv, Hq, Hk, D));
-
     int loff = l * S * KV;
-    HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
-                        hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(d_value_cache + loff + pos * KV, d_v,
-                        KV * sizeof(float), hipMemcpyDeviceToDevice));
-
-    dim3 gridR(((D / 2) + block.x - 1) / block.x);
-    PROFILE_KERNEL_LAUNCH("compute_cos_sin_kernel",
-                          compute_cos_sin_kernel<<<gridR, block>>>(
-                              d_cos_vals, d_sin_vals, pos, p->rope_theta, D,
-                              p->rope_scaling_factor,
-                              p->initial_context_length));
+    PROFILE_KERNEL_LAUNCH(
+        "split_qkv_scatter_to_cache_kernel",
+        split_qkv_scatter_to_cache_kernel<<<gridQKV, block>>>(
+            d_q, d_key_cache, d_value_cache, d_qkv, Hq, Hk, D, loff, pos * KV));
 
     dim3 gridApplyQ(Hq), gridApplyK(Hk);
-    PROFILE_KERNEL_LAUNCH("apply_rotary_emb_kernel",
-                          apply_rotary_emb_kernel<<<gridApplyQ, D / 2>>>(
-                              d_q, d_cos_vals, d_sin_vals, Hq, D));
-    PROFILE_KERNEL_LAUNCH("apply_rotary_emb_kernel",
-                          apply_rotary_emb_kernel<<<gridApplyK, D / 2>>>(
-                              d_k, d_cos_vals, d_sin_vals, Hk, D));
-
-    HIP_CHECK(hipMemcpy(d_key_cache + loff + pos * KV, d_k, KV * sizeof(float),
-                        hipMemcpyDeviceToDevice));
+    PROFILE_KERNEL_LAUNCH("inline_rope_kernel",
+                          inline_rope_kernel<<<gridApplyQ, D / 2>>>(
+                              d_q, pos, p->rope_theta, Hq, D,
+                              p->rope_scaling_factor, p->initial_context_length));
+    PROFILE_KERNEL_LAUNCH("inline_rope_to_cache_kernel",
+                          inline_rope_to_cache_kernel<<<gridApplyK, D / 2>>>(
+                              d_key_cache, pos, p->rope_theta, Hk, D,
+                              p->rope_scaling_factor, p->initial_context_length,
+                              loff, pos * KV));
 
     // --- Attention ---
     {

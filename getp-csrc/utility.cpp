@@ -117,6 +117,31 @@ __global__ void split_qkv_kernel(float *q, float *k, float *v, const float *qkv,
     v[idx - q_size - kv_size] = qkv[idx];
 }
 
+__global__ void split_qkv_scatter_to_cache_kernel(float *q, float *key_cache, float *value_cache, 
+                                                  const float *qkv, int n_attn_heads, int n_kv_heads, 
+                                                  int head_dim, int layer_offset, int pos_offset) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int q_size = n_attn_heads * head_dim;
+  int kv_size = n_kv_heads * head_dim;
+  int total = q_size + 2 * kv_size;
+  
+  if (idx >= total)
+    return;
+    
+  if (idx < q_size) {
+    // Copy Q to output buffer
+    q[idx] = qkv[idx];
+  } else if (idx < q_size + kv_size) {
+    // Scatter K directly to key cache
+    int k_idx = idx - q_size;
+    key_cache[layer_offset + pos_offset + k_idx] = qkv[idx];
+  } else {
+    // Scatter V directly to value cache  
+    int v_idx = idx - q_size - kv_size;
+    value_cache[layer_offset + pos_offset + v_idx] = qkv[idx];
+  }
+}
+
 __global__ void apply_rotary_emb_kernel(float *x, const float *cosv, const float *sinv,
                                        int n_heads, int head_dim) {
   int h = blockIdx.x;
@@ -131,20 +156,25 @@ __global__ void apply_rotary_emb_kernel(float *x, const float *cosv, const float
   }
 }
 
-__global__ void compute_cos_sin_kernel(float *cosv, float *sinv, int pos, float rope_theta,
-                                      int head_dim, float scaling_factor, float initial_context_length) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int d_half = head_dim >> 1;
-  if (i >= d_half)
+__global__ void inline_rope_kernel(float *x, int pos, float rope_theta, int n_heads, int head_dim,
+                                  float scaling_factor, float initial_context_length) {
+  int h = blockIdx.x;
+  int i = threadIdx.x;
+  int half = head_dim >> 1;
+  
+  if (h >= n_heads || i >= half)
     return;
+    
+  // Inline computation of cos/sin values
   float freq = powf(rope_theta, (float)(2 * i) / (float)head_dim);
   float inv_freq;
   float concentration = 1.0f;
+  
   if (scaling_factor > 1.0f) {
     concentration = 0.1f * logf(scaling_factor) + 1.0f;
     float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-    float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(rope_theta);
-    float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(rope_theta);
+    float low = half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(rope_theta);
+    float high = half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(rope_theta);
     float interpolation = 1.0f / (scaling_factor * freq);
     float extrapolation = 1.0f / freq;
     float ramp = ((float)i - low) / (high - low);
@@ -154,9 +184,58 @@ __global__ void compute_cos_sin_kernel(float *cosv, float *sinv, int pos, float 
   } else {
     inv_freq = 1.0f / freq;
   }
+  
   float val = pos * inv_freq;
-  cosv[i] = cosf(val) * concentration;
-  sinv[i] = sinf(val) * concentration;
+  float c = cosf(val) * concentration;
+  float s = sinf(val) * concentration;
+  
+  // Inline application of rotary embedding
+  float x1 = x[h * head_dim + i];
+  float x2 = x[h * head_dim + half + i];
+  x[h * head_dim + i] = x1 * c - x2 * s;
+  x[h * head_dim + half + i] = x2 * c + x1 * s;
+}
+
+__global__ void inline_rope_to_cache_kernel(float *key_cache, int pos, float rope_theta, int n_heads, int head_dim,
+                                           float scaling_factor, float initial_context_length, 
+                                           int layer_offset, int pos_offset) {
+  int h = blockIdx.x;
+  int i = threadIdx.x;
+  int half = head_dim >> 1;
+  
+  if (h >= n_heads || i >= half)
+    return;
+    
+  // Inline computation of cos/sin values
+  float freq = powf(rope_theta, (float)(2 * i) / (float)head_dim);
+  float inv_freq;
+  float concentration = 1.0f;
+  
+  if (scaling_factor > 1.0f) {
+    concentration = 0.1f * logf(scaling_factor) + 1.0f;
+    float ntk_beta = 32.0f, ntk_alpha = 1.0f;
+    float low = half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(rope_theta);
+    float high = half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(rope_theta);
+    float interpolation = 1.0f / (scaling_factor * freq);
+    float extrapolation = 1.0f / freq;
+    float ramp = ((float)i - low) / (high - low);
+    ramp = fmaxf(0.0f, fminf(1.0f, ramp));
+    float mask = 1.0f - ramp;
+    inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+  } else {
+    inv_freq = 1.0f / freq;
+  }
+  
+  float val = pos * inv_freq;
+  float c = cosf(val) * concentration;
+  float s = sinf(val) * concentration;
+  
+  // Apply rotary embedding directly to key cache
+  int cache_idx = layer_offset + pos_offset + h * head_dim;
+  float x1 = key_cache[cache_idx + i];
+  float x2 = key_cache[cache_idx + half + i];
+  key_cache[cache_idx + i] = x1 * c - x2 * s;
+  key_cache[cache_idx + half + i] = x2 * c + x1 * s;
 }
 
 __global__ void add_bias_kernel(float *y, const float *b, int size) {
