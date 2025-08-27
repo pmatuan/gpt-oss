@@ -369,7 +369,7 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   DeviceContext& ctx = g_devices[device_id];
   HIP_CHECK_DEVICE(hipSetDevice(device_id), device_id);
 
-  const Config *p = model_config.h_config;
+  const Config *p = &transformer->config;
   const int H = p->hidden_dim;
   const int D = p->head_dim;
   const int Hq = p->n_attn_heads;
@@ -545,12 +545,11 @@ long long simple_getp_generate_multigpu(Transformer *transformer, Tokenizer *tok
   while (pos < steps) {
     float *d_log = gpu_forward_device(transformer, token, pos, device_id);
 
-    float *h_logits =
-        (float *)malloc(transformer->config.vocab_size * sizeof(float));
-  HIP_CHECK_DEVICE(hipMemcpyAsync(h_logits, d_log,
-            transformer->config.vocab_size * sizeof(float),
-            hipMemcpyDeviceToHost, g_devices[device_id].stream), device_id);
-  HIP_CHECK_DEVICE(hipStreamSynchronize(g_devices[device_id].stream), device_id);
+    float *h_logits = (float *)malloc(transformer->config.vocab_size * sizeof(float));
+    HIP_CHECK_DEVICE(hipMemcpyAsync(h_logits, d_log,
+              transformer->config.vocab_size * sizeof(float),
+              hipMemcpyDeviceToHost, g_devices[device_id].stream), device_id);
+    HIP_CHECK_DEVICE(hipStreamSynchronize(g_devices[device_id].stream), device_id);
                       
     pos++;
     if (pos < num_prompt_tokens) {
@@ -590,25 +589,9 @@ struct WorkerTask {
 
 void process_request_worker(WorkerTask* task) {
   try {
-    // Thread-local copy of the Sampler to avoid RNG/data races across threads
-    Sampler local_sampler = *task->sampler;
-    if (task->sampler && task->sampler->probindex && task->sampler->vocab_size > 0) {
-      local_sampler.probindex = reinterpret_cast<ProbIndex*>(
-          malloc(sizeof(*local_sampler.probindex) * local_sampler.vocab_size));
-      if (local_sampler.probindex) {
-        memcpy(local_sampler.probindex, task->sampler->probindex,
-               sizeof(*local_sampler.probindex) * local_sampler.vocab_size);
-      }
-    }
-
     task->result = simple_getp_generate_multigpu(
-        task->transformer, task->tokenizer, &local_sampler,
+        task->transformer, task->tokenizer, task->sampler,
         task->input_seq, task->output_tokens, task->max_seq_len, task->device_id);
-
-    if (local_sampler.probindex && local_sampler.probindex != task->sampler->probindex) {
-      free(local_sampler.probindex);
-      local_sampler.probindex = nullptr;
-    }
   } catch (const std::exception& e) {
     fprintf(stderr, "Worker thread exception on device %d: %s\n", task->device_id, e.what());
     task->result = 0;
@@ -681,11 +664,9 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     std::vector<std::thread> workers;
     std::mutex output_mutex;
     
-  // Launch one worker per GPU to avoid concurrent access to the same DeviceContext
-  auto worker_func = [&](int device_id) {
+    auto worker_func = [&](int worker_id) {
+      int device_id = worker_id % g_num_devices;
       long long worker_tokens = 0;
-      // Bind this host thread to the assigned GPU
-      HIP_CHECK_DEVICE(hipSetDevice(device_id), device_id);
       
       while (true) {
         int req_idx = request_counter.fetch_add(1);
@@ -708,7 +689,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     // Create one worker per GPU (or capped by number of requests)
     int num_workers = std::min(g_num_devices, num_requests);
     for (int i = 0; i < num_workers; ++i) {
-      workers.emplace_back(worker_func, i /* device_id */);
+      workers.emplace_back(worker_func, i);
     }
     
     // Wait for all workers
