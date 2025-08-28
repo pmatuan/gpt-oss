@@ -1,4 +1,3 @@
-#include "../profiler.h"
 #include "getp_eval.cpp"
 #include "matmul.cpp"
 #include "attention.cpp"
@@ -364,8 +363,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 // ============================ Forward ============================
 // Multi-GPU forward pass
 float *gpu_forward_device(Transformer *transformer, int token, int pos, int device_id) {
-  PROFILE_FUNCTION();
-
   DeviceContext& ctx = g_devices[device_id];
   HIP_CHECK_DEVICE(hipSetDevice(device_id), device_id);
 
@@ -383,36 +380,27 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   dim3 gridH = get_gemv_grid_dim(H);
 
   // Embedding (BF16 -> FP32)
-  PROFILE_KERNEL_LAUNCH("copy_embedding_bf16_row_kernel",
-                        copy_embedding_bf16_row_kernel<<<gridH, block, 0, ctx.stream>>>(
-                            ctx.d_x, ctx.d_token_embedding_table_bf16, token, H));
+  copy_embedding_bf16_row_kernel<<<gridH, block, 0, ctx.stream>>>(ctx.d_x, ctx.d_token_embedding_table_bf16, token, H);
 
   for (int l = 0; l < p->n_layers; ++l) {
     // RMSNorm (attn)
-    PROFILE_KERNEL_LAUNCH(
-        "rmsnorm_kernel",
-        rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(ctx.d_t, ctx.d_x, ctx.d_rms_attn_w + l * H, H));
+    rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(ctx.d_t, ctx.d_x, ctx.d_rms_attn_w + l * H, H);
 
     // (A) QKV = W_qkv@t + b_qkv  (fused) - Using MFMA optimized kernel
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
-    PROFILE_KERNEL_LAUNCH(
-        "matmul_bias_kernel", matmul_bias_kernel<bf16_t>
-        <<<gridQKV, block, 0, ctx.stream>>>(ctx.d_qkv, ctx.d_t, ctx.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-                             ctx.d_b_qkv + l * QKV_D, H, QKV_D));
+    matmul_bias_kernel<bf16_t> <<<gridQKV, block, 0, ctx.stream>>>(ctx.d_qkv, ctx.d_t, ctx.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
+                             ctx.d_b_qkv + l * QKV_D, H, QKV_D);
 
     int loff = l * S * KV;
-    PROFILE_KERNEL_LAUNCH(
-        "split_qkv_scatter_to_cache_kernel",
-        split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0, ctx.stream>>>(
-            ctx.d_q, ctx.d_key_cache, ctx.d_value_cache, ctx.d_qkv, Hq, Hk, D, loff, pos * KV));
+    split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0, ctx.stream>>>(
+        ctx.d_q, ctx.d_key_cache, ctx.d_value_cache, ctx.d_qkv, Hq, Hk, D, loff, pos * KV);
 
     dim3 gridApply(max(Hq, Hk));
-    PROFILE_KERNEL_LAUNCH("fused_inline_rope_qkv_kernel",
-                          fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0, ctx.stream>>>(
-                              ctx.d_q, ctx.d_key_cache, pos, p->rope_theta,
-                              Hq, Hk, D, p->rope_scaling_factor, p->initial_context_length,
-                              loff, pos * KV));
+    fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0, ctx.stream>>>(
+        ctx.d_q, ctx.d_key_cache, pos, p->rope_theta,
+        Hq, Hk, D, p->rope_scaling_factor, p->initial_context_length,
+        loff, pos * KV);
 
     // --- Attention ---
     {
@@ -422,88 +410,66 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
       // Shared memory for attention scores: pos + 2 elements (pos+1 for sink)
       size_t shmem_size = (pos + 2) * sizeof(float);
 
-      PROFILE_KERNEL_LAUNCH(
-          "attention_kernel",
-          attention_kernel<<<grid, block, shmem_size, ctx.stream>>>(
-              ctx.d_tb, ctx.d_q,
-              ctx.d_key_cache + loff,   // [S, KV] FP32 for this layer - no conversion overhead
-              ctx.d_value_cache + loff, // [S, KV] FP32 for this layer - no conversion overhead
-              ctx.d_attn_sinks, l, pos, D, Hq, Hk, S,
-              (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.d_mask : nullptr));
+      attention_kernel<<<grid, block, shmem_size, ctx.stream>>>(
+          ctx.d_tb, ctx.d_q,
+          ctx.d_key_cache + loff,   // [S, KV] FP32 for this layer - no conversion overhead
+          ctx.d_value_cache + loff, // [S, KV] FP32 for this layer - no conversion overhead
+          ctx.d_attn_sinks, l, pos, D, Hq, Hk, S,
+          (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.d_mask : nullptr);
     }
 
     // Output projection + bias + residual (bias fused in add) - Using MFMA
     // optimized kernel
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
-    PROFILE_KERNEL_LAUNCH("matmul_kernel", matmul_kernel<bf16_t>
-                          <<<gridO, block, 0, ctx.stream>>>(ctx.d_tb2, ctx.d_tb,
+    matmul_kernel<bf16_t> <<<gridO, block, 0, ctx.stream>>>(ctx.d_tb2, ctx.d_tb,
                                              ctx.d_w_o_bf16 + (size_t)l * H * O_N,
-                                             O_N, H));
-    PROFILE_KERNEL_LAUNCH("add_bias_residual_inplace_kernel",
-                          add_bias_residual_inplace_kernel<<<gridO, block, 0, ctx.stream>>>(ctx.d_x, ctx.d_tb2, ctx.d_b_o + l * H, H));
+                                             O_N, H);
+    add_bias_residual_inplace_kernel<<<gridO, block, 0, ctx.stream>>>(ctx.d_x, ctx.d_tb2, ctx.d_b_o + l * H, H);
 
     // FFN RMSNorm
-    PROFILE_KERNEL_LAUNCH(
-        "rmsnorm_kernel",
-        rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(ctx.d_t, ctx.d_x, ctx.d_rms_ffn_w + l * H, H));
+    rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(ctx.d_t, ctx.d_x, ctx.d_rms_ffn_w + l * H, H);
 
     // Router: scores = W_router@t + b (FP32, use standard kernel)
     dim3 gridE = get_gemv_grid_dim(E);
-    PROFILE_KERNEL_LAUNCH("matmul_kernel", matmul_kernel<float>
-              <<<gridE, block, 0, ctx.stream>>>(ctx.d_router_score, ctx.d_t,
-                       ctx.d_w_router + (size_t)l * H * E, H,
-                       E));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel_router",
-                          add_bias_kernel<<<gridE, block, 0, ctx.stream>>>(
-                              ctx.d_router_score, ctx.d_b_router + l * E, E));
+    matmul_kernel<float><<<gridE, block, 0, ctx.stream>>>(ctx.d_router_score, ctx.d_t,
+                       ctx.d_w_router + (size_t)l * H * E, H, E);
+    add_bias_kernel<<<gridE, block, 0, ctx.stream>>>(ctx.d_router_score, ctx.d_b_router + l * E, E);
 
     // Top-k on device
     size_t shared_mem_size = E * sizeof(float);
-    PROFILE_KERNEL_LAUNCH(
-        "topk_kernel_1token",
-        topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size, ctx.stream>>>(
-            ctx.d_topk_v, ctx.d_topk_i, ctx.d_router_score, E, p->experts_per_token));
+    topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size, ctx.stream>>>(
+        ctx.d_topk_v, ctx.d_topk_i, ctx.d_router_score, E, p->experts_per_token);
 
-    PROFILE_KERNEL_LAUNCH(
-        "softmax_kernel",
-        softmax_kernel<<<1, 1, 0, ctx.stream>>>(ctx.d_topk_v, p->experts_per_token));
+    softmax_kernel<<<1, 1, 0, ctx.stream>>>(ctx.d_topk_v, p->experts_per_token);
 
     // Zero e_agg
-  HIP_CHECK(hipMemsetAsync(ctx.d_e_agg, 0, H * sizeof(float), ctx.stream));
+    HIP_CHECK(hipMemsetAsync(ctx.d_e_agg, 0, H * sizeof(float), ctx.stream));
 
     // (B)+(C): For each k in topk (remain on device): MLP1 fused, then MLP2
     // fused accumulate
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
       // MLP1 fused: gate_up (IM)
       dim3 gridIM = get_gemv_grid_dim(IM);
-      PROFILE_KERNEL_LAUNCH("mlp1_fused_kernel", mlp1_fused_kernel<bf16_t>
-                            <<<gridIM, block, 0, ctx.stream>>>(ctx.d_gate_up, ctx.d_t, ctx.d_w_mlp1_bf16, ctx.d_b_mlp1, ctx.d_topk_i, kk, l, E, H,
-                                                IM, p->swiglu_limit));
+      mlp1_fused_kernel<bf16_t> <<<gridIM, block, 0, ctx.stream>>>(ctx.d_gate_up, ctx.d_t, ctx.d_w_mlp1_bf16, ctx.d_b_mlp1, ctx.d_topk_i, kk, l, E, H,
+                                                IM, p->swiglu_limit);
       // MLP2 + bias + weighted accumulate to e_agg
-      PROFILE_KERNEL_LAUNCH(
-          "mlp2_bias_weighted_accum_kernel",
-          mlp2_bias_weighted_accum_kernel<bf16_t>
-          <<<gridH, block, 0, ctx.stream>>>(ctx.d_e_agg, ctx.d_gate_up, ctx.d_w_mlp2_bf16, ctx.d_b_mlp2,
-                             ctx.d_topk_i, ctx.d_topk_v, kk, l, E, IM, H));
+      mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block, 0, ctx.stream>>>(ctx.d_e_agg, ctx.d_gate_up, ctx.d_w_mlp2_bf16, ctx.d_b_mlp2,
+                             ctx.d_topk_i, ctx.d_topk_v, kk, l, E, IM, H);
     }
 
     // Residual add (x += e_agg)
-    PROFILE_KERNEL_LAUNCH(
-        "residual_add_kernel",
-        residual_add_kernel<<<gridH, block, 0, ctx.stream>>>(ctx.d_x, ctx.d_e_agg, H));
+    residual_add_kernel<<<gridH, block, 0, ctx.stream>>>(ctx.d_x, ctx.d_e_agg, H);
   }
   
   // Final RMSNorm
-  PROFILE_KERNEL_LAUNCH("rmsnorm_kernel", rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(
-                                              ctx.d_t, ctx.d_x, ctx.d_rms_out_w, H));
+  rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(ctx.d_t, ctx.d_x, ctx.d_rms_out_w, H);
   HIP_CHECK(hipMemcpyAsync(ctx.d_x, ctx.d_t, H * sizeof(float), hipMemcpyDeviceToDevice, ctx.stream));
 
   // LM head - Using MFMA optimized kernel
   const int V = p->vocab_size;
   dim3 gridV = get_gemv_grid_dim(V);
-  PROFILE_KERNEL_LAUNCH("matmul_kernel", matmul_kernel<bf16_t>
-                        <<<gridV, block, 0, ctx.stream>>>(ctx.d_logits, ctx.d_x, ctx.d_out_bf16, H, V));
+  matmul_kernel<bf16_t><<<gridV, block, 0, ctx.stream>>>(ctx.d_logits, ctx.d_x, ctx.d_out_bf16, H, V);
 
   return ctx.d_logits;
 }
@@ -512,8 +478,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
 long long simple_getp_generate_multigpu(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps, int device_id = -1) {
-  PROFILE_FUNCTION();
-
   // Auto-assign device if not specified
   if (device_id == -1) {
     device_id = get_thread_device();
@@ -609,8 +573,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 // Multi-GPU inference with load balancing
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  PROFILE_FUNCTION();
-
   if (g_num_devices == 0) {
     fprintf(stderr, "No GPUs initialized for inference!\n");
     return 0;
