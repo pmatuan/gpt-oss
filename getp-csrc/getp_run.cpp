@@ -364,8 +364,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 // ============================ Forward ============================
 // Multi-GPU forward pass
 float *gpu_forward_device(Transformer *transformer, int token, int pos, int device_id) {
-  PROFILE_FUNCTION();
-
   DeviceContext& ctx = g_devices[device_id];
   HIP_CHECK_DEVICE(hipSetDevice(device_id), device_id);
 
@@ -512,8 +510,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
 long long simple_getp_generate_multigpu(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps, int device_id = -1) {
-  PROFILE_FUNCTION();
-
   // Auto-assign device if not specified
   if (device_id == -1) {
     device_id = get_thread_device();
@@ -609,8 +605,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
 // Multi-GPU inference with load balancing
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  PROFILE_FUNCTION();
-
   if (g_num_devices == 0) {
     fprintf(stderr, "No GPUs initialized for inference!\n");
     return 0;
