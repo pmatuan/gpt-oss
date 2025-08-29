@@ -65,20 +65,3 @@ static inline void free_prompt_ctx_heap_buffers(PromptCtx &ctx) {
   }
   ctx.buffer_size = ctx.buffer_pos = 0;
 }
-
-static size_t
-calculate_prompt_ctx_memory_requirement(const Config &cfg,
-                                        size_t avg_input_length = 1000) {
-
-  size_t logits_mem = cfg.vocab_size * sizeof(float);
-
-  size_t prompt_tokens_mem = (avg_input_length + 3) * sizeof(int);
-
-  size_t output_buffer_mem = cfg.seq_len * 256ULL;
-
-  size_t struct_mem = sizeof(PromptCtx);
-
-  size_t total =
-      struct_mem + logits_mem + prompt_tokens_mem + output_buffer_mem;
-  return total;
-}

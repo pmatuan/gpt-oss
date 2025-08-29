@@ -35,26 +35,6 @@ static inline void debug_print_gpu_memory(const char *tag) {
   fflush(stdout);
 }
 
-static size_t get_available_gpu_memory() {
-  size_t free_b = 0, total_b = 0;
-  hipError_t err = hipMemGetInfo(&free_b, &total_b);
-  if (err != hipSuccess) {
-    fprintf(stderr, "HIP hipMemGetInfo failed: %s\n", hipGetErrorString(err));
-    // Fallback - assume 4GB available
-    return 0;
-  }
-  
-  double free_gib = (double)free_b / (1024.0 * 1024.0 * 1024.0);
-  double total_gib = (double)total_b / (1024.0 * 1024.0 * 1024.0);
-  double used_gib = total_gib - free_gib;
-  
-  printf("[DEBUG] GPU Memory: free %.2f GiB / total %.2f GiB (used %.2f GiB)\n", 
-         free_gib, total_gib, used_gib);
-  fflush(stdout);
-  
-  return free_b;
-}
-
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight, int size) {
