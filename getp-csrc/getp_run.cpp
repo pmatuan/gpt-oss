@@ -363,28 +363,21 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                               gpu_activations.d_t, gpu_activations.d_x,
                               gpu_weights_fp32.d_rms_ffn_w + l * H, H));
 
-    // Router: scores = W_router@t + b (FP32, use standard kernel)
+    // Router: scores = W_router@t + b (FP32, fused matmul + bias)
     dim3 gridE = get_gemv_grid_dim(E);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_kernel", matmul_kernel<float>
+        "matmul_bias_kernel", matmul_bias_kernel<float>
         <<<gridE, block>>>(gpu_activations.d_router_score, gpu_activations.d_t,
-                           gpu_weights_fp32.d_w_router + (size_t)l * H * E, H,
-                           E));
-    PROFILE_KERNEL_LAUNCH("add_bias_kernel_router",
-                          add_bias_kernel<<<gridE, block>>>(
-                              gpu_activations.d_router_score,
-                              gpu_weights_fp32.d_b_router + l * E, E));
+                           gpu_weights_fp32.d_w_router + (size_t)l * H * E,
+                           gpu_weights_fp32.d_b_router + l * E, H, E));
 
-    // Top-k on device
+    // Fused Top-k + Softmax
     size_t shared_mem_size = E * sizeof(float);
     PROFILE_KERNEL_LAUNCH(
-        "topk_kernel_1token",
-        topk_kernel_1token<<<1, BLOCK_SIZE, shared_mem_size>>>(
+        "fused_topk_softmax_kernel",
+        fused_topk_softmax_kernel<<<1, BLOCK_SIZE, shared_mem_size>>>(
             gpu_activations.d_topk_v, gpu_activations.d_topk_i,
             gpu_activations.d_router_score, E, p->experts_per_token));
-    PROFILE_KERNEL_LAUNCH("softmax_kernel",
-                          softmax_kernel<<<1, 1>>>(gpu_activations.d_topk_v,
-                                                   p->experts_per_token));
 
     // Zero e_agg
     HIP_CHECK(hipMemsetAsync(gpu_activations.d_e_agg, 0, H * sizeof(float), 0));
@@ -417,21 +410,14 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                               gpu_activations.d_x, gpu_activations.d_e_agg, H));
   }
 
-  // Final RMSNorm
-  PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
-                        rmsnorm_kernel<<<1, BLOCK_SIZE>>>(
-                            gpu_activations.d_t, gpu_activations.d_x,
-                            gpu_weights_fp32.d_rms_out_w, H));
-  HIP_CHECK(hipMemcpy(gpu_activations.d_x, gpu_activations.d_t,
-                      H * sizeof(float), hipMemcpyDeviceToDevice));
-
-  // LM head - Using MFMA optimized kernel
+  // Fused Final RMSNorm + LM head
   const int V = p->vocab_size;
   dim3 gridV = get_gemv_grid_dim(V);
-  PROFILE_KERNEL_LAUNCH("matmul_kernel", matmul_kernel<bf16_t>
-                        <<<gridV, block>>>(gpu_activations.d_logits,
-                                           gpu_activations.d_x,
-                                           gpu_weights_bf16.d_out_bf16, H, V));
+  PROFILE_KERNEL_LAUNCH("fused_rmsnorm_matmul_kernel",
+                        fused_rmsnorm_matmul_kernel<bf16_t><<<gridV, block>>>(
+                            gpu_activations.d_logits, gpu_activations.d_x,
+                            gpu_weights_bf16.d_out_bf16, 
+                            gpu_weights_fp32.d_rms_out_w, H, V));
 
   return gpu_activations.d_logits;
 }
