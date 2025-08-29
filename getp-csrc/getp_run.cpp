@@ -299,21 +299,16 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                             token, H));
 
   for (int l = 0; l < p->n_layers; ++l) {
-    // RMSNorm (attn)
-    PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
-                          rmsnorm_kernel<<<1, BLOCK_SIZE>>>(
-                              gpu_activations.d_t, gpu_activations.d_x,
-                              gpu_weights_fp32.d_rms_attn_w + l * H, H));
-
-    // (A) QKV = W_qkv@t + b_qkv  (fused) - Using MFMA optimized kernel
+    // (A) Fused RMSNorm + QKV projection
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_bias_kernel",
-        matmul_bias_kernel<bf16_t><<<gridQKV, block>>>(
-            gpu_activations.d_qkv, gpu_activations.d_t,
+        "fused_rmsnorm_matmul_bias_kernel",
+        fused_rmsnorm_matmul_bias_kernel<bf16_t><<<gridQKV, block>>>(
+            gpu_activations.d_qkv, gpu_activations.d_x,
             gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-            gpu_weights_fp32.d_b_qkv + l * QKV_D, H, QKV_D));
+            gpu_weights_fp32.d_b_qkv + l * QKV_D,
+            gpu_weights_fp32.d_rms_attn_w + l * H, H, QKV_D));
 
     int loff = l * S * KV;
     PROFILE_KERNEL_LAUNCH("split_qkv_scatter_to_cache_kernel",
@@ -352,21 +347,17 @@ float *gpu_forward(Transformer *transformer, int token, int pos) {
                                                       : nullptr));
     }
 
-    // Output projection + bias + residual (bias fused in add) - Using MFMA
-    // optimized kernel
+    // Fused Output projection + bias + residual
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
     PROFILE_KERNEL_LAUNCH(
-        "matmul_kernel", matmul_kernel<bf16_t>
-        <<<gridO, block>>>(gpu_activations.d_tb2, gpu_activations.d_tb,
-                           gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
-                           O_N, H));
-    PROFILE_KERNEL_LAUNCH("add_bias_residual_inplace_kernel",
-                          add_bias_residual_inplace_kernel<<<gridO, block>>>(
-                              gpu_activations.d_x, gpu_activations.d_tb2,
-                              gpu_weights_fp32.d_b_o + l * H, H));
+        "fused_matmul_bias_residual_kernel",
+        fused_matmul_bias_residual_kernel<bf16_t><<<gridO, block>>>(
+            gpu_activations.d_x, gpu_activations.d_tb,
+            gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
+            gpu_weights_fp32.d_b_o + l * H, O_N, H));
 
-    // FFN RMSNorm
+    // FFN RMSNorm (separate for now due to complexity)
     PROFILE_KERNEL_LAUNCH("rmsnorm_kernel",
                           rmsnorm_kernel<<<1, BLOCK_SIZE>>>(
                               gpu_activations.d_t, gpu_activations.d_x,

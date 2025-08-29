@@ -10,6 +10,8 @@ typedef hip_bfloat16 bf16_t;
 #define TM 8
 #define BLOCK_SIZE 512
 #define WF_SIZE 64
+#define TK 256
+#define LDS_PAD 16
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \
     hipError_t error = call;                                                   \
@@ -194,6 +196,363 @@ __global__ void add_bias_residual_inplace_kernel(float *x, const float *y, const
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < size)
     x[i] = x[i] + (y[i] + b[i]);
+}
+
+template <typename T>
+__launch_bounds__(BLOCK_SIZE, 1) __global__
+void fused_rmsnorm_matmul_bias_kernel(float *__restrict__ y,
+                                      const float *__restrict__ x,
+                                      const T *__restrict__ w,
+                                      const float *__restrict__ b,
+                                      const float *__restrict__ rms_w,
+                                      int n, int d) {
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+  __shared__ float s_rms_sum;
+  
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int row = blockIdx.x * TM + wid;
+
+  if (wid >= TM || row >= d) return;
+
+  // Initialize shared memory
+  if (tid == 0) {
+    s_rms_sum = 0.0f;
+  }
+  __syncthreads();
+
+  // Step 1: RMSNorm computation - all threads participate
+  float sum = 0.0f;
+  for (int i = tid; i < n; i += BLOCK_SIZE) {
+    float v = x[i];
+    sum += v * v;
+  }
+  
+  // Warp reduction
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    sum += __shfl_down(sum, off, WF_SIZE);
+  }
+  
+  // First thread in each warp adds to shared sum
+  if (lane == 0) {
+    atomicAdd(&s_rms_sum, sum);
+  }
+  __syncthreads();
+  
+  // Compute RMS normalization factor
+  float rms = rsqrtf(s_rms_sum / n + 1e-5f);
+  
+  float acc_all = 0.0f;
+
+  // Step 2: MatMul with normalized input
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = (k_base + TK < n) ? TK : (n - k_base);
+
+    for (int k = tid; k < k_size; k += BLOCK_SIZE) {
+      float v = x[k_base + k];
+      lds_x[k] = v * rms * rms_w[k_base + k];
+    }
+    __syncthreads();
+
+    const T* __restrict__ w_row_g = w + (size_t)row * (size_t)n + k_base;
+
+    if constexpr (std::is_same_v<T, bf16_t>) {
+      const uint32_t* __restrict__ w32 = reinterpret_cast<const uint32_t*>(w_row_g);
+      const int pairs = k_size >> 1;
+      const int step_pairs = 4;
+      const int vec_pairs = (pairs / step_pairs) * step_pairs;
+
+      float acc0 = 0.f, acc1 = 0.f;
+
+      for (int p = lane * step_pairs; p < vec_pairs; p += WF_SIZE * step_pairs) {
+        const int k_elem = (p << 1);
+        float4 x01 = *reinterpret_cast<const float4*>(&lds_x[k_elem + 0]);
+        float4 x23 = *reinterpret_cast<const float4*>(&lds_x[k_elem + 4]);
+
+        uint32_t u0 = w32[p + 0], u1 = w32[p + 1], u2 = w32[p + 2], u3 = w32[p + 3];
+        float w0, w1, w2, w3, w4, w5, w6, w7;
+        bf16pair_to_float2(u0, w0, w1);
+        bf16pair_to_float2(u1, w2, w3);
+        bf16pair_to_float2(u2, w4, w5);
+        bf16pair_to_float2(u3, w6, w7);
+
+        acc0 = fmaf(w0, x01.x, acc0);
+        acc1 = fmaf(w1, x01.y, acc1);
+        acc0 = fmaf(w2, x01.z, acc0);
+        acc1 = fmaf(w3, x01.w, acc1);
+        acc0 = fmaf(w4, x23.x, acc0);
+        acc1 = fmaf(w5, x23.y, acc1);
+        acc0 = fmaf(w6, x23.z, acc0);
+        acc1 = fmaf(w7, x23.w, acc1);
+      }
+
+      float acc = acc0 + acc1;
+
+      for (int p = vec_pairs + lane; p < pairs; p += WF_SIZE) {
+        const int k_elem = (p << 1);
+        uint32_t up = reinterpret_cast<const uint32_t*>(w_row_g)[p];
+        float w0, w1; bf16pair_to_float2(up, w0, w1);
+        acc = fmaf(w0, lds_x[k_elem + 0], acc);
+        if (k_elem + 1 < k_size) acc = fmaf(w1, lds_x[k_elem + 1], acc);
+      }
+      if (k_size & 1) {
+        const int k = k_base + k_size - 1;
+        if ((k - k_base) % WF_SIZE == lane) {
+          uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(
+                        &w_row_g[k_size - 1]))) << 16;
+          union { uint32_t u; float f; } cvt; cvt.u = u;
+          acc = fmaf(cvt.f, lds_x[k_size - 1], acc);
+        }
+      }
+
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+        acc += __shfl_down(acc, off, WF_SIZE);
+
+      if (lane == 0) acc_all += acc;
+
+    } else {
+      const float* __restrict__ wf = reinterpret_cast<const float*>(w_row_g);
+      int vec = (k_size / 8) * 8;
+      float acc0 = 0.f, acc1 = 0.f;
+
+      for (int k = lane * 8; k < vec; k += WF_SIZE * 8) {
+        float4 x01 = *reinterpret_cast<const float4*>(&lds_x[k + 0]);
+        float4 x23 = *reinterpret_cast<const float4*>(&lds_x[k + 4]);
+        float4 w01 = *reinterpret_cast<const float4*>(&wf[k + 0]);
+        float4 w23 = *reinterpret_cast<const float4*>(&wf[k + 4]);
+
+        acc0 = fmaf(w01.x, x01.x, acc0);
+        acc1 = fmaf(w01.y, x01.y, acc1);
+        acc0 = fmaf(w01.z, x01.z, acc0);
+        acc1 = fmaf(w01.w, x01.w, acc1);
+        acc0 = fmaf(w23.x, x23.x, acc0);
+        acc1 = fmaf(w23.y, x23.y, acc1);
+        acc0 = fmaf(w23.z, x23.z, acc0);
+        acc1 = fmaf(w23.w, x23.w, acc1);
+      }
+
+      float acc = acc0 + acc1;
+
+      int vec4 = ((k_size - vec) / 4) * 4 + vec;
+      for (int k = max(vec, lane * 4); k < vec4; k += WF_SIZE * 4) {
+        float4 xv = *reinterpret_cast<const float4*>(&lds_x[k]);
+        float4 wv = *reinterpret_cast<const float4*>(&wf[k]);
+        acc = fmaf(wv.x, xv.x, acc);
+        acc = fmaf(wv.y, xv.y, acc);
+        acc = fmaf(wv.z, xv.z, acc);
+        acc = fmaf(wv.w, xv.w, acc);
+      }
+      for (int k = vec4 + lane; k < k_size; k += WF_SIZE)
+        acc = fmaf(wf[k], lds_x[k], acc);
+
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+        acc += __shfl_down(acc, off, WF_SIZE);
+
+      if (lane == 0) acc_all += acc;
+    }
+
+    __syncthreads();
+  }
+
+  if (lane == 0) y[row] = acc_all + b[row];
+}
+
+template <typename T>
+__launch_bounds__(BLOCK_SIZE, 1) __global__
+void fused_matmul_bias_residual_kernel(float *__restrict__ x,
+                                       const float *__restrict__ y,
+                                       const T *__restrict__ w,
+                                       const float *__restrict__ b,
+                                       int n, int d) {
+  __shared__ __align__(16) float lds_y[TK + LDS_PAD];
+  
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int row = blockIdx.x * TM + wid;
+
+  if (wid >= TM || row >= d) return;
+
+  float acc_all = 0.0f;
+
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = (k_base + TK < n) ? TK : (n - k_base);
+
+    for (int k = tid; k < k_size; k += BLOCK_SIZE)
+      lds_y[k] = y[k_base + k];
+    __syncthreads();
+
+    const T* __restrict__ w_row_g = w + (size_t)row * (size_t)n + k_base;
+
+    if constexpr (std::is_same_v<T, bf16_t>) {
+      const uint32_t* __restrict__ w32 = reinterpret_cast<const uint32_t*>(w_row_g);
+      const int pairs = k_size >> 1;
+      const int step_pairs = 4;
+      const int vec_pairs = (pairs / step_pairs) * step_pairs;
+
+      float acc0 = 0.f, acc1 = 0.f;
+
+      for (int p = lane * step_pairs; p < vec_pairs; p += WF_SIZE * step_pairs) {
+        const int k_elem = (p << 1);
+        float4 y01 = *reinterpret_cast<const float4*>(&lds_y[k_elem + 0]);
+        float4 y23 = *reinterpret_cast<const float4*>(&lds_y[k_elem + 4]);
+
+        uint32_t u0 = w32[p + 0], u1 = w32[p + 1], u2 = w32[p + 2], u3 = w32[p + 3];
+        float w0, w1, w2, w3, w4, w5, w6, w7;
+        bf16pair_to_float2(u0, w0, w1);
+        bf16pair_to_float2(u1, w2, w3);
+        bf16pair_to_float2(u2, w4, w5);
+        bf16pair_to_float2(u3, w6, w7);
+
+        acc0 = fmaf(w0, y01.x, acc0);
+        acc1 = fmaf(w1, y01.y, acc1);
+        acc0 = fmaf(w2, y01.z, acc0);
+        acc1 = fmaf(w3, y01.w, acc1);
+        acc0 = fmaf(w4, y23.x, acc0);
+        acc1 = fmaf(w5, y23.y, acc1);
+        acc0 = fmaf(w6, y23.z, acc0);
+        acc1 = fmaf(w7, y23.w, acc1);
+      }
+
+      float acc = acc0 + acc1;
+
+      for (int p = vec_pairs + lane; p < pairs; p += WF_SIZE) {
+        const int k_elem = (p << 1);
+        uint32_t up = reinterpret_cast<const uint32_t*>(w_row_g)[p];
+        float w0, w1; bf16pair_to_float2(up, w0, w1);
+        acc = fmaf(w0, lds_y[k_elem + 0], acc);
+        if (k_elem + 1 < k_size) acc = fmaf(w1, lds_y[k_elem + 1], acc);
+      }
+      if (k_size & 1) {
+        const int k = k_base + k_size - 1;
+        if ((k - k_base) % WF_SIZE == lane) {
+          uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(
+                        &w_row_g[k_size - 1]))) << 16;
+          union { uint32_t u; float f; } cvt; cvt.u = u;
+          acc = fmaf(cvt.f, lds_y[k_size - 1], acc);
+        }
+      }
+
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+        acc += __shfl_down(acc, off, WF_SIZE);
+
+      if (lane == 0) acc_all += acc;
+
+    } else {
+      const float* __restrict__ wf = reinterpret_cast<const float*>(w_row_g);
+      int vec = (k_size / 8) * 8;
+      float acc0 = 0.f, acc1 = 0.f;
+
+      for (int k = lane * 8; k < vec; k += WF_SIZE * 8) {
+        float4 y01 = *reinterpret_cast<const float4*>(&lds_y[k + 0]);
+        float4 y23 = *reinterpret_cast<const float4*>(&lds_y[k + 4]);
+        float4 w01 = *reinterpret_cast<const float4*>(&wf[k + 0]);
+        float4 w23 = *reinterpret_cast<const float4*>(&wf[k + 4]);
+
+        acc0 = fmaf(w01.x, y01.x, acc0);
+        acc1 = fmaf(w01.y, y01.y, acc1);
+        acc0 = fmaf(w01.z, y01.z, acc0);
+        acc1 = fmaf(w01.w, y01.w, acc1);
+        acc0 = fmaf(w23.x, y23.x, acc0);
+        acc1 = fmaf(w23.y, y23.y, acc1);
+        acc0 = fmaf(w23.z, y23.z, acc0);
+        acc1 = fmaf(w23.w, y23.w, acc1);
+      }
+
+      float acc = acc0 + acc1;
+
+      int vec4 = ((k_size - vec) / 4) * 4 + vec;
+      for (int k = max(vec, lane * 4); k < vec4; k += WF_SIZE * 4) {
+        float4 yv = *reinterpret_cast<const float4*>(&lds_y[k]);
+        float4 wv = *reinterpret_cast<const float4*>(&wf[k]);
+        acc = fmaf(wv.x, yv.x, acc);
+        acc = fmaf(wv.y, yv.y, acc);
+        acc = fmaf(wv.z, yv.z, acc);
+        acc = fmaf(wv.w, yv.w, acc);
+      }
+      for (int k = vec4 + lane; k < k_size; k += WF_SIZE)
+        acc = fmaf(wf[k], lds_y[k], acc);
+
+      #pragma unroll
+      for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+        acc += __shfl_down(acc, off, WF_SIZE);
+
+      if (lane == 0) acc_all += acc;
+    }
+
+    __syncthreads();
+  }
+
+  // Fused bias addition and residual connection
+  if (lane == 0) x[row] = x[row] + (acc_all + b[row]);
+}
+
+template <typename T>
+__launch_bounds__(BLOCK_SIZE, 1) __global__
+void fused_rmsnorm_router_kernel(float *__restrict__ router_score,
+                                 const float *__restrict__ x,
+                                 const T *__restrict__ w_router,
+                                 const float *__restrict__ b_router,
+                                 const float *__restrict__ rms_w,
+                                 int H, int E) {
+  __shared__ float s_rms_sum;
+  
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int e = blockIdx.x * TM + wid;
+
+  // Initialize shared memory
+  if (tid == 0) {
+    s_rms_sum = 0.0f;
+  }
+  __syncthreads();
+
+  // Step 1: RMSNorm computation (all threads participate)
+  float sum = 0.0f;
+  for (int i = tid; i < H; i += BLOCK_SIZE) {
+    float v = x[i];
+    sum += v * v;
+  }
+  
+  // Warp reduction
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    sum += __shfl_down(sum, off, WF_SIZE);
+  }
+  
+  // First thread in each warp adds to shared sum
+  if (lane == 0) {
+    atomicAdd(&s_rms_sum, sum);
+  }
+  __syncthreads();
+  
+  // Compute RMS normalization factor
+  float rms = rsqrtf(s_rms_sum / H + 1e-5f);
+
+  // Step 2: Router computation for assigned expert
+  if (e >= E) return;
+  
+  float acc = 0.0f;
+  
+  if constexpr (std::is_same_v<T, float>) {
+    const float* __restrict__ w_row = w_router + (size_t)e * (size_t)H;
+    for (int h = lane; h < H; h += WF_SIZE) {
+      float norm_x = x[h] * rms * rms_w[h];
+      acc = fmaf(w_row[h], norm_x, acc);
+    }
+  }
+  
+  #pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+    acc += __shfl_down(acc, off, WF_SIZE);
+    
+  if (lane == 0) router_score[e] = acc + b_router[e];
 }
 
 __global__ void topk_kernel_1token(float *topk_values, int *topk_indices,
