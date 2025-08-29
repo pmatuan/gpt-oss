@@ -151,9 +151,7 @@ public:
 // Wrapper macro for profiling a single kernel launch
 #define PROFILE_KERNEL_LAUNCH(kernel_name, ...) \
     do { \
-        PROFILE_GPU_KERNEL_START(kernel_name); \
         __VA_ARGS__; \
-        PROFILE_GPU_KERNEL_END(kernel_name); \
     } while(0)
 
 #endif // PROFILER_H
