@@ -450,10 +450,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   PROFILE_FUNCTION();
   const Config &cfg = transformer->config;
 
-  if (!ctx.input_seq)
-    ctx.input_seq = "";
-
-  size_t alloc_tok = strlen(ctx.input_seq) + 3;
+  size_t alloc_tok = ctx.input_seq.length() + 3;
   ctx.prompt_tokens = (int *)malloc(alloc_tok * sizeof(int));
   if (!ctx.prompt_tokens) {
     fprintf(stderr, "OOM: prompt_tokens\n");
@@ -461,7 +458,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   }
 
   ctx.num_prompt_tokens = 0;
-  encode(tokenizer, ctx.input_seq, -1, -1, ctx.prompt_tokens,
+  encode(tokenizer, ctx.input_seq.c_str(), -1, -1, ctx.prompt_tokens,
          &ctx.num_prompt_tokens, cfg.initial_context_length);
   if (ctx.num_prompt_tokens < 1) {
     fprintf(stderr, "Expected at least 1 prompt token\n");
@@ -477,17 +474,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     }
   }
 
-  if (ctx.buffer_size == 0 || !ctx.output_buffer) {
-    ctx.buffer_size =
-        (ctx.max_steps ? ctx.max_steps : cfg.seq_len) * 256ULL; // heuristic
-    ctx.output_buffer = (char *)malloc(ctx.buffer_size);
-    if (!ctx.output_buffer) {
-      fprintf(stderr, "OOM: output_buffer\n");
-      exit(EXIT_FAILURE);
-    }
-  }
-  ctx.buffer_pos = 0;
-
   ctx.pos = 0;
   ctx.token = ctx.prompt_tokens[0];
   ctx.is_context_phase = true;
@@ -496,10 +482,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   {
     const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-    size_t first_len = strlen(first_piece);
-    ensure_buffer_capacity(ctx, first_len);
-    memcpy(ctx.output_buffer + ctx.buffer_pos, first_piece, first_len);
-    ctx.buffer_pos += first_len;
+    ctx.output_str += first_piece;
   }
 
   while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
@@ -527,16 +510,10 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     }
 
     const char *piece = decode_piece(tokenizer, ctx.token, next);
-    size_t piece_len = strlen(piece);
-    ensure_buffer_capacity(ctx, piece_len);
-    memcpy(ctx.output_buffer + ctx.buffer_pos, piece, piece_len);
-    ctx.buffer_pos += piece_len;
+    ctx.output_str += piece;
 
     ctx.token = next;
   }
-
-  ensure_buffer_capacity(ctx, 1);
-  ctx.output_buffer[ctx.buffer_pos] = '\0';
 
   ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
 
@@ -547,8 +524,9 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   PROFILE_FUNCTION();
   long long num_token_out = 0;
+  PromptCtx *ctxs = new PromptCtx[requests->num_reqs];
   for (int idx = 0; idx < requests->num_reqs; ++idx) {
-    PromptCtx ctx;
+    PromptCtx &ctx = ctxs[idx];
     ctx.idx = idx;
     ctx.input_seq = get_str_req_ptr(requests, idx);
     ctx.output_tokens = get_tok_gen_ptr(requests, idx);
@@ -556,8 +534,14 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     ctx.sampler = sampler;
     num_token_out +=
         simple_getp_generate(transformer, tokenizer, ctx);
-    free_prompt_ctx_heap_buffers(ctx);
   }
+
+  for (int idx = 0; idx < requests->num_reqs; ++idx) {
+    safe_printf(ctxs[idx].output_str.c_str());
+    safe_printf("\n");
+    free_prompt_ctx_heap_buffers(ctxs[idx]);
+  }
+  delete[] ctxs;
   return num_token_out;
 }
 
