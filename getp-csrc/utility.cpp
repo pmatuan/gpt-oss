@@ -23,7 +23,7 @@ typedef hip_bfloat16 bf16_t;
     }                                                                          \
   } while (0)
 
-static inline void debug_print_gpu_memory(const char *tag) {
+static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
   size_t free_b = 0, total_b = 0;
   hipError_t err = hipMemGetInfo(&free_b, &total_b);
   if (err != hipSuccess) {
@@ -33,7 +33,7 @@ static inline void debug_print_gpu_memory(const char *tag) {
   double free_gib = (double)free_b / (1024.0 * 1024.0 * 1024.0);
   double total_gib = (double)total_b / (1024.0 * 1024.0 * 1024.0);
   double used_gib = total_gib - free_gib;
-  printf("[HIP] %s: HBM free %.2f GiB / total %.2f GiB (used %.2f GiB)\n", tag,
+  printf("[DEVICE] %d [HIP] %s: HBM free %.2f GiB / total %.2f GiB (used %.2f GiB)\n", device_id, tag,
          free_gib, total_gib, used_gib);
   fflush(stdout);
 }
