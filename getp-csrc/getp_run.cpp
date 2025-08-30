@@ -1,12 +1,9 @@
-// #include "../profiler.h"  // Profiling removed for testing
 #include "attention.cpp"
 #include "getp_eval.cpp"
 #include "matmul.cpp"
 #include "utility.cpp"
 #include "prompt_ctx.cpp"
 #include <hip/hip_bfloat16.h>
-#include <hip/hip_cooperative_groups.h>
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <math.h>
 #include <omp.h>
@@ -15,8 +12,6 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <vector>
-#include <thread>
-#include <future>
 #include <atomic>
 #include <mutex>
 
@@ -319,8 +314,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   
   printf("Found %d HIP devices, initializing multi-GPU setup...\n", g_num_devices);
   
-  // Multi-GPU profiler removed for testing
-  // g_multi_profiler.initialize(g_num_devices);
   printf("Multi-GPU setup initialized for %d devices\n", g_num_devices);
   
   g_devices.resize(g_num_devices);
@@ -347,7 +340,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 
 // ============================ Forward ============================
 float *gpu_forward_device(Transformer *transformer, int token, int pos, int device_id = 0) {
-  // PROFILE_FUNCTION_DEVICE(device_id);  // Profiling removed for testing
 
   DeviceContext &ctx = g_devices[device_id];
   HIP_CHECK(hipSetDevice(device_id));
@@ -366,7 +358,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   dim3 gridH = get_gemv_grid_dim(H);
 
   // Embedding (BF16 -> FP32)
-  // PROFILE_KERNEL_LAUNCH_DEVICE("copy_embedding_bf16_row_kernel", device_id);  // Profiling removed for testing
   copy_embedding_bf16_row_kernel<<<gridH, block, 0, ctx.stream>>>(
       ctx.gpu_activations.d_x,
       ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
@@ -376,7 +367,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
     // (A) Fused RMSNorm + QKV projection
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
-    // PROFILE_KERNEL_LAUNCH_DEVICE("fused_rmsnorm_matmul_bias_kernel", device_id);  // Profiling removed for testing
     fused_rmsnorm_matmul_bias_kernel<bf16_t><<<gridQKV, block, 0, ctx.stream>>>(
         ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_x,
         ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
@@ -384,7 +374,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
         ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H, QKV_D);
 
     int loff = l * S * KV;
-    // PROFILE_KERNEL_LAUNCH_DEVICE("split_qkv_scatter_to_cache_kernel", device_id);  // Profiling removed for testing
     split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0, ctx.stream>>>(
         ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
         ctx.gpu_activations.d_value_cache,
@@ -392,7 +381,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
         pos * KV);
 
   dim3 gridApply(Hq > Hk ? Hq : Hk);
-    // PROFILE_KERNEL_LAUNCH_DEVICE("fused_inline_rope_qkv_kernel", device_id);  // Profiling removed for testing
     fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0, ctx.stream>>>(
         ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
         pos, p->rope_theta, Hq, Hk, D,
@@ -407,7 +395,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
       // Shared memory for attention scores: pos + 2 elements (pos+1 for sink)
       size_t shmem_size = (pos + 2) * sizeof(float);
 
-      // PROFILE_KERNEL_LAUNCH_DEVICE("attention_kernel", device_id);  // Profiling removed for testing
       attention_kernel<<<grid, block, shmem_size, ctx.stream>>>(
           ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
           ctx.gpu_activations.d_key_cache +
@@ -422,21 +409,18 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
     // Fused Output projection + bias + residual
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
-    // PROFILE_KERNEL_LAUNCH_DEVICE("fused_matmul_bias_residual_kernel", device_id);  // Profiling removed for testing
     fused_matmul_bias_residual_kernel<bf16_t><<<gridO, block, 0, ctx.stream>>>(
         ctx.gpu_activations.d_x, ctx.gpu_activations.d_tb,
         ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
         ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H);
 
     // FFN RMSNorm (separate for now due to complexity)
-    // PROFILE_KERNEL_LAUNCH_DEVICE("rmsnorm_kernel", device_id);  // Profiling removed for testing
     rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(
         ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
         ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H);
 
     // Router: scores = W_router@t + b (FP32, fused matmul + bias)
     dim3 gridE = get_gemv_grid_dim(E);
-    // PROFILE_KERNEL_LAUNCH_DEVICE("matmul_bias_kernel", device_id);  // Profiling removed for testing
     matmul_bias_kernel<float>
         <<<gridE, block, 0, ctx.stream>>>(ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
                            ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
@@ -444,7 +428,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
 
     // Fused Top-k + Softmax
     size_t shared_mem_size = E * sizeof(float);
-    // PROFILE_KERNEL_LAUNCH_DEVICE("fused_topk_softmax_kernel", device_id);  // Profiling removed for testing
     fused_topk_softmax_kernel<<<1, BLOCK_SIZE, shared_mem_size, ctx.stream>>>(
         ctx.gpu_activations.d_topk_v, ctx.gpu_activations.d_topk_i,
         ctx.gpu_activations.d_router_score, E, p->experts_per_token);
@@ -457,14 +440,12 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
       // MLP1 fused: gate_up (IM)
       dim3 gridIM = get_gemv_grid_dim(IM);
-      // PROFILE_KERNEL_LAUNCH_DEVICE("mlp1_fused_kernel", device_id);  // Profiling removed for testing
       mlp1_fused_kernel<bf16_t><<<gridIM, block, 0, ctx.stream>>>(
           ctx.gpu_activations.d_gate_up, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
           ctx.gpu_activations.d_topk_i, kk, l, E, H, IM, p->swiglu_limit);
 
       // MLP2 + bias + weighted accumulate to e_agg
-      // PROFILE_KERNEL_LAUNCH_DEVICE("mlp2_bias_weighted_accum_kernel", device_id);  // Profiling removed for testing
       mlp2_bias_weighted_accum_kernel<bf16_t>
           <<<gridH, block, 0, ctx.stream>>>(ctx.gpu_activations.d_e_agg, ctx.gpu_activations.d_gate_up,
                              ctx.gpu_weights_bf16.d_w_mlp2_bf16,
@@ -473,7 +454,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
     }
 
     // Residual add (x += e_agg)
-    // PROFILE_KERNEL_LAUNCH_DEVICE("residual_add_kernel", device_id);  // Profiling removed for testing
     residual_add_kernel<<<gridH, block, 0, ctx.stream>>>(
         ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg, H);
   }
@@ -481,7 +461,6 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   // Fused Final RMSNorm + LM head
   const int V = p->vocab_size;
   dim3 gridV = get_gemv_grid_dim(V);
-  // PROFILE_KERNEL_LAUNCH_DEVICE("fused_rmsnorm_matmul_kernel", device_id);  // Profiling removed for testing
   fused_rmsnorm_matmul_kernel<bf16_t><<<gridV, block, 0, ctx.stream>>>(
       ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
       ctx.gpu_weights_bf16.d_out_bf16,
@@ -498,8 +477,6 @@ long long simple_getp_generate_multigpu(Transformer *transformer, Tokenizer *tok
   } else {
     HIP_CHECK(hipSetDevice(device_id));
   }
-  
-  // PROFILE_FUNCTION_DEVICE(device_id);  // Profiling removed for testing
 
   const Config &cfg = transformer->config;
 
@@ -600,7 +577,6 @@ void process_request_worker(WorkerTask* task) {
 // Multi-GPU inference with load balancing
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  // PROFILE_FUNCTION();  // Profiling removed for testing
 
   if (g_num_devices == 0) {
     fprintf(stderr, "No GPUs initialized for inference!\n");
