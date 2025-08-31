@@ -294,55 +294,54 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 }
 
 // ============================ Forward ============================
-static inline void init_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx, Sampler *sampler) {
+static inline void setup_prompt_ctx(
+  PromptCtx &ctx,
+  Requests *requests,
+  int idx,
+  Sampler *sampler,
+  Transformer *transformer,
+  Tokenizer *tokenizer) 
+{
   ctx.idx = idx;
   ctx.input_seq = get_str_req_ptr(requests, idx);
   ctx.output_tokens = get_tok_gen_ptr(requests, idx);
   ctx.max_steps = requests->max_seq_len;
   ctx.sampler = sampler;
-}
 
-static inline void prepare_prompt_ctx(PromptCtx &ctx, Transformer *transformer, Tokenizer *tokenizer) {
   const Config &cfg = transformer->config;
 
-  // allocate token buffer (upper bound)
   size_t alloc_tok = ctx.input_seq.length() + 3;
   if (!ctx.prompt_tokens) {
-    ctx.prompt_tokens = (int*)malloc(alloc_tok * sizeof(int));
-    if (!ctx.prompt_tokens) { fprintf(stderr, "OOM: prompt_tokens\n"); exit(EXIT_FAILURE); }
+      ctx.prompt_tokens = (int*)malloc(alloc_tok * sizeof(int));
+      if (!ctx.prompt_tokens) { fprintf(stderr, "OOM: prompt_tokens\n"); exit(EXIT_FAILURE); }
   }
 
-  // encode input -> prompt_tokens / num_prompt_tokens
   ctx.num_prompt_tokens = 0;
-  // NOTE: encode() is expected thread-safe; if không, bọc bằng critical.
   encode(tokenizer, ctx.input_seq.c_str(), -1, -1,
          ctx.prompt_tokens, &ctx.num_prompt_tokens, cfg.initial_context_length);
   if (ctx.num_prompt_tokens < 1) {
-    fprintf(stderr, "Expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
+      fprintf(stderr, "Expected at least 1 prompt token\n");
+      exit(EXIT_FAILURE);
   }
 
-  // host logits
   ctx.logits_size = cfg.vocab_size;
   if (!ctx.h_logits) {
-    ctx.h_logits = (float*)malloc((size_t)ctx.logits_size * sizeof(float));
-    if (!ctx.h_logits) { fprintf(stderr, "OOM: h_logits\n"); exit(EXIT_FAILURE); }
+      ctx.h_logits = (float*)malloc((size_t)ctx.logits_size * sizeof(float));
+      if (!ctx.h_logits) { fprintf(stderr, "OOM: h_logits\n"); exit(EXIT_FAILURE); }
   }
 
-  // runtime state
   ctx.pos = 0;
   ctx.token = ctx.prompt_tokens[0];
   ctx.is_context_phase = true;
   ctx.finished = false;
   ctx.num_generated = 0;
 
-  // first visible piece
   if (ctx.output_str.empty()) {
-    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-    if (first_piece) ctx.output_str += first_piece;
+      const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+      if (first_piece) ctx.output_str += first_piece;
   }
 
-  // print all information of ctx
+  // debug print, will be removed
   printf("PromptCtx:\n");
   printf("  idx: %d\n", ctx.idx);
   printf("  input_seq: %s\n", ctx.input_seq.c_str());
@@ -477,19 +476,9 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
 static long long run_request_on_device(Transformer *transformer, Tokenizer *tokenizer,
                                        PromptCtx &ctx, int device_id) {
   HIP_CHECK(hipSetDevice(device_id));
-  const Config &cfg = transformer->config;
 
-  // If this ctx wasn't prepared in the prebuild phase, prepare it now (fallback)
-  bool need_prepare = (ctx.prompt_tokens == nullptr) || (ctx.num_prompt_tokens <= 0) || (ctx.logits_size != cfg.vocab_size);
-  if (need_prepare) {
-    prepare_prompt_ctx(ctx, transformer, tokenizer);
-  } else {
-    // Ensure first token is printed once (prepare already appended); if not, append here.
-    if (ctx.output_str.empty()) {
-      const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-      if (first_piece) ctx.output_str += first_piece;
-    }
-  }
+  const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+  if (first_piece) ctx.output_str += first_piece;
 
   while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
     float *d_log = gpu_forward_device(transformer, ctx.token, ctx.pos, device_id);
@@ -545,8 +534,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < num_requests; ++i) {
-    init_prompt_ctx(ctxs[i], requests, i, sampler);
-    prepare_prompt_ctx(ctxs[i], transformer, tokenizer);
+      setup_prompt_ctx(ctxs[i], requests, i, sampler, transformer, tokenizer);
   }
 
   // Launch one worker per GPU (simple, fast, balanced)
