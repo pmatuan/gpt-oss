@@ -28,6 +28,9 @@ struct GPUActivationBuffers {
   float *d_att, *d_logits, *d_mask;
   float *d_cos_vals, *d_sin_vals;
   int *d_token2row;
+  // Batched helpers
+  int *d_tokens;
+  int *d_pos;
 };
 
 struct GPUWeightBuffersFP32 {
@@ -59,6 +62,9 @@ struct DeviceContext {
   GPUWeightBuffersFP32 gpu_weights_fp32;
   GPUExpertBiasBuffers gpu_expert_bias;
   GPUWeightBuffersBF16 gpu_weights_bf16;
+  int capacity_B = 1; // how many batch slots are allocated for activations/caches
+  hipStream_t *streams = nullptr;
+  int n_streams = 0;
 };
 
 static Config *model_config;
@@ -138,6 +144,11 @@ static void init_device_context(DeviceContext &ctx, int device_id, Transformer *
   } else {
     ctx.gpu_activations.d_mask = nullptr;
   }
+
+  // Batched helpers (lazily grown as needed)
+  ctx.capacity_B = 1;
+  ctx.gpu_activations.d_tokens = nullptr;
+  ctx.gpu_activations.d_pos = nullptr;
 
   debug_print_gpu_memory("after activations", device_id);
 
@@ -239,6 +250,15 @@ static void cleanup_device_context(DeviceContext& ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_sin_vals));
   if (ctx.gpu_activations.d_mask) HIP_CHECK(hipFree(ctx.gpu_activations.d_mask));
   if (ctx.gpu_activations.d_token2row) HIP_CHECK(hipFree(ctx.gpu_activations.d_token2row));
+  if (ctx.gpu_activations.d_tokens) HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
+  if (ctx.gpu_activations.d_pos) HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
+
+  if (ctx.streams) {
+    for (int i = 0; i < ctx.n_streams; ++i) HIP_CHECK(hipStreamDestroy(ctx.streams[i]));
+    free(ctx.streams);
+    ctx.streams = nullptr;
+    ctx.n_streams = 0;
+  }
 
   HIP_CHECK(hipFree(ctx.gpu_weights_fp32.d_rms_attn_w));
   HIP_CHECK(hipFree(ctx.gpu_weights_fp32.d_rms_ffn_w));
@@ -292,6 +312,88 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 }
 
 // ============================ Forward ============================
+// Ensure device has capacity for B batch slots (reallocates activations & caches if needed)
+static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
+  if (B <= ctx.capacity_B) return;
+  HIP_CHECK(hipSetDevice(ctx.device_id));
+
+  const Config *p = model_config;
+  const int H = p->hidden_dim;
+  const int D = p->head_dim;
+  const int Hq = p->n_attn_heads;
+  const int Hk = p->n_kv_heads;
+  const int KV = D * Hk;
+  const int L = p->n_layers;
+  const int S = p->seq_len;
+  const int IM = p->intermediate_dim;
+  const int V = p->vocab_size;
+
+  // Free previous activations to re-alloc at batch size B
+  #define FREE_IF(p) if ((p)) HIP_CHECK(hipFree((p)))
+  FREE_IF(ctx.gpu_activations.d_x);
+  FREE_IF(ctx.gpu_activations.d_t);
+  FREE_IF(ctx.gpu_activations.d_tb);
+  FREE_IF(ctx.gpu_activations.d_tb2);
+  FREE_IF(ctx.gpu_activations.d_router_score);
+  FREE_IF(ctx.gpu_activations.d_topk_v);
+  FREE_IF(ctx.gpu_activations.d_topk_i);
+  FREE_IF(ctx.gpu_activations.d_mlp1_out);
+  FREE_IF(ctx.gpu_activations.d_gate_up);
+  FREE_IF(ctx.gpu_activations.d_e_agg);
+  FREE_IF(ctx.gpu_activations.d_qkv);
+  FREE_IF(ctx.gpu_activations.d_q);
+  FREE_IF(ctx.gpu_activations.d_k);
+  FREE_IF(ctx.gpu_activations.d_v);
+  FREE_IF(ctx.gpu_activations.d_key_cache);
+  FREE_IF(ctx.gpu_activations.d_value_cache);
+  FREE_IF(ctx.gpu_activations.d_att);
+  FREE_IF(ctx.gpu_activations.d_logits);
+  // mask & token2row remain shared
+  #undef FREE_IF
+
+  // Re-allocate with batch dimension
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, (size_t)B * H * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb, (size_t)B * D * Hq * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb2, (size_t)B * H * sizeof(float)));
+
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score, (size_t)B * p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v, (size_t)B * p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_i, (size_t)B * p->experts_per_token * sizeof(int)));
+
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_mlp1_out, (size_t)B * 2 * IM * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up, (size_t)B * IM * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
+
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv, (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, (size_t)B * Hq * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k, (size_t)B * Hk * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v, (size_t)B * Hk * D * sizeof(float)));
+
+  // Per-batch KV caches
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache, (size_t)B * L * S * KV * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache, (size_t)B * L * S * KV * sizeof(float)));
+  // Auxiliary buffers
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att, (size_t)B * Hq * S * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
+
+  // Tokens and positions (host-to-device each step)
+  if (!ctx.gpu_activations.d_tokens) HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
+  else { HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens)); HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int))); }
+  if (!ctx.gpu_activations.d_pos) HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
+  else { HIP_CHECK(hipFree(ctx.gpu_activations.d_pos)); HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int))); }
+
+  ctx.capacity_B = B;
+
+  // Recreate streams for per-sample parallelism
+  if (ctx.streams) {
+    for (int i = 0; i < ctx.n_streams; ++i) HIP_CHECK(hipStreamDestroy(ctx.streams[i]));
+    free(ctx.streams);
+  }
+  ctx.streams = (hipStream_t*)malloc(sizeof(hipStream_t) * B);
+  ctx.n_streams = B;
+  for (int i = 0; i < B; ++i) HIP_CHECK(hipStreamCreateWithFlags(&ctx.streams[i], hipStreamNonBlocking));
+}
 static inline void setup_prompt_ctx(
   PromptCtx &ctx,
   Requests *requests,
@@ -470,26 +572,223 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   return ctx.gpu_activations.d_logits;
 }
 
+// Batched single-step decode forward. Expects pos[b] >= 0 for active slots; inactive slots can set pos[b] < 0 to skip.
+static float *gpu_forward_device_batch(Transformer *transformer, const int *tokens, const int *pos,
+                                       int batch_size, int device_id, int max_pos_in_batch) {
+  DeviceContext &ctx = g_devices[device_id];
+  HIP_CHECK(hipSetDevice(device_id));
+
+  const Config *p = model_config;
+  const int H = p->hidden_dim;
+  const int D = p->head_dim;
+  const int Hq = p->n_attn_heads;
+  const int Hk = p->n_kv_heads;
+  const int KV = D * Hk;
+  const int IM = p->intermediate_dim;
+  const int E = p->n_experts;
+  const int S = p->seq_len;
+  const int L = p->n_layers;
+  const int V = p->vocab_size;
+
+  ensure_device_capacity(ctx, batch_size);
+
+  // Copy host tokens/positions into device buffers
+  HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_tokens, tokens, (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_pos, pos, (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
+
+  dim3 block(BLOCK_SIZE, 1, 1);
+  dim3 gridH = get_gemv_grid_dim(H);
+
+  // Launch identical single-sample kernels per slot on separate streams
+  for (int b = 0; b < batch_size; ++b) {
+    if (pos[b] < 0 || tokens[b] < 0) continue;
+    hipStream_t s = ctx.streams[b];
+    copy_embedding_bf16_row_kernel<<<gridH, block, 0, s>>>(
+        ctx.gpu_activations.d_x + (size_t)b * H,
+        ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
+        tokens[b], H);
+  }
+
+  for (int l = 0; l < L; ++l) {
+    const int QKV_D = D * (Hq + 2 * Hk);
+    dim3 gridQKV = get_gemv_grid_dim(QKV_D);
+    for (int b = 0; b < batch_size; ++b) {
+      if (pos[b] < 0 || tokens[b] < 0) continue;
+      hipStream_t s = ctx.streams[b];
+      fused_rmsnorm_matmul_bias_kernel<bf16_t><<<gridQKV, block, 0, s>>>(
+          ctx.gpu_activations.d_qkv + (size_t)b * QKV_D,
+          ctx.gpu_activations.d_x + (size_t)b * H,
+          ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
+          ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D,
+          ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H, QKV_D);
+
+      int loff = l * S * KV;
+      split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0, s>>>(
+          ctx.gpu_activations.d_q + (size_t)b * Hq * D,
+          ctx.gpu_activations.d_key_cache + (size_t)b * L * S * KV,
+          ctx.gpu_activations.d_value_cache + (size_t)b * L * S * KV,
+          ctx.gpu_activations.d_qkv + (size_t)b * QKV_D,
+          Hq, Hk, D, loff, pos[b] * KV);
+
+      dim3 gridApply(max(Hq, Hk));
+      fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0, s>>>(
+          ctx.gpu_activations.d_q + (size_t)b * Hq * D,
+          ctx.gpu_activations.d_key_cache + (size_t)b * L * S * KV,
+          pos[b], p->rope_theta, Hq, Hk, D,
+          p->rope_scaling_factor, p->initial_context_length,
+          loff, pos[b] * KV);
+
+      // Attention
+      dim3 grid(Hq);
+      dim3 blockA(WF_SIZE);
+      size_t shmem_size = (size_t)(pos[b] + 2) * sizeof(float);
+      attention_kernel<<<grid, blockA, shmem_size, s>>>(
+          ctx.gpu_activations.d_tb + (size_t)b * Hq * D,
+          ctx.gpu_activations.d_q + (size_t)b * Hq * D,
+          ctx.gpu_activations.d_key_cache + (size_t)b * L * S * KV + loff,
+          ctx.gpu_activations.d_value_cache + (size_t)b * L * S * KV + loff,
+          ctx.gpu_weights_fp32.d_attn_sinks, l, pos[b], D, Hq, Hk, S,
+          (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask : nullptr);
+
+      const int O_N = D * Hq;
+      dim3 gridO = get_gemv_grid_dim(H);
+      fused_matmul_bias_residual_kernel<bf16_t><<<gridO, block, 0, s>>>(
+          ctx.gpu_activations.d_x + (size_t)b * H,
+          ctx.gpu_activations.d_tb + (size_t)b * Hq * D,
+          ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
+          ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H);
+
+      // FFN
+      rmsnorm_kernel<<<1, BLOCK_SIZE, 0, s>>>(
+          ctx.gpu_activations.d_t + (size_t)b * H,
+          ctx.gpu_activations.d_x + (size_t)b * H,
+          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H);
+
+      dim3 gridE = get_gemv_grid_dim(E);
+      matmul_bias_kernel<float><<<gridE, block, 0, s>>>(
+          ctx.gpu_activations.d_router_score + (size_t)b * E,
+          ctx.gpu_activations.d_t + (size_t)b * H,
+          ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
+          ctx.gpu_weights_fp32.d_b_router + l * E, H, E);
+
+      size_t shared_mem_size = (size_t)E * sizeof(float);
+      fused_topk_softmax_kernel<<<1, BLOCK_SIZE, shared_mem_size, s>>>(
+          ctx.gpu_activations.d_topk_v + (size_t)b * p->experts_per_token,
+          ctx.gpu_activations.d_topk_i + (size_t)b * p->experts_per_token,
+          ctx.gpu_activations.d_router_score + (size_t)b * E, E, p->experts_per_token);
+
+      HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg + (size_t)b * H, 0, (size_t)H * sizeof(float), s));
+
+      for (int kk = 0; kk < p->experts_per_token; ++kk) {
+        dim3 gridIM = get_gemv_grid_dim(IM);
+        mlp1_fused_kernel<bf16_t><<<gridIM, block, 0, s>>>(
+            ctx.gpu_activations.d_gate_up + (size_t)b * IM,
+            ctx.gpu_activations.d_t + (size_t)b * H,
+            ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
+            ctx.gpu_activations.d_topk_i + (size_t)b * p->experts_per_token,
+            kk, l, E, H, IM, p->swiglu_limit);
+
+        dim3 gridHB = get_gemv_grid_dim(H);
+        mlp2_bias_weighted_accum_kernel<bf16_t><<<gridHB, block, 0, s>>>(
+            ctx.gpu_activations.d_e_agg + (size_t)b * H,
+            ctx.gpu_activations.d_gate_up + (size_t)b * IM,
+            ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+            ctx.gpu_expert_bias.g_b_mlp2,
+            ctx.gpu_activations.d_topk_i + (size_t)b * p->experts_per_token,
+            ctx.gpu_activations.d_topk_v + (size_t)b * p->experts_per_token,
+            kk, l, E, IM, H);
+      }
+
+      dim3 gridHB2 = get_gemv_grid_dim(H);
+      residual_add_kernel<<<gridHB2, block, 0, s>>>(
+          ctx.gpu_activations.d_x + (size_t)b * H,
+          ctx.gpu_activations.d_e_agg + (size_t)b * H, H);
+    }
+  }
+
+  // Final head
+  dim3 gridV = get_gemv_grid_dim(V);
+  for (int b = 0; b < batch_size; ++b) {
+    if (pos[b] < 0 || tokens[b] < 0) continue;
+    hipStream_t s = ctx.streams[b];
+    fused_rmsnorm_matmul_kernel<bf16_t><<<gridV, block, 0, s>>>(
+        ctx.gpu_activations.d_logits + (size_t)b * V,
+        ctx.gpu_activations.d_x + (size_t)b * H,
+        ctx.gpu_weights_bf16.d_out_bf16,
+        ctx.gpu_weights_fp32.d_rms_out_w, H, V);
+  }
+
+  // Synchronize all streams to ensure logits ready
+  for (int b = 0; b < batch_size; ++b) HIP_CHECK(hipStreamSynchronize(ctx.streams[b]));
+
+  return ctx.gpu_activations.d_logits;
+}
+
 static long long run_requests_on_device(Transformer *transformer, Tokenizer *tokenizer,
                                         PromptCtx *ctxs, int num_ctxs, int device_id) {
   HIP_CHECK(hipSetDevice(device_id));
   
   long long total_tokens = 0;
-  
-  for (int ctx_idx = 0; ctx_idx < num_ctxs; ++ctx_idx) {
-    PromptCtx &ctx = ctxs[ctx_idx];
-    
+
+  // Allocate batch helpers on host
+  const int B = num_ctxs;
+  std::vector<int> h_tokens(B, 0);
+  std::vector<int> h_pos(B, 0);
+  std::vector<char> h_active(B, 1);
+
+  // Append initial piece for each context once
+  for (int i = 0; i < B; ++i) {
+    PromptCtx &ctx = ctxs[i];
     const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
     if (first_piece) ctx.output_str += first_piece;
+    h_tokens[i] = ctx.token;
+    h_pos[i] = ctx.pos; // 0
+    h_active[i] = 1;
+  }
 
-    while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
-      float *d_log = gpu_forward_device(transformer, ctx.token, ctx.pos, device_id);
+  // Ensure device buffers sized for B and clear KV caches
+  ensure_device_capacity(g_devices[device_id], B);
+  const Config *p = model_config;
+  const int D = p->head_dim;
+  const int Hk = p->n_kv_heads;
+  const int KV = D * Hk;
+  const int L = p->n_layers;
+  const int S = p->seq_len;
+  DeviceContext &dctx = g_devices[device_id];
+  HIP_CHECK(hipMemset(dctx.gpu_activations.d_key_cache, 0, (size_t)B * L * S * KV * sizeof(float)));
+  HIP_CHECK(hipMemset(dctx.gpu_activations.d_value_cache, 0, (size_t)B * L * S * KV * sizeof(float)));
 
-      HIP_CHECK(hipMemcpy(ctx.h_logits, d_log,
-                          (size_t)ctx.logits_size * sizeof(float),
-                          hipMemcpyDeviceToHost));
+  // Temporary host buffer for batched logits
+  const int V = p->vocab_size;
+  std::vector<float> h_logits_batch((size_t)B * V);
+
+  int num_finished = 0;
+  while (num_finished < B) {
+    // Build positions and tokens for this step; mark inactive with pos=-1
+    int max_pos_in_batch = 0;
+    for (int i = 0; i < B; ++i) {
+      if (!h_active[i]) {
+        h_pos[i] = -1;
+        h_tokens[i] = -1;
+      } else {
+        if (h_pos[i] > max_pos_in_batch) max_pos_in_batch = h_pos[i];
+      }
+    }
+
+    float *d_log = gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(), B, device_id, max_pos_in_batch);
+
+    HIP_CHECK(hipMemcpy(h_logits_batch.data(), d_log, (size_t)B * V * sizeof(float), hipMemcpyDeviceToHost));
+
+    // For each active context, advance one step
+    for (int i = 0; i < B; ++i) {
+      if (!h_active[i]) continue;
+      PromptCtx &ctx = ctxs[i];
+
+      // Copy logits for this sample into ctx.h_logits
+      memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V], (size_t)V * sizeof(float));
 
       ctx.pos++;
+      h_pos[i] = ctx.pos;
       int next;
       if (ctx.pos < ctx.num_prompt_tokens) {
         next = ctx.prompt_tokens[ctx.pos];
@@ -502,19 +801,35 @@ static long long run_requests_on_device(Transformer *transformer, Tokenizer *tok
 
       if (next == 199999 || next == 200002) {
         ctx.finished = true;
-        break;
+        h_active[i] = 0;
+        num_finished++;
+        const char *piece = decode_piece(tokenizer, ctx.token, next);
+        if (piece) ctx.output_str += piece;
+        ctx.token = next;
+        continue;
       }
 
       const char *piece = decode_piece(tokenizer, ctx.token, next);
       if (piece) ctx.output_str += piece;
 
       ctx.token = next;
-    }
+      h_tokens[i] = next;
 
+      // Respect max steps constraint
+      if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
+        ctx.finished = true;
+        h_active[i] = 0;
+        num_finished++;
+      }
+    }
+  }
+
+  for (int i = 0; i < B; ++i) {
+    PromptCtx &ctx = ctxs[i];
     ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
     total_tokens += (long long)(ctx.pos - ctx.num_prompt_tokens + 1);
   }
-  
+
   return total_tokens;
 }
 
