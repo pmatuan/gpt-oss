@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <string.h>
 #include <vector>
 #include <atomic>
 #include <mutex>
@@ -72,6 +73,9 @@ static Config *model_config;
 // Global multi-GPU state
 static std::vector<DeviceContext> g_devices;
 static int g_num_devices = 0;
+
+// Forward declaration used by warm_up preallocation
+// (ensure_device_capacity declared later in this file)
 
 // ======================== Init / Finish ========================
 // Initialize single device context
@@ -385,14 +389,19 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
 
   ctx.capacity_B = B;
 
-  // Recreate streams for per-sample parallelism
-  if (ctx.streams) {
-    for (int i = 0; i < ctx.n_streams; ++i) HIP_CHECK(hipStreamDestroy(ctx.streams[i]));
+  if (!ctx.streams) {
+    ctx.streams = (hipStream_t*)malloc(sizeof(hipStream_t) * B);
+    ctx.n_streams = 0;
+  } else if (B > ctx.n_streams) {
+    hipStream_t *new_streams = (hipStream_t*)malloc(sizeof(hipStream_t) * B);
+    memcpy(new_streams, ctx.streams, sizeof(hipStream_t) * ctx.n_streams);
     free(ctx.streams);
+    ctx.streams = new_streams;
   }
-  ctx.streams = (hipStream_t*)malloc(sizeof(hipStream_t) * B);
+  for (int i = ctx.n_streams; i < B; ++i) {
+    HIP_CHECK(hipStreamCreateWithFlags(&ctx.streams[i], hipStreamNonBlocking));
+  }
   ctx.n_streams = B;
-  for (int i = 0; i < B; ++i) HIP_CHECK(hipStreamCreateWithFlags(&ctx.streams[i], hipStreamNonBlocking));
 }
 static inline void setup_prompt_ctx(
   PromptCtx &ctx,
@@ -755,8 +764,6 @@ static long long run_requests_on_device(Transformer *transformer, Tokenizer *tok
   const int L = p->n_layers;
   const int S = p->seq_len;
   DeviceContext &dctx = g_devices[device_id];
-  HIP_CHECK(hipMemset(dctx.gpu_activations.d_key_cache, 0, (size_t)B * L * S * KV * sizeof(float)));
-  HIP_CHECK(hipMemset(dctx.gpu_activations.d_value_cache, 0, (size_t)B * L * S * KV * sizeof(float)));
 
   // Temporary host buffer for batched logits
   const int V = p->vocab_size;
