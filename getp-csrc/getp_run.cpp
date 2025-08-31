@@ -42,6 +42,8 @@ struct GPUExpertBiasBuffers {
   float *g_b_mlp2;
 };
 
+typedef hip_bfloat16 bf16_t;
+
 struct GPUWeightBuffersBF16 {
   bf16_t *d_token_embedding_table_bf16;
   bf16_t *d_w_qkv_bf16, *d_w_o_bf16;
@@ -144,63 +146,70 @@ static void init_device_context(DeviceContext &ctx, int device_id, Transformer *
   // Weights (small FP32)
   TransformerWeights *w = &transformer->weights;
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_attn_w, w->rms_attn_w, L * H * sizeof(float), hipMemcpyHostToDevice));
+  const int H_ = H;
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_attn_w, w->rms_attn_w, L * H_ * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_ffn_w, w->rms_ffn_w, L * H * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_ffn_w, w->rms_ffn_w, L * H_ * sizeof(float), hipMemcpyHostToDevice));
 
-  const int QKV_D = D * (Hq + 2 * Hk);
+  const int D_ = model_config->head_dim;
+  const int Hq_ = model_config->n_attn_heads;
+  const int Hk_ = model_config->n_kv_heads;
+  const int QKV_D = D_ * (Hq_ + 2 * Hk_);
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, L * QKV_D * sizeof(float)));
   HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_qkv, w->b_qkv, L * QKV_D * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_o, w->b_o, L * H * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_o, w->b_o, L * H_ * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_attn_sinks, w->attn_sinks, L * Hq * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_attn_sinks, w->attn_sinks, L * Hq_ * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H * E * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_w_router, w->w_router, L * H * E * sizeof(float), hipMemcpyHostToDevice));
+  const int E_ = model_config->n_experts;
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H_ * E_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_w_router, w->w_router, L * H_ * E_ * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_router, w->b_router, L * E * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_router, w->b_router, L * E_ * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w, H * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_out_w, w->rms_out_w, H * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w, H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_out_w, w->rms_out_w, H_ * sizeof(float), hipMemcpyHostToDevice));
 
   debug_print_gpu_memory("after small FP32 weights", device_id);
 
   // Expert biases FP32
-  HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1, (size_t)L * E * (2 * IM) * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1, w->b_mlp1, (size_t)L * E * (2 * IM) * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2, (size_t)L * E * H * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2, w->b_mlp2, (size_t)L * E * H * sizeof(float), hipMemcpyHostToDevice));
+  const int IM_ = model_config->intermediate_dim;
+  HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1, (size_t)L * E_ * (2 * IM_) * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1, w->b_mlp1, (size_t)L * E_ * (2 * IM_) * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2, (size_t)L * E_ * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2, w->b_mlp2, (size_t)L * E_ * H_ * sizeof(float), hipMemcpyHostToDevice));
 
   debug_print_gpu_memory("after expert biases", device_id);
 
   // Large BF16 weights
   const int n_streams = 4;
   const size_t chunk_bytes = 64ULL * 1024 * 1024;
+  const int V_ = model_config->vocab_size;
+  const int O_N = D_ * Hq_;
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_token_embedding_table_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V * H, ctx.gpu_weights_bf16.d_token_embedding_table_bf16, n_streams, chunk_bytes);
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_token_embedding_table_bf16, (size_t)V_ * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->token_embedding_table, (size_t)V_ * H_, ctx.gpu_weights_bf16.d_token_embedding_table_bf16, n_streams, chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_qkv_bf16, (size_t)L * QKV_D * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H, ctx.gpu_weights_bf16.d_w_qkv_bf16, n_streams, chunk_bytes);
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_qkv_bf16, (size_t)L * QKV_D * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H_, ctx.gpu_weights_bf16.d_w_qkv_bf16, n_streams, chunk_bytes);
 
-  const int O_N = D * Hq;
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_o_bf16, (size_t)L * H * O_N * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H * O_N, ctx.gpu_weights_bf16.d_w_o_bf16, n_streams, chunk_bytes);
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_o_bf16, (size_t)L * H_ * O_N * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H_ * O_N, ctx.gpu_weights_bf16.d_w_o_bf16, n_streams, chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp1_bf16, (size_t)L * E * (2 * IM) * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E * (2 * IM) * H, ctx.gpu_weights_bf16.d_w_mlp1_bf16, n_streams, chunk_bytes);
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp1_bf16, (size_t)L * E_ * (2 * IM_) * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E_ * (2 * IM_) * H_, ctx.gpu_weights_bf16.d_w_mlp1_bf16, n_streams, chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp2_bf16, (size_t)L * E * H * IM * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E * H * IM, ctx.gpu_weights_bf16.d_w_mlp2_bf16, n_streams, chunk_bytes);
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp2_bf16, (size_t)L * E_ * H_ * IM_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E_ * H_ * IM_, ctx.gpu_weights_bf16.d_w_mlp2_bf16, n_streams, chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_out_bf16, (size_t)V * H * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->out, (size_t)V * H, ctx.gpu_weights_bf16.d_out_bf16, n_streams, chunk_bytes);
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_out_bf16, (size_t)V_ * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->out, (size_t)V_ * H_, ctx.gpu_weights_bf16.d_out_bf16, n_streams, chunk_bytes);
 
   debug_print_gpu_memory("after large BF16 weights (model loaded)", device_id);
 }
@@ -291,6 +300,63 @@ static inline void init_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx, 
   ctx.output_tokens = get_tok_gen_ptr(requests, idx);
   ctx.max_steps = requests->max_seq_len;
   ctx.sampler = sampler;
+}
+
+static inline void prepare_prompt_ctx(PromptCtx &ctx, Transformer *transformer, Tokenizer *tokenizer) {
+  const Config &cfg = transformer->config;
+
+  // allocate token buffer (upper bound)
+  size_t alloc_tok = ctx.input_seq.length() + 3;
+  if (!ctx.prompt_tokens) {
+    ctx.prompt_tokens = (int*)malloc(alloc_tok * sizeof(int));
+    if (!ctx.prompt_tokens) { fprintf(stderr, "OOM: prompt_tokens\n"); exit(EXIT_FAILURE); }
+  }
+
+  // encode input -> prompt_tokens / num_prompt_tokens
+  ctx.num_prompt_tokens = 0;
+  // NOTE: encode() is expected thread-safe; if không, bọc bằng critical.
+  encode(tokenizer, ctx.input_seq.c_str(), -1, -1,
+         ctx.prompt_tokens, &ctx.num_prompt_tokens, cfg.initial_context_length);
+  if (ctx.num_prompt_tokens < 1) {
+    fprintf(stderr, "Expected at least 1 prompt token\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // host logits
+  ctx.logits_size = cfg.vocab_size;
+  if (!ctx.h_logits) {
+    ctx.h_logits = (float*)malloc((size_t)ctx.logits_size * sizeof(float));
+    if (!ctx.h_logits) { fprintf(stderr, "OOM: h_logits\n"); exit(EXIT_FAILURE); }
+  }
+
+  // runtime state
+  ctx.pos = 0;
+  ctx.token = ctx.prompt_tokens[0];
+  ctx.is_context_phase = true;
+  ctx.finished = false;
+  ctx.num_generated = 0;
+
+  // first visible piece
+  if (ctx.output_str.empty()) {
+    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+    if (first_piece) ctx.output_str += first_piece;
+  }
+
+  // print all information of ctx
+  printf("PromptCtx:\n");
+  printf("  idx: %d\n", ctx.idx);
+  printf("  input_seq: %s\n", ctx.input_seq.c_str());
+  printf("  num_prompt_tokens: %d\n", ctx.num_prompt_tokens);
+  printf("  logits_size: %d\n", ctx.logits_size);
+  printf("  pos: %d\n", ctx.pos);
+  printf("  token: %d\n", ctx.token);
+  printf("  is_context_phase: %d\n", ctx.is_context_phase);
+  printf("  finished: %d\n", ctx.finished);
+  printf("  num_generated: %lld\n", ctx.num_generated);
+  printf("  start_time: %f\n", ctx.start_time);
+  printf("  end_time: %f\n", ctx.end_time);
+  printf("  user_data: %p\n", ctx.user_data);
+  fflush(stdout);
 }
 
 float *gpu_forward_device(Transformer *transformer, int token, int pos, int device_id) {
@@ -413,33 +479,16 @@ static long long run_request_on_device(Transformer *transformer, Tokenizer *toke
   HIP_CHECK(hipSetDevice(device_id));
   const Config &cfg = transformer->config;
 
-  size_t alloc_tok = ctx.input_seq.length() + 3;
-  ctx.prompt_tokens = (int *)malloc(alloc_tok * sizeof(int));
-  if (!ctx.prompt_tokens) { fprintf(stderr, "OOM: prompt_tokens\n"); exit(EXIT_FAILURE); }
-
-  ctx.num_prompt_tokens = 0;
-  encode(tokenizer, ctx.input_seq.c_str(), -1, -1, ctx.prompt_tokens,
-         &ctx.num_prompt_tokens, cfg.initial_context_length);
-  if (ctx.num_prompt_tokens < 1) {
-    fprintf(stderr, "Expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
-  }
-
-  ctx.logits_size = cfg.vocab_size;
-  if (!ctx.h_logits) {
-    ctx.h_logits = (float *)malloc(ctx.logits_size * sizeof(float));
-    if (!ctx.h_logits) { fprintf(stderr, "OOM: h_logits\n"); exit(EXIT_FAILURE); }
-  }
-
-  ctx.pos = 0;
-  ctx.token = ctx.prompt_tokens[0];
-  ctx.is_context_phase = true;
-  ctx.finished = false;
-  ctx.num_generated = 0;
-
-  {
-    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-    ctx.output_str += first_piece;
+  // If this ctx wasn't prepared in the prebuild phase, prepare it now (fallback)
+  bool need_prepare = (ctx.prompt_tokens == nullptr) || (ctx.num_prompt_tokens <= 0) || (ctx.logits_size != cfg.vocab_size);
+  if (need_prepare) {
+    prepare_prompt_ctx(ctx, transformer, tokenizer);
+  } else {
+    // Ensure first token is printed once (prepare already appended); if not, append here.
+    if (ctx.output_str.empty()) {
+      const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+      if (first_piece) ctx.output_str += first_piece;
+    }
   }
 
   while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
@@ -467,7 +516,7 @@ static long long run_request_on_device(Transformer *transformer, Tokenizer *toke
     }
 
     const char *piece = decode_piece(tokenizer, ctx.token, next);
-    ctx.output_str += piece;
+    if (piece) ctx.output_str += piece;
 
     ctx.token = next;
   }
@@ -492,8 +541,13 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   std::atomic<int> next_req{0};
   std::mutex agg_mutex;
 
-  // One PromptCtx per request (owned by main thread; workers fill them)
   PromptCtx *ctxs = new PromptCtx[num_requests];
+
+  #pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < num_requests; ++i) {
+    init_prompt_ctx(ctxs[i], requests, i, sampler);
+    prepare_prompt_ctx(ctxs[i], transformer, tokenizer);
+  }
 
   // Launch one worker per GPU (simple, fast, balanced)
   std::vector<std::thread> workers;
@@ -507,9 +561,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       while (true) {
         int idx = next_req.fetch_add(1);
         if (idx >= num_requests) break;
-
-        // Init per-request context
-        init_prompt_ctx(ctxs[idx], requests, idx, sampler);
 
         long long t = run_request_on_device(transformer, tokenizer, ctxs[idx], dev);
         local_tokens += t;
