@@ -472,49 +472,55 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   return ctx.gpu_activations.d_logits;
 }
 
-// Run a single request to completion on a specific device
-static long long run_request_on_device(Transformer *transformer, Tokenizer *tokenizer,
-                                       PromptCtx &ctx, int device_id) {
+static long long run_requests_on_device(Transformer *transformer, Tokenizer *tokenizer,
+                                        PromptCtx *ctxs, int num_ctxs, int device_id) {
   HIP_CHECK(hipSetDevice(device_id));
+  
+  long long total_tokens = 0;
+  
+  for (int ctx_idx = 0; ctx_idx < num_ctxs; ++ctx_idx) {
+    PromptCtx &ctx = ctxs[ctx_idx];
+    
+    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+    if (first_piece) ctx.output_str += first_piece;
 
-  const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-  if (first_piece) ctx.output_str += first_piece;
+    while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
+      float *d_log = gpu_forward_device(transformer, ctx.token, ctx.pos, device_id);
 
-  while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
-    float *d_log = gpu_forward_device(transformer, ctx.token, ctx.pos, device_id);
+      HIP_CHECK(hipStreamSynchronize(g_devices[device_id].stream));
+      HIP_CHECK(hipMemcpy(ctx.h_logits, d_log,
+                          (size_t)ctx.logits_size * sizeof(float),
+                          hipMemcpyDeviceToHost));
 
-    HIP_CHECK(hipStreamSynchronize(g_devices[device_id].stream));
-    HIP_CHECK(hipMemcpy(ctx.h_logits, d_log,
-                        (size_t)ctx.logits_size * sizeof(float),
-                        hipMemcpyDeviceToHost));
+      ctx.pos++;
+      int next;
+      if (ctx.pos < ctx.num_prompt_tokens) {
+        next = ctx.prompt_tokens[ctx.pos];
+      } else {
+        ctx.is_context_phase = false;
+        next = sample(ctx.sampler, ctx.h_logits);
+        ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
+        ctx.num_generated++;
+      }
 
-    ctx.pos++;
-    int next;
-    if (ctx.pos < ctx.num_prompt_tokens) {
-      next = ctx.prompt_tokens[ctx.pos];
-    } else {
-      ctx.is_context_phase = false;
-      next = sample(ctx.sampler, ctx.h_logits);
-      ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
-      ctx.num_generated++;
+      if (next == 199999 || next == 200002) {
+        ctx.finished = true;
+        break;
+      }
+
+      const char *piece = decode_piece(tokenizer, ctx.token, next);
+      if (piece) ctx.output_str += piece;
+
+      ctx.token = next;
     }
 
-    if (next == 199999 || next == 200002) {
-      ctx.finished = true;
-      break;
-    }
-
-    const char *piece = decode_piece(tokenizer, ctx.token, next);
-    if (piece) ctx.output_str += piece;
-
-    ctx.token = next;
+    ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
+    total_tokens += (long long)(ctx.pos - ctx.num_prompt_tokens + 1);
   }
-
-  ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
-  return (long long)(ctx.pos - ctx.num_prompt_tokens + 1);
+  
+  return total_tokens;
 }
 
-// ============================ Inference ============================
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   if (g_num_devices == 0) {
@@ -527,7 +533,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   printf("Processing %d requests across %d GPUs...\n", num_requests, g_num_devices);
 
   long long num_token_out = 0;
-  std::atomic<int> next_req{0};
   std::mutex agg_mutex;
 
   PromptCtx *ctxs = new PromptCtx[num_requests];
@@ -537,22 +542,25 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       setup_prompt_ctx(ctxs[i], requests, i, sampler, transformer, tokenizer);
   }
 
-  // Launch one worker per GPU (simple, fast, balanced)
+  int ctxs_per_device = num_requests / g_num_devices;
+  int remainder = num_requests % g_num_devices;
+  
   std::vector<std::thread> workers;
   workers.reserve(g_num_devices);
 
   for (int dev = 0; dev < g_num_devices; ++dev) {
     workers.emplace_back([&, dev]() {
-      HIP_CHECK(hipSetDevice(dev));
-      long long local_tokens = 0;
-
-      while (true) {
-        int idx = next_req.fetch_add(1);
-        if (idx >= num_requests) break;
-
-        long long t = run_request_on_device(transformer, tokenizer, ctxs[idx], dev);
-        local_tokens += t;
+      int num_ctxs_for_device = ctxs_per_device;
+      if (dev < remainder) {
+        num_ctxs_for_device++;
       }
+      
+      if (num_ctxs_for_device == 0) return;
+      
+      int start_idx = dev * ctxs_per_device + std::min(dev, remainder);
+      
+      long long local_tokens = run_requests_on_device(transformer, tokenizer, 
+                                                      &ctxs[start_idx], num_ctxs_for_device, dev);
 
       // Aggregate tokens
       std::lock_guard<std::mutex> lk(agg_mutex);
