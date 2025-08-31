@@ -54,7 +54,6 @@ struct GPUWeightBuffersBF16 {
 // Multi-GPU device management
 struct DeviceContext {
   int device_id;
-  hipStream_t stream;
 
   GPUActivationBuffers gpu_activations;
   GPUWeightBuffersFP32 gpu_weights_fp32;
@@ -73,7 +72,6 @@ static int g_num_devices = 0;
 static void init_device_context(DeviceContext &ctx, int device_id, Transformer *transformer) {
   ctx.device_id = device_id;
   HIP_CHECK(hipSetDevice(device_id));
-  HIP_CHECK(hipStreamCreateWithFlags(&ctx.stream, hipStreamNonBlocking));
 
   model_config = &transformer->config;
   const int H = model_config->hidden_dim;
@@ -376,7 +374,7 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   dim3 gridH = get_gemv_grid_dim(H);
 
   // Embedding (BF16 -> FP32)
-  copy_embedding_bf16_row_kernel<<<gridH, block, 0, ctx.stream>>>(
+  copy_embedding_bf16_row_kernel<<<gridH, block, 0>>>(
       ctx.gpu_activations.d_x,
       ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
       token, H);
@@ -384,21 +382,21 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
   for (int l = 0; l < p->n_layers; ++l) {
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
-    fused_rmsnorm_matmul_bias_kernel<bf16_t><<<gridQKV, block, 0, ctx.stream>>>(
+    fused_rmsnorm_matmul_bias_kernel<bf16_t><<<gridQKV, block, 0>>>(
         ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_x,
         ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
         ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D,
         ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H, QKV_D);
 
     int loff = l * S * KV;
-    split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0, ctx.stream>>>(
+    split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0>>>(
         ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
         ctx.gpu_activations.d_value_cache,
         ctx.gpu_activations.d_qkv, Hq, Hk, D, loff,
         pos * KV);
 
     dim3 gridApply(Hq > Hk ? Hq : Hk);
-    fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0, ctx.stream>>>(
+    fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0>>>(
         ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
         pos, p->rope_theta, Hq, Hk, D,
         p->rope_scaling_factor, p->initial_context_length,
@@ -409,7 +407,7 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
       dim3 grid(Hq);
       dim3 blockA(WF_SIZE);
       size_t shmem_size = (pos + 2) * sizeof(float);
-      attention_kernel<<<grid, blockA, shmem_size, ctx.stream>>>(
+      attention_kernel<<<grid, blockA, shmem_size>>>(
           ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
           ctx.gpu_activations.d_key_cache + loff,
           ctx.gpu_activations.d_value_cache + loff,
@@ -420,37 +418,37 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
     // Output projection + residual
     const int O_N = D * Hq;
     dim3 gridO = get_gemv_grid_dim(H);
-    fused_matmul_bias_residual_kernel<bf16_t><<<gridO, block, 0, ctx.stream>>>(
+    fused_matmul_bias_residual_kernel<bf16_t><<<gridO, block, 0>>>(
         ctx.gpu_activations.d_x, ctx.gpu_activations.d_tb,
         ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
         ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H);
 
     // FFN
-    rmsnorm_kernel<<<1, BLOCK_SIZE, 0, ctx.stream>>>(
+    rmsnorm_kernel<<<1, BLOCK_SIZE, 0>>>(
         ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
         ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H);
 
     dim3 gridE = get_gemv_grid_dim(E);
-    matmul_bias_kernel<float><<<gridE, block, 0, ctx.stream>>>(
+    matmul_bias_kernel<float><<<gridE, block, 0>>>(
         ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
         ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
         ctx.gpu_weights_fp32.d_b_router + l * E, H, E);
 
     size_t shared_mem_size = E * sizeof(float);
-    fused_topk_softmax_kernel<<<1, BLOCK_SIZE, shared_mem_size, ctx.stream>>>(
+    fused_topk_softmax_kernel<<<1, BLOCK_SIZE, shared_mem_size>>>(
         ctx.gpu_activations.d_topk_v, ctx.gpu_activations.d_topk_i,
         ctx.gpu_activations.d_router_score, E, p->experts_per_token);
 
-    HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0, H * sizeof(float), ctx.stream));
+    HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0, H * sizeof(float)));
 
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
       dim3 gridIM = get_gemv_grid_dim(IM);
-      mlp1_fused_kernel<bf16_t><<<gridIM, block, 0, ctx.stream>>>(
+      mlp1_fused_kernel<bf16_t><<<gridIM, block, 0>>>(
           ctx.gpu_activations.d_gate_up, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
           ctx.gpu_activations.d_topk_i, kk, l, E, H, IM, p->swiglu_limit);
 
-      mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block, 0, ctx.stream>>>(
+      mlp2_bias_weighted_accum_kernel<bf16_t><<<gridH, block, 0>>>(
           ctx.gpu_activations.d_e_agg, ctx.gpu_activations.d_gate_up,
           ctx.gpu_weights_bf16.d_w_mlp2_bf16,
           ctx.gpu_expert_bias.g_b_mlp2,
@@ -458,13 +456,13 @@ float *gpu_forward_device(Transformer *transformer, int token, int pos, int devi
           kk, l, E, IM, H);
     }
 
-    residual_add_kernel<<<gridH, block, 0, ctx.stream>>>(ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg, H);
+    residual_add_kernel<<<gridH, block, 0>>>(ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg, H);
   }
 
   // Final RMSNorm + LM head
   const int V = p->vocab_size;
   dim3 gridV = get_gemv_grid_dim(V);
-  fused_rmsnorm_matmul_kernel<bf16_t><<<gridV, block, 0, ctx.stream>>>(
+  fused_rmsnorm_matmul_kernel<bf16_t><<<gridV, block, 0>>>(
       ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
       ctx.gpu_weights_bf16.d_out_bf16,
       ctx.gpu_weights_fp32.d_rms_out_w, H, V);
@@ -487,7 +485,6 @@ static long long run_requests_on_device(Transformer *transformer, Tokenizer *tok
     while (!ctx.finished && (ctx.max_steps == 0 || ctx.pos < ctx.max_steps)) {
       float *d_log = gpu_forward_device(transformer, ctx.token, ctx.pos, device_id);
 
-      HIP_CHECK(hipStreamSynchronize(g_devices[device_id].stream));
       HIP_CHECK(hipMemcpy(ctx.h_logits, d_log,
                           (size_t)ctx.logits_size * sizeof(float),
                           hipMemcpyDeviceToHost));
