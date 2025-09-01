@@ -641,11 +641,7 @@ static long long run_requests_on_device(Transformer *transformer, Tokenizer *tok
   #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < B; ++i) {
     PromptCtx &ctx = ctxs[i];
-    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-    if (first_piece) ctx.output_str += first_piece;
     h_tokens[i] = ctx.token;
-    h_pos[i] = ctx.pos; // 0
-    h_active[i] = 1;
   }
 
   // Ensure device buffers sized for B and clear KV caches
