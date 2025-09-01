@@ -494,15 +494,14 @@ static float *gpu_forward_device_batch(Transformer *transformer, const int *toke
   dim3 block(BLOCK_SIZE, 1, 1);
   dim3 gridH = get_gemv_grid_dim(H);
 
-  // Launch identical single-sample kernels per slot on separate streams
-  for (int b = 0; b < batch_size; ++b) {
-    if (pos[b] < 0 || tokens[b] < 0) continue;
-    hipStream_t s = ctx.streams[b];
-    copy_embedding_bf16_row_kernel<<<gridH, block, 0, s>>>(
-        ctx.gpu_activations.d_x + (size_t)b * H,
-        ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
-        tokens[b], H);
-  }
+  // Launch batched embedding kernel
+  dim3 gridH_batch(gridH.x, batch_size, 1);
+  copy_embedding_bf16_batch_kernel<<<gridH_batch, block, 0, ctx.streams[0]>>>(
+      ctx.gpu_activations.d_x,
+      ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
+      ctx.gpu_activations.d_tokens,
+      ctx.gpu_activations.d_pos,
+      batch_size, H);
 
   for (int l = 0; l < L; ++l) {
     const int QKV_D = D * (Hq + 2 * Hk);

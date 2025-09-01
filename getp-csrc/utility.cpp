@@ -104,14 +104,15 @@ __global__ void copy_embedding_bf16_row_kernel(float *dst, const bf16_t *src, in
   }
 }
 
-// Batched embedding lookup: grid.y = batch, x covers hidden_dim
-__global__ void copy_embedding_bf16_rows_kernel(float *dst, const bf16_t *src, const int *tokens, int hidden_dim, int batch) {
-  int b = blockIdx.y;
+__global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src, const int *tokens, 
+                                                 const int *pos, int batch_size, int hidden_dim) {
+  int batch_idx = blockIdx.y;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= batch || i >= hidden_dim) return;
-  int token = tokens[b];
-  if (token < 0) return; // inactive sample
-  dst[(size_t)b * hidden_dim + i] = static_cast<float>(src[(size_t)token * hidden_dim + i]);
+  
+  if (batch_idx < batch_size && i < hidden_dim && pos[batch_idx] >= 0 && tokens[batch_idx] >= 0) {
+    int token = tokens[batch_idx];
+    dst[(size_t)batch_idx * hidden_dim + i] = static_cast<float>(src[(size_t)token * hidden_dim + i]);
+  }
 }
 
 __global__ void split_qkv_scatter_to_cache_kernel(float *q, float *key_cache, float *value_cache, 
