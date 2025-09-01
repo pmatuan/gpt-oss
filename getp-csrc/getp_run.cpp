@@ -13,11 +13,12 @@
 #include <pthread.h>
 #include <string.h>
 #include <vector>
-#include <atomic>
 #include <mutex>
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+typedef hip_bfloat16 bf16_t;
 
 struct GPUActivationBuffers {
   float *d_x, *d_t, *d_tb, *d_tb2;
@@ -29,7 +30,6 @@ struct GPUActivationBuffers {
   float *d_att, *d_logits, *d_mask;
   float *d_cos_vals, *d_sin_vals;
   int *d_token2row;
-  // Batched helpers
   int *d_tokens;
   int *d_pos;
 };
@@ -46,8 +46,6 @@ struct GPUExpertBiasBuffers {
   float *g_b_mlp2;
 };
 
-typedef hip_bfloat16 bf16_t;
-
 struct GPUWeightBuffersBF16 {
   bf16_t *d_token_embedding_table_bf16;
   bf16_t *d_w_qkv_bf16, *d_w_o_bf16;
@@ -55,7 +53,6 @@ struct GPUWeightBuffersBF16 {
   bf16_t *d_out_bf16;
 };
 
-// Multi-GPU device management
 struct DeviceContext {
   int device_id;
 
@@ -63,22 +60,16 @@ struct DeviceContext {
   GPUWeightBuffersFP32 gpu_weights_fp32;
   GPUExpertBiasBuffers gpu_expert_bias;
   GPUWeightBuffersBF16 gpu_weights_bf16;
-  int capacity_B = 1; // how many batch slots are allocated for activations/caches
+  int capacity_B = 1;
   hipStream_t *streams = nullptr;
   int n_streams = 0;
 };
 
 static Config *model_config;
 
-// Global multi-GPU state
 static std::vector<DeviceContext> g_devices;
 static int g_num_devices = 0;
 
-// Forward declaration used by warm_up preallocation
-// (ensure_device_capacity declared later in this file)
-
-// ======================== Init / Finish ========================
-// Initialize single device context
 static void init_device_context(DeviceContext &ctx, int device_id, Transformer *transformer) {
   ctx.device_id = device_id;
   HIP_CHECK(hipSetDevice(device_id));
@@ -284,7 +275,6 @@ static void cleanup_device_context(DeviceContext& ctx) {
   HIP_CHECK(hipFree(ctx.gpu_weights_bf16.d_out_bf16));
 }
 
-// --------------------- Public lifecycle -------------------------
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   model_config = &transformer->config;
 
@@ -403,6 +393,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   }
   ctx.n_streams = B;
 }
+
 static inline void setup_prompt_ctx(
   PromptCtx &ctx,
   Requests *requests,
@@ -446,24 +437,28 @@ static inline void setup_prompt_ctx(
   ctx.num_generated = 0;
 
   if (ctx.output_str.empty()) {
-      const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-      if (first_piece) ctx.output_str += first_piece;
+    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+    if (first_piece)
+      ctx.output_str += first_piece;
   }
 
   // debug print, will be removed
-  printf("PromptCtx:\n");
-  printf("  idx: %d\n", ctx.idx);
-  printf("  input_seq: %s\n", ctx.input_seq.c_str());
-  printf("  num_prompt_tokens: %d\n", ctx.num_prompt_tokens);
-  printf("  logits_size: %d\n", ctx.logits_size);
-  printf("  pos: %d\n", ctx.pos);
-  printf("  token: %d\n", ctx.token);
-  printf("  is_context_phase: %d\n", ctx.is_context_phase);
-  printf("  finished: %d\n", ctx.finished);
-  printf("  num_generated: %lld\n", ctx.num_generated);
-  printf("  start_time: %f\n", ctx.start_time);
-  printf("  end_time: %f\n", ctx.end_time);
-  printf("  user_data: %p\n", ctx.user_data);
+  printf("PromptCtx:\n"
+         "  idx: %d\n"
+         "  input_seq: %s\n"
+         "  num_prompt_tokens: %d\n"
+         "  logits_size: %d\n"
+         "  pos: %d\n"
+         "  token: %d\n"
+         "  is_context_phase: %d\n"
+         "  finished: %d\n"
+         "  num_generated: %lld\n"
+         "  start_time: %f\n"
+         "  end_time: %f\n"
+         "  user_data: %p\n",
+         ctx.idx, ctx.input_seq.c_str(), ctx.num_prompt_tokens, ctx.logits_size,
+         ctx.pos, ctx.token, ctx.is_context_phase, ctx.finished,
+         ctx.num_generated, ctx.start_time, ctx.end_time, ctx.user_data);
   fflush(stdout);
 }
 
@@ -643,6 +638,7 @@ static long long run_requests_on_device(Transformer *transformer, Tokenizer *tok
   std::vector<char> h_active(B, 1);
 
   // Append initial piece for each context once
+  #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < B; ++i) {
     PromptCtx &ctx = ctxs[i];
     const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
