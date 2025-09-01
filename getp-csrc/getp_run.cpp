@@ -506,53 +506,67 @@ static float *gpu_forward_device_batch(Transformer *transformer, const int *toke
   for (int l = 0; l < L; ++l) {
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
+    // Batched QKV projection (RMSNorm + MatMul + Bias)
+    dim3 gridQKV_batch(gridQKV.x, batch_size, 1);
+    fused_rmsnorm_matmul_bias_batch_kernel<bf16_t><<<gridQKV_batch, block, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_qkv,
+        ctx.gpu_activations.d_x,
+        ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
+        ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D,
+        ctx.gpu_weights_fp32.d_rms_attn_w + l * H,
+        ctx.gpu_activations.d_pos,
+        H, QKV_D, batch_size);
+
+    // Scatter QKV to q / caches (batched)
+    const int loff = l * S * KV;
+    split_qkv_scatter_to_cache_batch_kernel<<<gridQKV_batch, block, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_q,
+        ctx.gpu_activations.d_key_cache,
+        ctx.gpu_activations.d_value_cache,
+        ctx.gpu_activations.d_qkv,
+        Hq, Hk, D, loff,
+        ctx.gpu_activations.d_pos, batch_size, L * S * KV);
+
+    // Apply RoPE to q and cached k (batched)
+    dim3 gridApply_batch(max(Hq, Hk), batch_size, 1);
+    fused_inline_rope_qkv_batch_kernel<<<gridApply_batch, D / 2, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_q,
+        ctx.gpu_activations.d_key_cache,
+        ctx.gpu_activations.d_pos,
+        p->rope_theta, Hq, Hk, D,
+        p->rope_scaling_factor, p->initial_context_length,
+        loff, L * S * KV, batch_size);
+
+    // Attention (batched)
+    dim3 gridAttn(Hq, batch_size, 1);
+    dim3 blockA(WF_SIZE);
+    size_t shmem_size = (size_t)(max_pos_in_batch + 2) * sizeof(float);
+    attention_batch_kernel<<<gridAttn, blockA, shmem_size, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_tb,
+        ctx.gpu_activations.d_q,
+        ctx.gpu_activations.d_key_cache,
+        ctx.gpu_activations.d_value_cache,
+        ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos,
+        D, Hq, Hk, S,
+        (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask : nullptr,
+        L * S * KV, batch_size);
+
+    // Output projection + residual (batched)
+    const int O_N = D * Hq;
+    dim3 gridO = get_gemv_grid_dim(H);
+    dim3 gridO_batch(gridO.x, batch_size, 1);
+    fused_matmul_bias_residual_batch_kernel<bf16_t><<<gridO_batch, block, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_x,
+        ctx.gpu_activations.d_tb,
+        ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
+        ctx.gpu_weights_fp32.d_b_o + l * H,
+        ctx.gpu_activations.d_pos,
+        O_N, H, batch_size);
+
+    // FFN (kept per-sample, unaffected by tokens/pos)
     for (int b = 0; b < batch_size; ++b) {
       if (pos[b] < 0 || tokens[b] < 0) continue;
-      hipStream_t s = ctx.streams[b];
-      fused_rmsnorm_matmul_bias_kernel<bf16_t><<<gridQKV, block, 0, s>>>(
-          ctx.gpu_activations.d_qkv + (size_t)b * QKV_D,
-          ctx.gpu_activations.d_x + (size_t)b * H,
-          ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-          ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D,
-          ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H, QKV_D);
-
-      int loff = l * S * KV;
-      split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0, s>>>(
-          ctx.gpu_activations.d_q + (size_t)b * Hq * D,
-          ctx.gpu_activations.d_key_cache + (size_t)b * L * S * KV,
-          ctx.gpu_activations.d_value_cache + (size_t)b * L * S * KV,
-          ctx.gpu_activations.d_qkv + (size_t)b * QKV_D,
-          Hq, Hk, D, loff, pos[b] * KV);
-
-      dim3 gridApply(max(Hq, Hk));
-      fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0, s>>>(
-          ctx.gpu_activations.d_q + (size_t)b * Hq * D,
-          ctx.gpu_activations.d_key_cache + (size_t)b * L * S * KV,
-          pos[b], p->rope_theta, Hq, Hk, D,
-          p->rope_scaling_factor, p->initial_context_length,
-          loff, pos[b] * KV);
-
-      // Attention
-      dim3 grid(Hq);
-      dim3 blockA(WF_SIZE);
-      size_t shmem_size = (size_t)(pos[b] + 2) * sizeof(float);
-      attention_kernel<<<grid, blockA, shmem_size, s>>>(
-          ctx.gpu_activations.d_tb + (size_t)b * Hq * D,
-          ctx.gpu_activations.d_q + (size_t)b * Hq * D,
-          ctx.gpu_activations.d_key_cache + (size_t)b * L * S * KV + loff,
-          ctx.gpu_activations.d_value_cache + (size_t)b * L * S * KV + loff,
-          ctx.gpu_weights_fp32.d_attn_sinks, l, pos[b], D, Hq, Hk, S,
-          (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask : nullptr);
-
-      const int O_N = D * Hq;
-      dim3 gridO = get_gemv_grid_dim(H);
-      fused_matmul_bias_residual_kernel<bf16_t><<<gridO, block, 0, s>>>(
-          ctx.gpu_activations.d_x + (size_t)b * H,
-          ctx.gpu_activations.d_tb + (size_t)b * Hq * D,
-          ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
-          ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H);
-
-      // FFN
+      hipStream_t s = ctx.streams[0];
       rmsnorm_kernel<<<1, BLOCK_SIZE, 0, s>>>(
           ctx.gpu_activations.d_t + (size_t)b * H,
           ctx.gpu_activations.d_x + (size_t)b * H,
@@ -602,18 +616,16 @@ static float *gpu_forward_device_batch(Transformer *transformer, const int *toke
 
   // Final head
   dim3 gridV = get_gemv_grid_dim(V);
-  for (int b = 0; b < batch_size; ++b) {
-    if (pos[b] < 0 || tokens[b] < 0) continue;
-    hipStream_t s = ctx.streams[b];
-    fused_rmsnorm_matmul_kernel<bf16_t><<<gridV, block, 0, s>>>(
-        ctx.gpu_activations.d_logits + (size_t)b * V,
-        ctx.gpu_activations.d_x + (size_t)b * H,
-        ctx.gpu_weights_bf16.d_out_bf16,
-        ctx.gpu_weights_fp32.d_rms_out_w, H, V);
-  }
+  dim3 gridV_batch(gridV.x, batch_size, 1);
+  fused_rmsnorm_matmul_batch_kernel<bf16_t><<<gridV_batch, block, 0, ctx.streams[0]>>>(
+      ctx.gpu_activations.d_logits,
+      ctx.gpu_activations.d_x,
+      ctx.gpu_weights_bf16.d_out_bf16,
+      ctx.gpu_weights_fp32.d_rms_out_w,
+      ctx.gpu_activations.d_pos, H, V, batch_size);
 
   // Synchronize all streams to ensure logits ready
-  for (int b = 0; b < batch_size; ++b) HIP_CHECK(hipStreamSynchronize(ctx.streams[b]));
+  HIP_CHECK(hipStreamSynchronize(ctx.streams[0]));
 
   return ctx.gpu_activations.d_logits;
 }
