@@ -558,55 +558,61 @@ static float *gpu_forward_device_batch(Transformer *transformer, const int *toke
         ctx.gpu_activations.d_pos,
         O_N, H, batch_size);
 
-    // FFN (kept per-sample, unaffected by tokens/pos)
-    for (int b = 0; b < batch_size; ++b) {
-      if (pos[b] < 0 || tokens[b] < 0) continue;
-      hipStream_t s = ctx.streams[0];
-      rmsnorm_kernel<<<1, BLOCK_SIZE, 0, s>>>(
-          ctx.gpu_activations.d_t + (size_t)b * H,
-          ctx.gpu_activations.d_x + (size_t)b * H,
-          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H);
+    // FFN (batched)
+    dim3 gridH_batch(gridH.x, batch_size, 1);
+    rmsnorm_batch_kernel<<<gridH_batch, block, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_t,
+        ctx.gpu_activations.d_x,
+        ctx.gpu_weights_fp32.d_rms_ffn_w + l * H,
+        ctx.gpu_activations.d_pos, H, batch_size);
 
-      dim3 gridE = get_gemv_grid_dim(E);
-      matmul_bias_kernel<float><<<gridE, block, 0, s>>>(
-          ctx.gpu_activations.d_router_score + (size_t)b * E,
-          ctx.gpu_activations.d_t + (size_t)b * H,
-          ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
-          ctx.gpu_weights_fp32.d_b_router + l * E, H, E);
+    dim3 gridE_batch = get_gemv_grid_dim(E);
+    gridE_batch.y = batch_size;
+    matmul_bias_batch_kernel<float><<<gridE_batch, block, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_router_score,
+        ctx.gpu_activations.d_t,
+        ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
+        ctx.gpu_weights_fp32.d_b_router + l * E,
+        ctx.gpu_activations.d_pos, H, E, batch_size);
 
-      size_t shared_mem_size = (size_t)E * sizeof(float);
-      fused_topk_softmax_kernel<<<1, BLOCK_SIZE, shared_mem_size, s>>>(
-          ctx.gpu_activations.d_topk_v + (size_t)b * p->experts_per_token,
-          ctx.gpu_activations.d_topk_i + (size_t)b * p->experts_per_token,
-          ctx.gpu_activations.d_router_score + (size_t)b * E, E, p->experts_per_token);
+    dim3 gridTopK_batch(1, batch_size, 1);
+    size_t shared_mem_size = (size_t)E * sizeof(float);
+    fused_topk_softmax_batch_kernel<<<gridTopK_batch, BLOCK_SIZE, shared_mem_size, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_topk_v,
+        ctx.gpu_activations.d_topk_i,
+        ctx.gpu_activations.d_router_score,
+        ctx.gpu_activations.d_pos, E, p->experts_per_token, batch_size);
 
-      HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg + (size_t)b * H, 0, (size_t)H * sizeof(float), s));
+    HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0, (size_t)batch_size * H * sizeof(float), ctx.streams[0]));
 
-      for (int kk = 0; kk < p->experts_per_token; ++kk) {
-        dim3 gridIM = get_gemv_grid_dim(IM);
-        mlp1_fused_kernel<bf16_t><<<gridIM, block, 0, s>>>(
-            ctx.gpu_activations.d_gate_up + (size_t)b * IM,
-            ctx.gpu_activations.d_t + (size_t)b * H,
-            ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
-            ctx.gpu_activations.d_topk_i + (size_t)b * p->experts_per_token,
-            kk, l, E, H, IM, p->swiglu_limit);
+    for (int kk = 0; kk < p->experts_per_token; ++kk) {
+      dim3 gridIM_batch = get_gemv_grid_dim(IM);
+      gridIM_batch.y = batch_size;
+      mlp1_fused_batch_kernel<bf16_t><<<gridIM_batch, block, 0, ctx.streams[0]>>>(
+          ctx.gpu_activations.d_gate_up,
+          ctx.gpu_activations.d_t,
+          ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
+          ctx.gpu_activations.d_topk_i,
+          ctx.gpu_activations.d_pos,
+          kk, l, E, H, IM, p->swiglu_limit, batch_size, p->experts_per_token);
 
-        dim3 gridHB = get_gemv_grid_dim(H);
-        mlp2_bias_weighted_accum_kernel<bf16_t><<<gridHB, block, 0, s>>>(
-            ctx.gpu_activations.d_e_agg + (size_t)b * H,
-            ctx.gpu_activations.d_gate_up + (size_t)b * IM,
-            ctx.gpu_weights_bf16.d_w_mlp2_bf16,
-            ctx.gpu_expert_bias.g_b_mlp2,
-            ctx.gpu_activations.d_topk_i + (size_t)b * p->experts_per_token,
-            ctx.gpu_activations.d_topk_v + (size_t)b * p->experts_per_token,
-            kk, l, E, IM, H);
-      }
-
-      dim3 gridHB2 = get_gemv_grid_dim(H);
-      residual_add_kernel<<<gridHB2, block, 0, s>>>(
-          ctx.gpu_activations.d_x + (size_t)b * H,
-          ctx.gpu_activations.d_e_agg + (size_t)b * H, H);
+      dim3 gridHB_batch = get_gemv_grid_dim(H);
+      gridHB_batch.y = batch_size;
+      mlp2_bias_weighted_accum_batch_kernel<bf16_t><<<gridHB_batch, block, 0, ctx.streams[0]>>>(
+          ctx.gpu_activations.d_e_agg,
+          ctx.gpu_activations.d_gate_up,
+          ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+          ctx.gpu_expert_bias.g_b_mlp2,
+          ctx.gpu_activations.d_topk_i,
+          ctx.gpu_activations.d_topk_v,
+          ctx.gpu_activations.d_pos,
+          kk, l, E, IM, H, batch_size, p->experts_per_token);
     }
+
+    residual_add_batch_kernel<<<gridH_batch, block, 0, ctx.streams[0]>>>(
+        ctx.gpu_activations.d_x,
+        ctx.gpu_activations.d_e_agg,
+        ctx.gpu_activations.d_pos, H, batch_size);
   }
 
   // Final head
