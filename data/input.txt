@@ -1,3 +1,5 @@
-2
+4
 Hello
 Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
