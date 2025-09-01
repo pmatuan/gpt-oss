@@ -637,12 +637,8 @@ static long long run_requests_on_device(Transformer *transformer, Tokenizer *tok
   std::vector<int> h_pos(B, 0);
   std::vector<char> h_active(B, 1);
 
-  // Append initial piece for each context once
-  #pragma omp parallel for schedule(dynamic)
-  for (int i = 0; i < B; ++i) {
-    PromptCtx &ctx = ctxs[i];
-    h_tokens[i] = ctx.token;
-  }
+  std::transform(ctxs, ctxs + B, h_tokens.begin(), 
+               [](const PromptCtx& ctx) { return ctx.token; });
 
   // Ensure device buffers sized for B and clear KV caches
   ensure_device_capacity(g_devices[device_id], B);
