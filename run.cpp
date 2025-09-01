@@ -19,6 +19,7 @@
 #endif
 
 #include "tokenizer.hpp"
+#include "getp-csrc/profiler.h"
 
 // ----------------------------------------------------------------------------
 
@@ -526,6 +527,7 @@ void apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
+  PROFILE_SCOPE("forward");
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
@@ -922,6 +924,7 @@ long time_in_ms() {
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
               const char *prompt, int steps) {
+  PROFILE_SCOPE("generate");
   // <|start|>: 200006
   // <|end|>: 200007
   // <|return|>: 200002
@@ -1245,6 +1248,10 @@ int main(int argc, char **argv) {
   free_sampler(&sampler);
   free_tokenizer(&tokenizer);
   free_transformer(&transformer);
+  
+  // Print profiling summary
+  PROFILER_PRINT_SUMMARY();
+  
   return 0;
 }
 
