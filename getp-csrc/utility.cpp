@@ -8,7 +8,7 @@
 #define TM 8
 #define BLOCK_SIZE 512
 #define WF_SIZE 64
-#define TK 256
+#define TK 512
 #define LDS_PAD 16
 
 #define HIP_CHECK(call)                                                        \
