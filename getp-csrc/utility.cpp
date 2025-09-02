@@ -157,10 +157,16 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
   }
 }
 
-__global__ void residual_add_kernel(float *x, const float *residual, int size) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < size)
-    x[i] += residual[i];
+__global__ void residual_add_batch_kernel(float *x, const float *residual,
+                                          const int *pos, int size,
+                                          int batch_size) {
+  const int b = blockIdx.y;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= batch_size || pos[b] < 0)
+    return;
+  if (i < size) {
+    x[(size_t)b * size + i] += residual[(size_t)b * size + i];
+  }
 }
 
 // Batched RMSNorm + MatMul + Bias for QKV projection
