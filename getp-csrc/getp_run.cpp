@@ -31,6 +31,7 @@ struct GPUActivationBuffers {
   int *d_token2row;
   int *d_tokens;
   int *d_pos;
+  float *d_inv_rms; // [B]
 };
 
 struct GPUWeightBuffersFP32 {
@@ -288,6 +289,8 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_value_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_att));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_logits));
+  if (ctx.gpu_activations.d_inv_rms)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_cos_vals));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_sin_vals));
   if (ctx.gpu_activations.d_mask)
@@ -400,6 +403,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   FREE_IF(ctx.gpu_activations.d_value_cache);
   FREE_IF(ctx.gpu_activations.d_att);
   FREE_IF(ctx.gpu_activations.d_logits);
+  FREE_IF(ctx.gpu_activations.d_inv_rms);
 // mask & token2row remain shared
 #undef FREE_IF
 
@@ -442,6 +446,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
                       (size_t)B * Hq * S * sizeof(float)));
   HIP_CHECK(
       hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
 
   // Tokens and positions (host-to-device each step)
   if (!ctx.gpu_activations.d_tokens)
@@ -725,13 +730,28 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
   // Final head
   {
-    PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_batch_kernel", 0);
-    dim3 gridV = get_gemv_grid_dim(V);
-    dim3 gridV_batch(gridV.x, batch_size, 1);
-    fused_rmsnorm_matmul_batch_kernel<bf16_t><<<gridV_batch, block, 0>>>(
-        ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
-        ctx.gpu_weights_bf16.d_out_bf16, ctx.gpu_weights_fp32.d_rms_out_w,
-        ctx.gpu_activations.d_pos, H, V, batch_size);
+    // 1) Compute per-sample inv_rms once (avoid redundant scans per block)
+    {
+      PROFILE_GPU_SCOPE("compute_inv_rms_batch_kernel", 0);
+      dim3 gridInv(1, batch_size, 1);
+      dim3 blockInv(256, 1, 1);
+      compute_inv_rms_batch_kernel<<<gridInv, blockInv, 0>>>(
+          ctx.gpu_activations.d_inv_rms, ctx.gpu_activations.d_x,
+          ctx.gpu_activations.d_pos, H, batch_size);
+    }
+
+    // 2) Fused (rmsnorm scale + matmul) for logits
+    {
+      PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_batch_kernel", 0);
+      dim3 block_logits(1024, 1, 1); // 16 warps -> 16 rows per block
+      const int TM_logits = block_logits.x / WF_SIZE;
+      dim3 gridV_batch((V + TM_logits - 1) / TM_logits, batch_size, 1);
+      fused_rmsnorm_matmul_batch_kernel<bf16_t><<<gridV_batch, block_logits, 0>>>(
+          ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
+          ctx.gpu_weights_bf16.d_out_bf16, ctx.gpu_weights_fp32.d_rms_out_w,
+          ctx.gpu_activations.d_pos, ctx.gpu_activations.d_inv_rms, H, V,
+          batch_size);
+    }
   }
 
   return ctx.gpu_activations.d_logits;

@@ -410,71 +410,43 @@ __launch_bounds__(BLOCK_SIZE, 1) __global__
 }
 
 template <typename T>
-__launch_bounds__(BLOCK_SIZE, 1) __global__
-void fused_rmsnorm_matmul_batch_kernel(
-    float *__restrict__ y,           // [B, V]
-    const float *__restrict__ x,     // [B, H]
-    const T *__restrict__ w,         // [V, H] (row-major), bf16
-    const float *__restrict__ rms_w, // [H]
-    const int *__restrict__ pos,     // [B]
-    int H, int V, int batch_size)
-{
+__launch_bounds__(1024, 1) __global__ void fused_rmsnorm_matmul_batch_kernel(
+    float *__restrict__ y,              // [B, V]
+    const float *__restrict__ x,        // [B, H]
+    const T *__restrict__ w,            // [V, H] (row-major), bf16
+    const float *__restrict__ rms_w,    // [H]
+    const int *__restrict__ pos,        // [B]
+    const float *__restrict__ inv_rms,  // [B]
+    int H, int V, int batch_size) {
   // Thread / warp identifiers
-  const int tid  = threadIdx.x;
+  const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;
+  const int wid = tid >> 6; // wavefront id within block
+
+  // Allow flexible block sizes: TM_local = warps per block
+  const int TM_local = blockDim.x / WF_SIZE;
 
   const int row_block = blockIdx.x;
-  const int row = row_block * TM + wid; // one warp -> one output row
+  const int row = row_block * TM_local + wid; // one warp -> one output row
   const int b = blockIdx.y;
 
-  if (b >= batch_size || pos[b] < 0) return;
-  if (wid >= TM || row >= V) return;
+  if (b >= batch_size || pos[b] < 0)
+    return;
+  if (wid >= TM_local || row >= V)
+    return;
 
   // Pointers for this batch sample
-  const float* __restrict__ x_b = x + (size_t)b * H;
-  float* __restrict__ y_b = y + (size_t)b * V;
+  const float *__restrict__ x_b = x + (size_t)b * H;
+  float *__restrict__ y_b = y + (size_t)b * V;
 
-  // --- Phase 1: compute inv_rms = 1 / sqrt(mean(x^2)) ---
-  float sum_sq = 0.f;
-  for (int k = tid; k < H; k += BLOCK_SIZE) {
-    float v = x_b[k];
-    sum_sq = fmaf(v, v, sum_sq);
-  }
-  // warp reduce
-  #pragma unroll
-  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
-    sum_sq += __shfl_down(sum_sq, off, WF_SIZE);
-  }
+  // inv_rms provided per sample
+  const float inv = inv_rms[b];
 
-  __shared__ float warp_sums[BLOCK_SIZE / WF_SIZE];
-  if (lane == 0) {
-    warp_sums[wid] = sum_sq;
-  }
-  __syncthreads();
-  float total = 0.f;
-  if (tid < (BLOCK_SIZE / WF_SIZE)) {
-    total = warp_sums[tid];
-  }
-  // reduce first warp
-  if (wid == 0) {
-    #pragma unroll
-    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
-      total += __shfl_down(total, off, WF_SIZE);
-    }
-  }
-  // Broadcast inv_rms via lane 0 of warp 0
-  __shared__ float s_inv_rms;
-  if (tid == 0) {
-    float mean_sq = total / (float)H;
-    s_inv_rms = rsqrtf(fmaxf(mean_sq, 1e-12f));
-  }
-  __syncthreads();
-
-  // --- Phase 2: dot(W[row, :], (x * inv_rms * rms_w)) ---
-  // Use two LDS buffers for x tiles
-  __shared__ float lds_x0[TK + LDS_PAD];
-  __shared__ float lds_x1[TK + LDS_PAD];
+  // --- Dot(W[row, :], (x * inv * rms_w)) ---
+  // Two LDS buffers for x tiles (local size to avoid global TK changes)
+  constexpr int TK_LOCAL = 256;
+  __shared__ __align__(16) float lds_x0[TK_LOCAL + LDS_PAD];
+  __shared__ __align__(16) float lds_x1[TK_LOCAL + LDS_PAD];
 
   float acc_all = 0.f;
 
@@ -482,20 +454,20 @@ void fused_rmsnorm_matmul_batch_kernel(
   int k_base = 0;
   int cur = 0;
   {
-    const int k_size = min(TK, H - k_base);
-    for (int k = tid; k < k_size; k += BLOCK_SIZE) {
-      float xv = x_b[k_base + k] * s_inv_rms * rms_w[k_base + k];
+    const int k_size = min(TK_LOCAL, H - k_base);
+    for (int k = tid; k < k_size; k += blockDim.x) {
+      float xv = x_b[k_base + k] * inv * rms_w[k_base + k];
       lds_x0[k] = xv;
     }
     __syncthreads();
   }
 
   while (k_base < H) {
-    const int k_size = min(TK, H - k_base);
-    const float* __restrict__ lds_cur = (cur == 0 ? lds_x0 : lds_x1);
+    const int k_size = min(TK_LOCAL, H - k_base);
+    const float *__restrict__ lds_cur = (cur == 0 ? lds_x0 : lds_x1);
 
     // Prepare weight row pointer for this tile
-    const T* __restrict__ w_row_g = w + (size_t)row * (size_t)H + k_base;
+    const T *__restrict__ w_row_g = w + (size_t)row * (size_t)H + k_base;
 
     // Accumulate partial dot for this warp's row
     float acc = 0.f;
@@ -564,21 +536,22 @@ void fused_rmsnorm_matmul_batch_kernel(
     }
 
     // Warp reduce
-    #pragma unroll
+#pragma unroll
     for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
       acc += __shfl_down(acc, off, WF_SIZE);
     }
-    if (lane == 0) acc_all += acc;
+    if (lane == 0)
+      acc_all += acc;
     __syncthreads();
 
     // Prefetch next tile if any
     k_base += k_size;
     cur ^= 1;
     if (k_base < H) {
-      const int k_next = min(TK, H - k_base);
-      float* __restrict__ lds_nxt = (cur == 0 ? lds_x0 : lds_x1);
-      for (int k = tid; k < k_next; k += BLOCK_SIZE) {
-        float xv = x_b[k_base + k] * s_inv_rms * rms_w[k_base + k];
+      const int k_next = min(TK_LOCAL, H - k_base);
+      float *__restrict__ lds_nxt = (cur == 0 ? lds_x0 : lds_x1);
+      for (int k = tid; k < k_next; k += blockDim.x) {
+        float xv = x_b[k_base + k] * inv * rms_w[k_base + k];
         lds_nxt[k] = xv;
       }
       __syncthreads();
@@ -588,6 +561,51 @@ void fused_rmsnorm_matmul_batch_kernel(
   // Store
   if (lane == 0) {
     y_b[row] = acc_all;
+  }
+}
+
+// Compute per-sample inv_rms = rsqrt(mean(x^2) + eps)
+__global__ void compute_inv_rms_batch_kernel(
+    float *__restrict__ out_inv, const float *__restrict__ x,
+    const int *__restrict__ pos, int H, int batch_size) {
+  const int b = blockIdx.y;
+  if (b >= batch_size)
+    return;
+  if (pos[b] < 0) {
+    if (threadIdx.x == 0)
+      out_inv[b] = 0.0f;
+    return;
+  }
+
+  const float *__restrict__ xb = x + (size_t)b * H;
+  float sum = 0.f;
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    float v = xb[i];
+    sum = fmaf(v, v, sum);
+  }
+  // warp reduce
+  #pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    sum += __shfl_down(sum, off, WF_SIZE);
+  }
+  __shared__ float warp_sums[1024 / WF_SIZE];
+  const int lane = threadIdx.x & (WF_SIZE - 1);
+  const int wid = threadIdx.x >> 6;
+  if (lane == 0)
+    warp_sums[wid] = sum;
+  __syncthreads();
+  float total = 0.f;
+  if (wid == 0) {
+    const int nwarps = blockDim.x / WF_SIZE;
+    total = (threadIdx.x < nwarps) ? warp_sums[threadIdx.x] : 0.f;
+    #pragma unroll
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+      total += __shfl_down(total, off, WF_SIZE);
+    }
+    if (lane == 0) {
+      float mean_sq = total / (float)H;
+      out_inv[b] = rsqrtf(mean_sq + 1e-5f);
+    }
   }
 }
 
