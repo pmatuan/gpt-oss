@@ -2,23 +2,16 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <math.h>
-#include <type_traits>
 
 typedef hip_bfloat16 bf16_t;
 
 // ============================ Configuration ============================
-// K tile (reduction) — 512 làm việc tốt trên MI250 cho H/N lớn
 #define TK 512
-// Số warp tạo ra các hàng output trong 1 block
 #define TM 8
-// Threads per block (8 warps)
 #define BLOCK_SIZE 512
-// Padding để tránh LDS bank conflict
 #define LDS_PAD 16
-// AMD wavefront size
 #define WF_SIZE 64
 
-// Batch tile (số cột của Y tính trong 1 block). 4 cân bằng giữa LDS và registers.
 #define BATCH_TILE_DEFAULT 4
 #define BATCH_TILE_LIGHT   2   // dùng cho kernel có nhiều truy cập W phụ thuộc batch (MoE)
 
