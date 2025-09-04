@@ -39,6 +39,11 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
 
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
+// GEMM grid dimension function for processing multiple batch items simultaneously
+inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile = 4) { 
+  return dim3((d + TM - 1) / TM, (batch_size + batch_tile - 1) / batch_tile, 1); 
+}
+
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
                                                  const int *tokens,
                                                  const int *pos, int batch_size,

@@ -596,11 +596,12 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   for (int l = 0; l < L; ++l) {
     const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV = get_gemv_grid_dim(QKV_D);
-    // Batched QKV projection (RMSNorm + MatMul + Bias)
+    // Batched QKV projection (RMSNorm + MatMul + Bias) - GEMM version
     {
-      PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_bias_batch_kernel", 0);
-      dim3 gridQKV_batch(gridQKV.x, batch_size, 1);
-      fused_rmsnorm_matmul_bias_batch_kernel<bf16_t><<<gridQKV_batch, block, 0>>>(
+      PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_bias_gemm_kernel", 0);
+      constexpr int BATCH_TILE = 2;
+      dim3 gridQKV_gemm = get_gemm_grid_dim(QKV_D, batch_size, BATCH_TILE);
+      fused_rmsnorm_matmul_bias_gemm_kernel<bf16_t><<<gridQKV_gemm, block, 0>>>(
           ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_x,
           ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
           ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D,
@@ -646,13 +647,13 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           L * S * KV, batch_size);
     }
 
-    // Output projection + residual (batched)
+    // Output projection + residual (batched) - GEMM version
     {
-      PROFILE_GPU_SCOPE("fused_matmul_bias_residual_batch_kernel", 0);
+      PROFILE_GPU_SCOPE("fused_matmul_bias_residual_gemm_kernel", 0);
       const int O_N = D * Hq;
-      dim3 gridO = get_gemv_grid_dim(H);
-      dim3 gridO_batch(gridO.x, batch_size, 1);
-      fused_matmul_bias_residual_batch_kernel<bf16_t><<<gridO_batch, block, 0>>>(
+      constexpr int BATCH_TILE = 2;
+      dim3 gridO_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
+      fused_matmul_bias_residual_gemm_kernel<bf16_t><<<gridO_gemm, block, 0>>>(
           ctx.gpu_activations.d_x, ctx.gpu_activations.d_tb,
           ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
           ctx.gpu_weights_fp32.d_b_o + l * H, ctx.gpu_activations.d_pos, O_N, H,
@@ -670,10 +671,10 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     }
 
     {
-      PROFILE_GPU_SCOPE("matmul_bias_batch_kernel", 0);
-      dim3 gridE_batch = get_gemv_grid_dim(E);
-      gridE_batch.y = batch_size;
-      matmul_bias_batch_kernel<float><<<gridE_batch, block, 0>>>(
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
+      constexpr int BATCH_TILE = 8; // Use larger tile for smaller matrices
+      dim3 gridE_gemm = get_gemm_grid_dim(E, batch_size, BATCH_TILE);
+      matmul_bias_gemm_kernel<float><<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
           ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
           ctx.gpu_weights_fp32.d_b_router + l * E, ctx.gpu_activations.d_pos, H,
@@ -696,10 +697,10 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
     for (int kk = 0; kk < p->experts_per_token; ++kk) {
       {
-        PROFILE_GPU_SCOPE("mlp1_fused_batch_kernel", 0);
-        dim3 gridIM_batch = get_gemv_grid_dim(IM);
-        gridIM_batch.y = batch_size;
-        mlp1_fused_batch_kernel<bf16_t><<<gridIM_batch, block, 0>>>(
+        PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
+        constexpr int BATCH_TILE = 2;
+        dim3 gridIM_gemm = get_gemm_grid_dim(IM, batch_size, BATCH_TILE);
+        mlp1_fused_gemm_kernel<bf16_t><<<gridIM_gemm, block, 0>>>(
             ctx.gpu_activations.d_gate_up, ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
             ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos, kk, l, E, H,
@@ -707,10 +708,10 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       }
 
       {
-        PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_batch_kernel", 0);
-        dim3 gridHB_batch = get_gemv_grid_dim(H);
-        gridHB_batch.y = batch_size;
-        mlp2_bias_weighted_accum_batch_kernel<bf16_t><<<gridHB_batch, block, 0>>>(
+        PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
+        constexpr int BATCH_TILE = 2;
+        dim3 gridHB_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
+        mlp2_bias_weighted_accum_gemm_kernel<bf16_t><<<gridHB_gemm, block, 0>>>(
             ctx.gpu_activations.d_e_agg, ctx.gpu_activations.d_gate_up,
             ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.gpu_expert_bias.g_b_mlp2,
             ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_topk_v,
@@ -740,13 +741,14 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           ctx.gpu_activations.d_pos, H, batch_size);
     }
 
-    // 2) Fused (rmsnorm scale + matmul) for logits
+    // 2) Fused (rmsnorm scale + matmul) for logits - GEMM version
     {
-      PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_batch_kernel", 0);
+      PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_gemm_kernel", 0);
       dim3 block_logits(1024, 1, 1); // 16 warps -> 16 rows per block
       const int TM_logits = block_logits.x / WF_SIZE;
-      dim3 gridV_batch((V + TM_logits - 1) / TM_logits, batch_size, 1);
-      fused_rmsnorm_matmul_batch_kernel<bf16_t><<<gridV_batch, block_logits, 0>>>(
+      constexpr int BATCH_TILE = 4;
+      dim3 gridV_gemm((V + TM_logits - 1) / TM_logits, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
+      fused_rmsnorm_matmul_gemm_kernel<bf16_t><<<gridV_gemm, block_logits, 0>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
           ctx.gpu_weights_bf16.d_out_bf16, ctx.gpu_weights_fp32.d_rms_out_w,
           ctx.gpu_activations.d_pos, ctx.gpu_activations.d_inv_rms, H, V,
