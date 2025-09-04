@@ -410,7 +410,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
       float* eB = e_agg + (size_t)b_idx[bi] * H;
       const size_t bbase = ((size_t)l_layer * E + expert_id[bi]) * (size_t)H;
       float out = v + b_mlp2_all[bbase + row];
-      atomicAdd(&eB[row], out * expert_w[bi]);
+      eB[row] += out * expert_w[bi];
     }
   }
 }
