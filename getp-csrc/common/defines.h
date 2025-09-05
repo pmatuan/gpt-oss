@@ -31,10 +31,6 @@ typedef hip_bfloat16 bf16_t;
     }                                                                          \
   } while (0)
 
-// Forward declarations
-struct Config;
-struct Sampler;
-
 // GPU Buffer Structures
 struct GPUActivationBuffers {
   float *d_x, *d_t, *d_tb, *d_tb2;

@@ -24,7 +24,7 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
 // GEMM grid dimension function for processing multiple batch items simultaneously
-inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile = 4) { 
+inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile) { 
   return dim3((d + TM - 1) / TM, (batch_size + batch_tile - 1) / batch_tile, 1); 
 }
 
@@ -299,14 +299,13 @@ __global__ void fused_topk_softmax_batch_kernel(
   }
 }
 
-static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
-                                     bf16_t *d_dst, int n_streams,
-                                     size_t chunk_bytes) {
-  if (count == 0)
+void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
+                               int n_streams, size_t chunk_bytes) {
+  if (n == 0)
     return;
 
   const size_t chunk_elems = chunk_bytes / sizeof(bf16_t);
-  const size_t actual_chunk_elems = (chunk_elems > count) ? count : chunk_elems;
+  const size_t actual_chunk_elems = (chunk_elems > n) ? n : chunk_elems;
 
   hipStream_t *streams = nullptr;
   hipEvent_t *events = nullptr;
@@ -388,12 +387,12 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     HIP_CHECK(
         hipHostMalloc((void **)&h_chunk, SYNC_CHUNK_ELEMS * sizeof(bf16_t)));
     size_t done = 0;
-    while (done < count) {
+    while (done < n) {
       size_t todo =
-          (count - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (count - done);
+          (n - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (n - done);
       for (size_t i = 0; i < todo; ++i)
-        h_chunk[i] = hip_bfloat16(h_src[done + i]);
-      HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t),
+        h_chunk[i] = hip_bfloat16(src[done + i]);
+      HIP_CHECK(hipMemcpy(dst + done, h_chunk, todo * sizeof(bf16_t),
                           hipMemcpyHostToDevice));
       done += todo;
     }
@@ -407,9 +406,9 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
   for (int i = 0; i < n_streams; i++)
     buffer_ready[i] = true;
 
-  while (done < count) {
-    size_t todo = (count - done > actual_chunk_elems) ? actual_chunk_elems
-                                                      : (count - done);
+  while (done < n) {
+    size_t todo = (n - done > actual_chunk_elems) ? actual_chunk_elems
+                                                      : (n - done);
     if (!buffer_ready[stream_idx]) {
       HIP_CHECK(hipEventSynchronize(events[stream_idx]));
       buffer_ready[stream_idx] = true;
@@ -417,9 +416,9 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     bf16_t *chunk = pinned_chunks[stream_idx];
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < todo; ++i)
-      chunk[i] = hip_bfloat16(h_src[done + i]);
+      chunk[i] = hip_bfloat16(src[done + i]);
 
-    HIP_CHECK(hipMemcpyAsync(d_dst + done, chunk, todo * sizeof(bf16_t),
+    HIP_CHECK(hipMemcpyAsync(dst + done, chunk, todo * sizeof(bf16_t),
                              hipMemcpyHostToDevice, streams[stream_idx]));
     HIP_CHECK(hipEventRecord(events[stream_idx], streams[stream_idx]));
     buffer_ready[stream_idx] = false;
