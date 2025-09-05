@@ -18,7 +18,6 @@ typedef hip_bfloat16 bf16_t;
 
 // Batch Processing Constants
 #define BATCH_TILE_DEFAULT 4
-#define BATCH_TILE_LIGHT 2
 
 // HIP Error Checking Macro
 #define HIP_CHECK(call)                                                        \

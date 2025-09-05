@@ -165,245 +165,207 @@ void matmul_bias_gemm_kernel(
   }
 }
 
-// ================= MLP1 (Gate & Up) : all-topk, single launch =================
+// ================= MLP1 (Gate & Up) : per-batch, no CB =================
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up_topk, // [K, B, IM]  (K=experts_per_token)
+    float* __restrict__ gate_up_topk, // [K, B, IM] (K = experts_per_token)
     const float* __restrict__ x,      // [B, H]
-    const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H]
-    const float* __restrict__ b_mlp1_all, // [L, E, 2*IM]
+    const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
+    const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
     const int* __restrict__ topk_i,   // [B, K]
-    const int* __restrict__ pos,      // [B]
+    const int* __restrict__ pos,      // [B] (inactive: pos[b] < 0)
     int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size, int experts_per_token)
 {
-  constexpr int CB = BATCH_TILE_LIGHT;
-  __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
-  __shared__ int shared_expert_id[CB];
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD]; // one column (this b)
+  __shared__ int s_expert_id;
 
   const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;
+  const int wid  = tid >> 6;          // warp id in block
 
-  const int i    = blockIdx.x * TM + wid;  // output index in IM
-  const int b0   = blockIdx.y * CB;
-  const int k_index = blockIdx.z;          // <--- lấy kk từ grid.z
+  const int i    = blockIdx.x * TM + wid;   // output row in IM (0..IM-1)
+  const int b    = blockIdx.y;              // batch index
+  const int kidx = blockIdx.z;              // expert index per token
 
-  if (wid >= TM || i >= IM || k_index >= experts_per_token) return;
+  if (wid >= TM || i >= IM || b >= batch_size || kidx >= experts_per_token)
+    return;
+  if (pos[b] < 0) return; // inactive slot
 
-  int b_idx[CB]; bool b_valid[CB];
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    b_idx[bi]   = b0 + bi;
-    b_valid[bi] = (b_idx[bi] < batch_size) && (pos[b_idx[bi]] >= 0);
-    if (tid == 0 && b_valid[bi]) {
-      const int* tk = topk_i + (size_t)b_idx[bi] * experts_per_token;
-      shared_expert_id[bi] = tk[k_index];
-    } else if (tid == 0) {
-      shared_expert_id[bi] = -1;
-    }
+  // expert id for this (b, kidx)
+  if (tid == 0) {
+    s_expert_id = topk_i[(size_t)b * experts_per_token + kidx];
   }
   __syncthreads();
+  if (s_expert_id < 0) return;
 
-  float acc_gate[CB], acc_up[CB];
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) { acc_gate[bi] = 0.f; acc_up[bi] = 0.f; }
+  float acc_gate = 0.f, acc_up = 0.f;
 
+  // K loop over H, loading x[b, k_base : k_base+k_size) once per block
   for (int k_base = 0; k_base < H; k_base += TK) {
     const int k_size = min(TK, H - k_base);
 
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) {
-      if (b_valid[bi]) {
-        const float* xb = x + (size_t)b_idx[bi] * H + k_base;
-        for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = xb[k];
-      } else {
-        for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = 0.f;
-      }
+    // vectorized load x[b] -> shared
+    const float* __restrict__ xb = x + (size_t)b * H + k_base;
+    // vec4 part
+    const int vec4 = (k_size >> 2);
+    float4* __restrict__ s4 = reinterpret_cast<float4*>(lds_x);
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xb);
+    for (int v = tid; v < vec4; v += BLOCK_SIZE) { s4[v] = x4[v]; }
+    // tail
+    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = xb[k];
     }
     __syncthreads();
 
-    // Process gate and up weights together for better cache utilization
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) {
-      if (!b_valid[bi] || shared_expert_id[bi] < 0) continue;
+    // weights layout:
+    // base = ((l * E + expert) * (2*IM)) * H + (2*i + {0,1}) * H + k_base
+    const size_t base_2im = ((size_t)l_layer * (size_t)E + (size_t)s_expert_id) * (size_t)(2 * IM);
+    const size_t gate_off = ((base_2im + (size_t)(2 * i + 0)) * (size_t)H) + (size_t)k_base;
+    const size_t up_off   = ((base_2im + (size_t)(2 * i + 1)) * (size_t)H) + (size_t)k_base;
 
-      const size_t base = ((size_t)l_layer * E + shared_expert_id[bi]) * (size_t)(2 * IM);
-      const size_t gate_off = (base + (size_t)(2 * i + 0)) * (size_t)H + k_base;
-      const size_t up_off   = (base + (size_t)(2 * i + 1)) * (size_t)H + k_base;
+    const uint2* __restrict__ gate_q = reinterpret_cast<const uint2*>(w_mlp1_all + gate_off);
+    const uint2* __restrict__  up_q  = reinterpret_cast<const uint2*>(w_mlp1_all + up_off);
 
-      // Combined GEMM for gate and up to reduce redundant work
-      const bf16_t* gate_weights = w_mlp1_all + gate_off;
-      const bf16_t* up_weights = w_mlp1_all + up_off;
-      
-      // Vector processing with double buffering
-      const uint2* gate_q = reinterpret_cast<const uint2*>(gate_weights);
-      const uint2* up_q = reinterpret_cast<const uint2*>(up_weights);
-      
-      const int vec4 = (k_size / 4) * 4;
-      for (int k = lane * 4; k < vec4; k += WF_SIZE * 4) {
-        const float4 gate_wv = bf16quad_to_float4(gate_q[k >> 2]);
-        const float4 up_wv = bf16quad_to_float4(up_q[k >> 2]);
-        const float4 xv = *reinterpret_cast<const float4*>(&lds_x[bi][k]);
-        
-        acc_gate[bi] = fmaf(gate_wv.x, xv.x, acc_gate[bi]);
-        acc_gate[bi] = fmaf(gate_wv.y, xv.y, acc_gate[bi]);
-        acc_gate[bi] = fmaf(gate_wv.z, xv.z, acc_gate[bi]);
-        acc_gate[bi] = fmaf(gate_wv.w, xv.w, acc_gate[bi]);
-        
-        acc_up[bi] = fmaf(up_wv.x, xv.x, acc_up[bi]);
-        acc_up[bi] = fmaf(up_wv.y, xv.y, acc_up[bi]);
-        acc_up[bi] = fmaf(up_wv.z, xv.z, acc_up[bi]);
-        acc_up[bi] = fmaf(up_wv.w, xv.w, acc_up[bi]);
-      }
-      
-      // Handle remainder
-      for (int k = vec4 + lane; k < k_size; k += WF_SIZE) {
-        uint32_t gate_u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&gate_weights[k]))) << 16;
-        uint32_t up_u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&up_weights[k]))) << 16;
-        union { uint32_t u; float f; } gate_cvt, up_cvt;
-        gate_cvt.u = gate_u; up_cvt.u = up_u;
-        
-        acc_gate[bi] = fmaf(gate_cvt.f, lds_x[bi][k], acc_gate[bi]);
-        acc_up[bi] = fmaf(up_cvt.f, lds_x[bi][k], acc_up[bi]);
-      }
+    // vector compute (4 bf16 weights at a time)
+    const int vec4k = (k_size >> 2);
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 w_gate = bf16quad_to_float4(gate_q[v]);
+      const float4 w_up   = bf16quad_to_float4(up_q[v]);
+      const float4 xv     = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
+      acc_gate = fmaf(w_gate.x, xv.x, acc_gate);
+      acc_gate = fmaf(w_gate.y, xv.y, acc_gate);
+      acc_gate = fmaf(w_gate.z, xv.z, acc_gate);
+      acc_gate = fmaf(w_gate.w, xv.w, acc_gate);
+
+      acc_up   = fmaf(w_up.x,   xv.x, acc_up);
+      acc_up   = fmaf(w_up.y,   xv.y, acc_up);
+      acc_up   = fmaf(w_up.z,   xv.z, acc_up);
+      acc_up   = fmaf(w_up.w,   xv.w, acc_up);
+    }
+    // tail pairs/singles
+    const int tail_start = vec4k << 2;
+    for (int k = tail_start + lane; k < k_size; k += WF_SIZE) {
+      // bf16 -> f32 (single)
+      uint32_t ug = ((uint32_t)(*reinterpret_cast<const uint16_t*>(
+                        (w_mlp1_all + gate_off + k)))) << 16;
+      uint32_t uu = ((uint32_t)(*reinterpret_cast<const uint16_t*>(
+                        (w_mlp1_all + up_off   + k)))) << 16;
+      union { uint32_t u; float f; } cg, cu; cg.u = ug; cu.u = uu;
+      acc_gate = fmaf(cg.f, lds_x[k], acc_gate);
+      acc_up   = fmaf(cu.f, lds_x[k], acc_up);
     }
     __syncthreads();
   }
 
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    float g = warp_reduce_sum(acc_gate[bi]);
-    float u = warp_reduce_sum(acc_up[bi]);
-    if (lane == 0 && b_valid[bi] && shared_expert_id[bi] >= 0) {
-      const size_t base = ((size_t)l_layer * E + shared_expert_id[bi]) * (size_t)(2 * IM);
-      float gate = g + b_mlp1_all[base + (size_t)(2 * i + 0)];
-      float up   = u + b_mlp1_all[base + (size_t)(2 * i + 1)];
+  // warp reduce per output
+  acc_gate = warp_reduce_sum(acc_gate);
+  acc_up   = warp_reduce_sum(acc_up);
 
-      // Optimized clipping using fast math
-      gate = __saturatef((gate + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
-      up = __saturatef((up + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
+  if (lane == 0) {
+    const size_t b_gate_base = ((size_t)l_layer * (size_t)E + (size_t)s_expert_id) * (size_t)(2 * IM);
+    float gate = acc_gate + b_mlp1_all[b_gate_base + (size_t)(2 * i + 0)];
+    float up   = acc_up   + b_mlp1_all[b_gate_base + (size_t)(2 * i + 1)];
 
-      // Fast SwiGLU approximation
-      const float alpha = 1.702f;
-      gate = gate * __saturatef(0.5f + 0.5f * tanhf(alpha * gate / 2.0f));
-      gate = gate * (up + 1.0f);
+    // clip + SwiGLU-ish (như bản bạn đang dùng)
+    gate = __saturatef((gate + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
+    up   = __saturatef((up   + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
+    const float alpha = 1.702f;
+    gate = gate * __saturatef(0.5f + 0.5f * tanhf(alpha * gate * 0.5f));
+    gate = gate * (up + 1.0f);
 
-      // write to [K, B, IM]
-      float* gu = gate_up_topk + (((size_t)k_index * (size_t)batch_size + (size_t)b_idx[bi]) * (size_t)IM);
-      gu[i] = gate;
-    }
+    float* __restrict__ gu = gate_up_topk + (((size_t)kidx * (size_t)batch_size + (size_t)b) * (size_t)IM);
+    gu[i] = gate;
   }
 }
 
 
-// ================= MLP2 (weighted accum) : all-topk, single launch ============
+// ============ MLP2 (weighted accum) : per-batch, no CB ==============
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void mlp2_bias_weighted_accum_gemm_kernel(
-    float* __restrict__ e_agg,         // [B, H]
+    float* __restrict__ e_agg,              // [B, H] (accumulator)
     const float* __restrict__ gate_up_topk, // [K, B, IM]
     const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
     const float* __restrict__ b_mlp2_all,   // [L, E, H]
-    const int* __restrict__ topk_i,    // [B, K]
-    const float* __restrict__ topk_v,  // [B, K]
-    const int* __restrict__ pos,       // [B]
+    const int* __restrict__ topk_i,         // [B, K]
+    const float* __restrict__ topk_v,       // [B, K]
+    const int* __restrict__ pos,            // [B]
     int l_layer, int E, int IM, int H,
     int batch_size, int experts_per_token)
 {
-  constexpr int CB = BATCH_TILE_LIGHT;
-  __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
-  __shared__ int shared_expert_id[CB];
-  __shared__ float shared_expert_w[CB];
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD]; // one column (this b,k)
+  __shared__ int   s_expert_id;
+  __shared__ float s_expert_w;
 
   const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
   const int wid  = tid >> 6;
 
-  const int row     = blockIdx.x * TM + wid; // output H row
-  const int b0      = blockIdx.y * CB;
-  const int k_index = blockIdx.z;            // <--- lấy kk từ grid.z
+  const int row  = blockIdx.x * TM + wid;   // output H row
+  const int b    = blockIdx.y;              // batch index
+  const int kidx = blockIdx.z;              // expert index per token
 
-  if (wid >= TM || row >= H || k_index >= experts_per_token) return;
+  if (wid >= TM || row >= H || b >= batch_size || kidx >= experts_per_token)
+    return;
+  if (pos[b] < 0) return;
 
-  int b_idx[CB]; bool b_valid[CB];
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    b_idx[bi]   = b0 + bi;
-    b_valid[bi] = (b_idx[bi] < batch_size) && (pos[b_idx[bi]] >= 0);
-    if (tid == 0 && b_valid[bi]) {
-      const int* ti = topk_i + (size_t)b_idx[bi] * experts_per_token;
-      const float* tv = topk_v + (size_t)b_idx[bi] * experts_per_token;
-      shared_expert_id[bi] = ti[k_index];
-      shared_expert_w[bi] = tv[k_index];
-    } else if (tid == 0) {
-      shared_expert_id[bi] = -1;
-      shared_expert_w[bi] = 0.f;
-    }
+  // expert id & weight for this (b,kidx)
+  if (tid == 0) {
+    s_expert_id = topk_i[(size_t)b * experts_per_token + kidx];
+    s_expert_w  = topk_v[(size_t)b * experts_per_token + kidx];
   }
   __syncthreads();
+  if (s_expert_id < 0 || s_expert_w == 0.f) return;
 
-  float acc_row[CB]; for (int bi = 0; bi < CB; ++bi) acc_row[bi] = 0.f;
+  float acc = 0.f;
 
+  // K loop over IM, loading gate_up_topk[kidx, b, :] into shared
   for (int k_base = 0; k_base < IM; k_base += TK) {
     const int k_size = min(TK, IM - k_base);
 
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) {
-      if (b_valid[bi]) {
-        const float* xb = gate_up_topk
-                        + (((size_t)k_index * (size_t)batch_size + (size_t)b_idx[bi]) * (size_t)IM + (size_t)k_base);
-        for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = xb[k];
-      } else {
-        for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = 0.f;
-      }
+    const float* __restrict__ xb =
+        gate_up_topk + (((size_t)kidx * (size_t)batch_size + (size_t)b) * (size_t)IM + (size_t)k_base);
+
+    // vectorized load to shared
+    const int vec4 = (k_size >> 2);
+    float4* __restrict__ s4 = reinterpret_cast<float4*>(lds_x);
+    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xb);
+    for (int v = tid; v < vec4; v += BLOCK_SIZE) { s4[v] = x4[v]; }
+    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = xb[k];
     }
     __syncthreads();
 
-    // Optimized weight loading and computation
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) {
-      if (!b_valid[bi] || shared_expert_id[bi] < 0) continue;
+    // weight row: w[l, expert, row, k_base: ]
+    const size_t base = ((size_t)l_layer * (size_t)E + (size_t)s_expert_id) * (size_t)H * (size_t)IM;
+    const bf16_t* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
 
-      const size_t base = ((size_t)l_layer * E + shared_expert_id[bi]) * (size_t)H * (size_t)IM;
-      const bf16_t* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
-
-      // Optimized GEMM with better vectorization
-      const uint2* __restrict__ wq = reinterpret_cast<const uint2*>(w_row);
-      const int vec4 = (k_size / 4) * 4;
-
-      // Vector loop for better memory throughput
-      for (int k = lane * 4; k < vec4; k += WF_SIZE * 4) {
-        const float4 wv = bf16quad_to_float4(wq[k >> 2]);
-        const float4 xv = *reinterpret_cast<const float4*>(&lds_x[bi][k]);
-        acc_row[bi] = fmaf(wv.x, xv.x, acc_row[bi]);
-        acc_row[bi] = fmaf(wv.y, xv.y, acc_row[bi]);
-        acc_row[bi] = fmaf(wv.z, xv.z, acc_row[bi]);
-        acc_row[bi] = fmaf(wv.w, xv.w, acc_row[bi]);
-      }
-      
-      // Handle remainder
-      for (int k = vec4 + lane; k < k_size; k += WF_SIZE) {
-        uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
-        union { uint32_t u; float f; } cvt; cvt.u = u;
-        acc_row[bi] = fmaf(cvt.f, lds_x[bi][k], acc_row[bi]);
-      }
+    // vector compute
+    const uint2* __restrict__ wq = reinterpret_cast<const uint2*>(w_row);
+    const int vec4k = (k_size >> 2);
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 wv = bf16quad_to_float4(wq[v]);
+      const float4 xv = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
+      acc = fmaf(wv.x, xv.x, acc);
+      acc = fmaf(wv.y, xv.y, acc);
+      acc = fmaf(wv.z, xv.z, acc);
+      acc = fmaf(wv.w, xv.w, acc);
+    }
+    // tail
+    for (int k = (vec4k << 2) + lane; k < k_size; k += WF_SIZE) {
+      uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
+      union { uint32_t u; float f; } cvt; cvt.u = u;
+      acc = fmaf(cvt.f, lds_x[k], acc);
     }
     __syncthreads();
   }
 
-  // Use local reduction to minimize atomicAdd contention
-  __shared__ float warp_results[CB][WF_SIZE / 32]; // Reduce warps per batch
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    float v = warp_reduce_sum(acc_row[bi]);
-    if (lane == 0 && b_valid[bi] && shared_expert_id[bi] >= 0) {
-      float out = v + b_mlp2_all[ ((size_t)l_layer * (size_t)E + (size_t)shared_expert_id[bi]) * (size_t)H + (size_t)row ];
-      float contrib = out * shared_expert_w[bi];
-      
-      // Use faster atomic operations for better performance
-      atomicAdd(e_agg + (size_t)b_idx[bi] * (size_t)H + (size_t)row, contrib);
-    }
+  // reduce and write once (1 atomic per (b,row) per expert)
+  acc = warp_reduce_sum(acc);
+  if (lane == 0) {
+    const size_t b_mlp2_base = ((size_t)l_layer * (size_t)E + (size_t)s_expert_id) * (size_t)H;
+    float out = acc + b_mlp2_all[b_mlp2_base + (size_t)row];
+    float contrib = out * s_expert_w;
+    atomicAdd(e_agg + (size_t)b * (size_t)H + (size_t)row, contrib);
   }
 }
-
-
