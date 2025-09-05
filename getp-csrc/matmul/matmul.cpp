@@ -407,47 +407,6 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 }
 
 /**
- * Compute inv RMS per sample: inv_rms = rsqrt(mean(x^2)+eps)
- */
-__global__ void compute_inv_rms_batch_kernel(
-    float* __restrict__ out_inv,
-    const float* __restrict__ x,
-    const int* __restrict__ pos,
-    int H, int batch_size) {
-
-  const int b = blockIdx.y;
-  if (b >= batch_size) return;
-
-  if (pos[b] < 0) { if (threadIdx.x == 0) out_inv[b] = 0.0f; return; }
-
-  const float* xb = x + (size_t)b * H;
-
-  float sum = 0.f;
-  for (int i = threadIdx.x; i < H; i += blockDim.x) {
-    float v = xb[i]; sum = fmaf(v, v, sum);
-  }
-  sum = warp_reduce_sum(sum);
-
-  __shared__ float warp_sums[1024 / WF_SIZE];
-  const int lane = threadIdx.x & (WF_SIZE - 1);
-  const int wid  = threadIdx.x >> 6;
-
-  if (lane == 0) warp_sums[wid] = sum;
-  __syncthreads();
-
-  float total = 0.f;
-  if (wid == 0) {
-    const int num_warps = blockDim.x / WF_SIZE;
-    total = (threadIdx.x < num_warps) ? warp_sums[threadIdx.x] : 0.f;
-    total = warp_reduce_sum(total);
-    if (lane == 0) {
-      float mean_sq = total / (float)H;
-      out_inv[b] = rsqrtf(mean_sq + 1e-5f);
-    }
-  }
-}
-
-/**
  * y = (RMSNorm(x) * rms_w) @ W^T
  * x: [B,H], w:[V,H], y:[B,V], inv_rms:[B]
  */
