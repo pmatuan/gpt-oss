@@ -155,6 +155,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.capacity_B = 1;
   ctx.gpu_activations.d_tokens = nullptr;
   ctx.gpu_activations.d_pos = nullptr;
+  ctx.gpu_activations.d_inv_rms = nullptr;
 
   debug_print_gpu_memory("after activations", device_id);
 
@@ -403,7 +404,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_value_cache);
     FREE_IF(ctx.gpu_activations.d_att);
     FREE_IF(ctx.gpu_activations.d_logits);
-    FREE_IF(ctx.gpu_activations.d_inv_rms);
     // mask & token2row remain shared
     #undef FREE_IF
 
@@ -449,23 +449,32 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
 
     ctx.capacity_B = B;
   }
-  // inv_rms handled below to also cover B <= capacity_B case
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
+  // Allocate per-sample inv_rms buffer
+  if (need_realloc) {
+    if (ctx.gpu_activations.d_inv_rms) {
+      HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
+    }
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms,
+                        (size_t)B * sizeof(float)));
+  } else if (!ctx.gpu_activations.d_inv_rms) {
+    // First-time allocation when capacity already sufficient
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms,
+                        (size_t)ctx.capacity_B * sizeof(float)));
+  }
 
   // Tokens and positions (host-to-device each step)
-  if (!ctx.gpu_activations.d_tokens)
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
-  else {
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
-  }
-  if (!ctx.gpu_activations.d_pos)
+  if (need_realloc) {
+    if (ctx.gpu_activations.d_tokens) HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
+
+    if (ctx.gpu_activations.d_pos) HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
-  else {
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
+  } else {
+    if (!ctx.gpu_activations.d_tokens)
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)ctx.capacity_B * sizeof(int)));
+
+    if (!ctx.gpu_activations.d_pos)
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)ctx.capacity_B * sizeof(int)));
   }
 
   // Ensure we have at least B stream
@@ -785,6 +794,11 @@ static long long run_requests_on_device(Transformer *transformer,
   const int L = p->n_layers;
   const int S = p->seq_len;
   DeviceContext &dctx = g_devices[device_id];
+
+  // Clear K/V caches to avoid any stale data from previous runs
+  size_t kv_bytes = (size_t)B * L * S * KV * sizeof(float);
+  HIP_CHECK(hipMemset(dctx.gpu_activations.d_key_cache, 0, kv_bytes));
+  HIP_CHECK(hipMemset(dctx.gpu_activations.d_value_cache, 0, kv_bytes));
 
   // Temporary host buffer for batched logits
   const int V = p->vocab_size;
