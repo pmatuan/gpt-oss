@@ -1,34 +1,7 @@
-// matmul.cpp — GEMM-tiled, multi-batch per block (no per-batch matvec loops)
 #include "../common/defines.h"
+#include "../utility/utility.h"
 #include "matmul.h"
 #include <math.h>
-
-// ============================ Utility ============================
-
-__device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
-  union { uint32_t u; float f; } a, b;
-  a.u = (u & 0x0000FFFFu) << 16; // lower bf16 -> fp32
-  b.u = (u & 0xFFFF0000u);       // upper bf16 -> fp32
-  f0 = a.f;
-  f1 = b.f;
-}
-
-__device__ __forceinline__ float4 bf16quad_to_float4(uint2 u) {
-  float4 r;
-  bf16pair_to_float2(u.x, r.x, r.y);
-  bf16pair_to_float2(u.y, r.z, r.w);
-  return r;
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-#pragma unroll
-  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
-    v += __shfl_down(v, off, WF_SIZE);
-  }
-  return v;
-}
-
-// ======== Core inner: one weight row × CB batch columns (outer-product accumulate) ========
 
 template<int CB>
 __device__ __forceinline__ void gemm_row_tile_fp32_multiB(
@@ -107,8 +80,6 @@ __device__ __forceinline__ void gemm_row_tile_bf16_multiB(
     }
   }
 }
-
-// ============================ Main Kernel Functions ============================
 
 /**
  * Y = X @ W^T + B
@@ -616,7 +587,7 @@ void fused_rmsnorm_matmul_bias_gemm_kernel(
   float invr[CB];
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
-    invr[bi] = (b_valid[bi]) ? __frsqrt_rn(rms_sum[bi] / n + 1e-5f) : 0.f; // Use fast rsqrt
+    invr[bi] = (b_valid[bi]) ? __frsqrt_rn(rms_sum[bi] / n + 1e-5f) : 0.f;
   }
 
   float acc[CB]; for (int bi = 0; bi < CB; ++bi) acc[bi] = 0.f;
@@ -663,7 +634,7 @@ void fused_rmsnorm_matmul_bias_gemm_kernel(
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void fused_matmul_bias_residual_gemm_kernel(
-    float* __restrict__ x_out,   // (accumulates into x_out)
+    float* __restrict__ x_out,
     const float* __restrict__ y_in,
     const T* __restrict__ w,
     const float* __restrict__ b,

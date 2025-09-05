@@ -23,9 +23,31 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
 
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
-// GEMM grid dimension function for processing multiple batch items simultaneously
 inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile) { 
   return dim3((d + TM - 1) / TM, (batch_size + batch_tile - 1) / batch_tile, 1); 
+}
+
+__device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
+  union { uint32_t u; float f; } a, b;
+  a.u = (u & 0x0000FFFFu) << 16; // lower bf16 -> fp32
+  b.u = (u & 0xFFFF0000u);       // upper bf16 -> fp32
+  f0 = a.f;
+  f1 = b.f;
+}
+
+__device__ __forceinline__ float4 bf16quad_to_float4(uint2 u) {
+  float4 r;
+  bf16pair_to_float2(u.x, r.x, r.y);
+  bf16pair_to_float2(u.y, r.z, r.w);
+  return r;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    v += __shfl_down(v, off, WF_SIZE);
+  }
+  return v;
 }
 
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,

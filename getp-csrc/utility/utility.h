@@ -10,6 +10,10 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
 inline dim3 get_gemv_grid_dim(int d);
 inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile = BATCH_TILE_DEFAULT);
 
+__device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1);
+__device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
+__device__ __forceinline__ float warp_reduce_sum(float v);
+
 // Embedding and Data Movement Kernels
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
                                                  const int *tokens,

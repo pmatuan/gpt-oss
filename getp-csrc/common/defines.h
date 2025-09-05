@@ -45,7 +45,7 @@ struct GPUActivationBuffers {
   int *d_token2row;
   int *d_tokens;
   int *d_pos;
-  float *d_inv_rms; // [B]
+  float *d_inv_rms;
 };
 
 struct GPUWeightBuffersFP32 {
