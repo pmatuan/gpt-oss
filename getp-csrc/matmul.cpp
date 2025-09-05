@@ -206,33 +206,31 @@ void matmul_bias_gemm_kernel(
   }
 }
 
-/**
- * MLP1 (Gate & Up): per-token expert weights -> W phụ thuộc batch (ít reuse)
- * gate_up: [B, IM], x: [B, H], w_mlp1_all: [L,E,2*IM,H], b_mlp1_all: [L,E,2*IM]
- */
+// ================= MLP1 (Gate & Up) : all-topk, single launch =================
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up,
-    const float* __restrict__ x,
-    const T* __restrict__ w_mlp1_all,
-    const float* __restrict__ b_mlp1_all,
-    const int* __restrict__ topk_i,
-    const int* __restrict__ pos,
-    int k_index, int l_layer, int E, int H, int IM,
-    float swiglu_limit, int batch_size, int experts_per_token) {
-
-  // Do weights vary per batch -> dùng tile batch nhỏ để giữ register
+    float* __restrict__ gate_up_topk, // [K, B, IM]  (K=experts_per_token)
+    const float* __restrict__ x,      // [B, H]
+    const T* __restrict__ w_mlp1_all, // [L, E, 2*IM, H]
+    const float* __restrict__ b_mlp1_all, // [L, E, 2*IM]
+    const int* __restrict__ topk_i,   // [B, K]
+    const int* __restrict__ pos,      // [B]
+    int l_layer, int E, int H, int IM,
+    float swiglu_limit, int batch_size, int experts_per_token)
+{
   constexpr int CB = BATCH_TILE_LIGHT;
   __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
 
   const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
   const int wid  = tid >> 6;
-  const int i    = blockIdx.x * TM + wid; // output index in IM
-  const int b0   = blockIdx.y * CB;
 
-  if (wid >= TM || i >= IM) return;
+  const int i    = blockIdx.x * TM + wid;  // output index in IM
+  const int b0   = blockIdx.y * CB;
+  const int k_index = blockIdx.z;          // <--- lấy kk từ grid.z
+
+  if (wid >= TM || i >= IM || k_index >= experts_per_token) return;
 
   int b_idx[CB]; bool b_valid[CB];
   int expert_id[CB];
@@ -247,7 +245,6 @@ void mlp1_fused_gemm_kernel(
     }
   }
 
-  // Accumulators per batch: gate & up
   float acc_gate[CB], acc_up[CB];
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) { acc_gate[bi] = 0.f; acc_up[bi] = 0.f; }
@@ -255,7 +252,6 @@ void mlp1_fused_gemm_kernel(
   for (int k_base = 0; k_base < H; k_base += TK) {
     const int k_size = min(TK, H - k_base);
 
-    // Load X tiles once
 #pragma unroll
     for (int bi = 0; bi < CB; ++bi) {
       if (b_valid[bi]) {
@@ -267,19 +263,16 @@ void mlp1_fused_gemm_kernel(
     }
     __syncthreads();
 
-    // Với mỗi batch, W_gate/W_up khác nhau (MoE). Tính outer-product trên X đã share.
 #pragma unroll
     for (int bi = 0; bi < CB; ++bi) {
       if (!b_valid[bi] || expert_id[bi] < 0) continue;
 
-      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (2 * IM);
-      const size_t gate_off = (base + (2 * i + 0)) * (size_t)H + k_base;
-      const size_t up_off   = (base + (2 * i + 1)) * (size_t)H + k_base;
+      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)(2 * IM);
+      const size_t gate_off = (base + (size_t)(2 * i + 0)) * (size_t)H + k_base;
+      const size_t up_off   = (base + (size_t)(2 * i + 1)) * (size_t)H + k_base;
 
-      float* xptrs[1] = { lds_x[bi] }; // trick: reuse inner helpers with CB=1
-
-      // Gate
-      {
+      float* xptrs[1] = { lds_x[bi] };
+      { // Gate
         float tmp[1] = {0.f};
         if constexpr (std::is_same_v<T, bf16_t>) {
           gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + gate_off), xptrs, k_size, lane, tmp);
@@ -288,8 +281,7 @@ void mlp1_fused_gemm_kernel(
         }
         acc_gate[bi] += tmp[0];
       }
-      // Up
-      {
+      { // Up
         float tmp[1] = {0.f};
         if constexpr (std::is_same_v<T, bf16_t>) {
           gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + up_off), xptrs, k_size, lane, tmp);
@@ -302,55 +294,58 @@ void mlp1_fused_gemm_kernel(
     __syncthreads();
   }
 
-  // Reduce & write + bias + SwiGLU
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
     float g = warp_reduce_sum(acc_gate[bi]);
     float u = warp_reduce_sum(acc_up[bi]);
     if (lane == 0 && b_valid[bi] && expert_id[bi] >= 0) {
-      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (2 * IM);
-      float gate = g + b_mlp1_all[base + (2 * i + 0)];
-      float up   = u + b_mlp1_all[base + (2 * i + 1)];
+      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)(2 * IM);
+      float gate = g + b_mlp1_all[base + (size_t)(2 * i + 0)];
+      float up   = u + b_mlp1_all[base + (size_t)(2 * i + 1)];
+
       // clip
       gate = fminf(fmaxf(gate, -swiglu_limit), swiglu_limit);
       up   = fminf(fmaxf(up,   -swiglu_limit), swiglu_limit);
-      // SwiGLU (SwiGLU = SiLU(gate) * (up + 1))
+
+      // SwiGLU
       const float alpha = 1.702f;
       gate = gate * (1.0f / (1.0f + expf(-alpha * gate)));
       gate = gate * (up + 1.0f);
-      float* gu = gate_up + (size_t)b_idx[bi] * IM;
+
+      // write to [K, B, IM]
+      float* gu = gate_up_topk + (((size_t)k_index * (size_t)batch_size + (size_t)b_idx[bi]) * (size_t)IM);
       gu[i] = gate;
     }
   }
 }
 
-/**
- * MLP2: e_agg += (gate_up @ W^T + b) * weight
- * e_agg: [B, H], gate_up: [B, IM], W: [H, IM]
- */
+
+// ================= MLP2 (weighted accum) : all-topk, single launch ============
 template <typename T>
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void mlp2_bias_weighted_accum_gemm_kernel(
-    float* __restrict__ e_agg,
-    const float* __restrict__ gate_up,
-    const T* __restrict__ w_mlp2_all,
-    const float* __restrict__ b_mlp2_all,
-    const int* __restrict__ topk_i,
-    const float* __restrict__ topk_v,
-    const int* __restrict__ pos,
-    int k_index, int l_layer, int E, int IM, int H,
-    int batch_size, int experts_per_token) {
-
+    float* __restrict__ e_agg,         // [B, H]
+    const float* __restrict__ gate_up_topk, // [K, B, IM]
+    const T* __restrict__ w_mlp2_all,  // [L, E, H, IM]
+    const float* __restrict__ b_mlp2_all,   // [L, E, H]
+    const int* __restrict__ topk_i,    // [B, K]
+    const float* __restrict__ topk_v,  // [B, K]
+    const int* __restrict__ pos,       // [B]
+    int l_layer, int E, int IM, int H,
+    int batch_size, int experts_per_token)
+{
   constexpr int CB = BATCH_TILE_LIGHT;
   __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
 
   const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
   const int wid  = tid >> 6;
-  const int row  = blockIdx.x * TM + wid; // output dim H
-  const int b0   = blockIdx.y * CB;
 
-  if (wid >= TM || row >= H) return;
+  const int row     = blockIdx.x * TM + wid; // output H row
+  const int b0      = blockIdx.y * CB;
+  const int k_index = blockIdx.z;            // <--- lấy kk từ grid.z
+
+  if (wid >= TM || row >= H || k_index >= experts_per_token) return;
 
   int b_idx[CB]; bool b_valid[CB];
   int expert_id[CB]; float expert_w[CB];
@@ -367,7 +362,6 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     }
   }
 
-  // Each bi has its own accumulator (then reduced + atomicAdd with weight)
   float acc_row[CB]; for (int bi = 0; bi < CB; ++bi) acc_row[bi] = 0.f;
 
   for (int k_base = 0; k_base < IM; k_base += TK) {
@@ -376,7 +370,8 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 #pragma unroll
     for (int bi = 0; bi < CB; ++bi) {
       if (b_valid[bi]) {
-        const float* xb = gate_up + (size_t)b_idx[bi] * IM + k_base;
+        const float* xb = gate_up_topk
+                        + (((size_t)k_index * (size_t)batch_size + (size_t)b_idx[bi]) * (size_t)IM + (size_t)k_base);
         for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = xb[k];
       } else {
         for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = 0.f;
@@ -389,7 +384,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
       if (!b_valid[bi] || expert_id[bi] < 0) continue;
 
       const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)H * (size_t)IM;
-      const T* __restrict__ w_row = w_mlp2_all + base + (size_t)row * IM + k_base;
+      const T* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
 
       float* xptrs[1] = { lds_x[bi] };
       float tmp[1] = {0.f};
@@ -407,10 +402,10 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   for (int bi = 0; bi < CB; ++bi) {
     float v = warp_reduce_sum(acc_row[bi]);
     if (lane == 0 && b_valid[bi] && expert_id[bi] >= 0) {
-      float* eB = e_agg + (size_t)b_idx[bi] * H;
-      const size_t bbase = ((size_t)l_layer * E + expert_id[bi]) * (size_t)H;
-      float out = v + b_mlp2_all[bbase + row];
-      eB[row] += out * expert_w[bi];
+      float out = v + b_mlp2_all[ ((size_t)l_layer * (size_t)E + (size_t)expert_id[bi]) * (size_t)H + (size_t)row ];
+      float contrib = out * expert_w[bi];
+      // do các kk (grid.z) chạy song song, cần atomicAdd để tích lũy vào cùng e_agg[b,row]
+      atomicAdd(e_agg + (size_t)b_idx[bi] * (size_t)H + (size_t)row, contrib);
     }
   }
 }

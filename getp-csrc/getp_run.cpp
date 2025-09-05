@@ -1,8 +1,8 @@
 #include "attention.cpp"
 #include "getp_eval.cpp"
 #include "matmul.cpp"
-#include "prompt_ctx.cpp"
 #include "profiler.h"
+#include "prompt_ctx.cpp"
 #include "utility.cpp"
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
@@ -446,7 +446,8 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
                       (size_t)B * Hq * S * sizeof(float)));
   HIP_CHECK(
       hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
 
   // Tokens and positions (host-to-device each step)
   if (!ctx.gpu_activations.d_tokens)
@@ -605,8 +606,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_x,
           ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
           ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D,
-          ctx.gpu_weights_fp32.d_rms_attn_w + l * H, ctx.gpu_activations.d_pos, H,
-          QKV_D, batch_size);
+          ctx.gpu_weights_fp32.d_rms_attn_w + l * H, ctx.gpu_activations.d_pos,
+          H, QKV_D, batch_size);
     }
 
     // Scatter QKV to q / caches (batched)
@@ -616,8 +617,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridQKV_batch(gridQKV.x, batch_size, 1);
       split_qkv_scatter_to_cache_batch_kernel<<<gridQKV_batch, block, 0>>>(
           ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
-          ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk, D,
-          loff, ctx.gpu_activations.d_pos, batch_size, L * S * KV);
+          ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk,
+          D, loff, ctx.gpu_activations.d_pos, batch_size, L * S * KV);
     }
 
     // Apply RoPE to q and cached k (batched)
@@ -640,8 +641,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
           ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
           ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-          ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D, Hq,
-          Hk, S,
+          ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+          Hq, Hk, S,
           (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask
                                                   : nullptr,
           L * S * KV, batch_size);
@@ -666,8 +667,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(gridH.x, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, ctx.gpu_activations.d_pos, H,
-          batch_size);
+          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, ctx.gpu_activations.d_pos,
+          H, batch_size);
     }
 
     {
@@ -695,30 +696,55 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0,
                              (size_t)batch_size * H * sizeof(float)));
 
-    for (int kk = 0; kk < p->experts_per_token; ++kk) {
-      {
-        PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
-        constexpr int BATCH_TILE = 2;
-        dim3 gridIM_gemm = get_gemm_grid_dim(IM, batch_size, BATCH_TILE);
-        mlp1_fused_gemm_kernel<bf16_t><<<gridIM_gemm, block, 0>>>(
-            ctx.gpu_activations.d_gate_up, ctx.gpu_activations.d_t,
-            ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.gpu_expert_bias.g_b_mlp1,
-            ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos, kk, l, E, H,
-            IM, p->swiglu_limit, batch_size, p->experts_per_token);
-      }
+    // --- NEW: alloc workspace [K, B, IM] cho gate_up (có thể chuyển vào
+    // DeviceContext để tái dùng)
+    size_t gate_up_topk_bytes = (size_t)p->experts_per_token *
+                                (size_t)batch_size * (size_t)IM * sizeof(float);
+    float *d_gate_up_topk = nullptr;
+    HIP_CHECK(hipMalloc(&d_gate_up_topk, gate_up_topk_bytes));
+    HIP_CHECK(hipMemset(d_gate_up_topk, 0, gate_up_topk_bytes));
 
-      {
-        PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
-        constexpr int BATCH_TILE = 2;
-        dim3 gridHB_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
-        mlp2_bias_weighted_accum_gemm_kernel<bf16_t><<<gridHB_gemm, block, 0>>>(
-            ctx.gpu_activations.d_e_agg, ctx.gpu_activations.d_gate_up,
-            ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.gpu_expert_bias.g_b_mlp2,
-            ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_topk_v,
-            ctx.gpu_activations.d_pos, kk, l, E, IM, H, batch_size,
-            p->experts_per_token);
-      }
+    // --- MLP1: chạy 1 lần, grid.z quét toàn bộ kk
+    {
+      PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
+      constexpr int BATCH_TILE = 2;
+      dim3 gridIM_gemm = get_gemm_grid_dim(IM, batch_size, BATCH_TILE);
+      gridIM_gemm.z = p->experts_per_token; // <--- added
+      mlp1_fused_gemm_kernel<bf16_t><<<gridIM_gemm, block, 0>>>(
+          /*gate_up_topk[K,B,IM]*/ d_gate_up_topk,
+          /*x[B,H]*/ ctx.gpu_activations.d_t,
+          /*w*/ ctx.gpu_weights_bf16.d_w_mlp1_bf16,
+          /*b*/ ctx.gpu_expert_bias.g_b_mlp1,
+          /*topk_i*/ ctx.gpu_activations.d_topk_i,
+          /*pos*/ ctx.gpu_activations.d_pos,
+          /*layer*/ l,
+          /*E,H,IM*/ E, H, IM,
+          /*clip*/ p->swiglu_limit,
+          /*B,K*/ batch_size, p->experts_per_token);
     }
+
+    // --- MLP2: chạy 1 lần, grid.z quét toàn bộ kk; lưu ý dùng atomicAdd khi
+    // cộng e_agg
+    {
+      PROFILE_GPU_SCOPE(
+          "mlp2_bias_weighted_accum_gemm_kernel", 0);
+      constexpr int BATCH_TILE = 2;
+      dim3 gridHB_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
+      gridHB_gemm.z = p->experts_per_token; // <--- added
+      mlp2_bias_weighted_accum_gemm_kernel<bf16_t><<<gridHB_gemm, block, 0>>>(
+          /*e_agg[B,H]*/ ctx.gpu_activations.d_e_agg,
+          /*gate_up[K,B,IM]*/ d_gate_up_topk,
+          /*w*/ ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+          /*b*/ ctx.gpu_expert_bias.g_b_mlp2,
+          /*topk_i, topk_v*/ ctx.gpu_activations.d_topk_i,
+          ctx.gpu_activations.d_topk_v,
+          /*pos*/ ctx.gpu_activations.d_pos,
+          /*layer*/ l,
+          /*E,IM,H,B,K*/ E, IM, H, batch_size, p->experts_per_token);
+    }
+
+    // --- free tạm (nếu bạn chưa đưa vào DeviceContext để tái sử dụng)
+    HIP_CHECK(hipFree(d_gate_up_topk));
 
     {
       PROFILE_GPU_SCOPE("residual_add_batch_kernel", 0);
@@ -747,7 +773,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 block_logits(1024, 1, 1); // 16 warps -> 16 rows per block
       const int TM_logits = block_logits.x / WF_SIZE;
       constexpr int BATCH_TILE = 4;
-      dim3 gridV_gemm((V + TM_logits - 1) / TM_logits, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
+      dim3 gridV_gemm((V + TM_logits - 1) / TM_logits,
+                      (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
       fused_rmsnorm_matmul_gemm_kernel<bf16_t><<<gridV_gemm, block_logits, 0>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
           ctx.gpu_weights_bf16.d_out_bf16, ctx.gpu_weights_fp32.d_rms_out_w,
