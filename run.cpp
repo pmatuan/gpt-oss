@@ -19,7 +19,7 @@
 #endif
 
 #include "tokenizer.hpp"
-#include "getp-csrc/profiler.h"
+#include "getp-csrc/profiler/profiler.h"
 
 // ----------------------------------------------------------------------------
 

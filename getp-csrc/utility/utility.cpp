@@ -1,27 +1,11 @@
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
+#include "../common/defines.h"
+#include "utility.h"
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-#define TM 8
-#define BLOCK_SIZE 512
-#define WF_SIZE 64
-#define TK 512
-#define LDS_PAD 16
-
-#define HIP_CHECK(call)                                                        \
-  do {                                                                         \
-    hipError_t error = call;                                                   \
-    if (error != hipSuccess) {                                                 \
-      fprintf(stderr, "HIP error at %s:%d - %s\n", __FILE__, __LINE__,         \
-              hipGetErrorString(error));                                       \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
-
-static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
+static inline void debug_print_gpu_memory(const char *tag, int device_id) {
   size_t free_b = 0, total_b = 0;
   hipError_t err = hipMemGetInfo(&free_b, &total_b);
   if (err != hipSuccess) {
@@ -39,9 +23,31 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
 
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
-// GEMM grid dimension function for processing multiple batch items simultaneously
-inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile = 4) { 
+inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile) { 
   return dim3((d + TM - 1) / TM, (batch_size + batch_tile - 1) / batch_tile, 1); 
+}
+
+__device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
+  union { uint32_t u; float f; } a, b;
+  a.u = (u & 0x0000FFFFu) << 16; // lower bf16 -> fp32
+  b.u = (u & 0xFFFF0000u);       // upper bf16 -> fp32
+  f0 = a.f;
+  f1 = b.f;
+}
+
+__device__ __forceinline__ float4 bf16quad_to_float4(uint2 u) {
+  float4 r;
+  bf16pair_to_float2(u.x, r.x, r.y);
+  bf16pair_to_float2(u.y, r.z, r.w);
+  return r;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
+    v += __shfl_down(v, off, WF_SIZE);
+  }
+  return v;
 }
 
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
@@ -98,17 +104,16 @@ __global__ void split_qkv_scatter_to_cache_batch_kernel(
 
 // Batched variant reading pos[b] and scattering per batch
 __global__ void fused_inline_rope_qkv_batch_kernel(
-    float *q, float *key_cache, const int *pos, float rope_theta, int n_q_heads,
-    int n_k_heads, int head_dim, float scaling_factor,
-    float initial_context_length, int layer_offset, int kv_stride,
-    int batch_size) {
+    float *q, float *k_cache, const int *pos, float theta, int Hq, int Hk,
+    int D, float rope_scaling_factor, int initial_context_length, int loff,
+    int kv_total_size, int batch_size) {
   const int h = blockIdx.x;
   const int i = threadIdx.x;
   const int b = blockIdx.y;
   if (b >= batch_size)
     return;
 
-  const int half = head_dim >> 1;
+  const int half = D >> 1;
   if (i >= half)
     return;
 
@@ -116,19 +121,19 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
   if (pos_b < 0)
     return;
 
-  float freq = powf(rope_theta, (float)(2 * i) / (float)head_dim);
+  float freq = powf(theta, (float)(2 * i) / (float)D);
   float inv_freq;
   float concentration = 1.0f;
 
-  if (scaling_factor > 1.0f) {
-    concentration = 0.1f * logf(scaling_factor) + 1.0f;
+  if (rope_scaling_factor > 1.0f) {
+    concentration = 0.1f * logf(rope_scaling_factor) + 1.0f;
     float ntk_beta = 32.0f, ntk_alpha = 1.0f;
     float low = half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) /
-                logf(rope_theta);
+                logf(theta);
     float high = half *
                  logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) /
-                 logf(rope_theta);
-    float interpolation = 1.0f / (scaling_factor * freq);
+                 logf(theta);
+    float interpolation = 1.0f / (rope_scaling_factor * freq);
     float extrapolation = 1.0f / freq;
     float ramp = ((float)i - low) / (high - low);
     ramp = fmaxf(0.0f, fminf(1.0f, ramp));
@@ -143,22 +148,22 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
   float s = sinf(val) * concentration;
 
   // Apply to Q for this batch
-  if (h < n_q_heads) {
-    float *q_b = q + (size_t)b * n_q_heads * head_dim;
-    float x1 = q_b[h * head_dim + i];
-    float x2 = q_b[h * head_dim + half + i];
-    q_b[h * head_dim + i] = x1 * c - x2 * s;
-    q_b[h * head_dim + half + i] = x2 * c + x1 * s;
+  if (h < Hq) {
+    float *q_b = q + (size_t)b * Hq * D;
+    float x1 = q_b[h * D + i];
+    float x2 = q_b[h * D + half + i];
+    q_b[h * D + i] = x1 * c - x2 * s;
+    q_b[h * D + half + i] = x2 * c + x1 * s;
   }
 
-  if (h < n_k_heads) {
-    const int KV = n_k_heads * head_dim;
+  if (h < Hk) {
+    const int KV = Hk * D;
     const int cache_idx =
-        (size_t)b * kv_stride + layer_offset + pos_b * KV + h * head_dim;
-    float x1 = key_cache[cache_idx + i];
-    float x2 = key_cache[cache_idx + half + i];
-    key_cache[cache_idx + i] = x1 * c - x2 * s;
-    key_cache[cache_idx + half + i] = x2 * c + x1 * s;
+        (size_t)b * kv_total_size + loff + pos_b * KV + h * D;
+    float x1 = k_cache[cache_idx + i];
+    float x2 = k_cache[cache_idx + half + i];
+    k_cache[cache_idx + i] = x1 * c - x2 * s;
+    k_cache[cache_idx + half + i] = x2 * c + x1 * s;
   }
 }
 
@@ -221,6 +226,47 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   for (int i = tid; i < size; i += blockDim.x) {
     o_b[i] = weight[i] * (x_b[i] * inv);
   }
+}
+
+/**
+ * Compute inv RMS per sample: inv_rms = rsqrt(mean(x^2)+eps)
+ */
+ __global__ void compute_inv_rms_batch_kernel(
+  float* __restrict__ out_inv,
+  const float* __restrict__ x,
+  const int* __restrict__ pos,
+  int H, int batch_size) {
+
+const int b = blockIdx.y;
+if (b >= batch_size) return;
+
+if (pos[b] < 0) { if (threadIdx.x == 0) out_inv[b] = 0.0f; return; }
+
+const float* xb = x + (size_t)b * H;
+
+float sum = 0.f;
+for (int i = threadIdx.x; i < H; i += blockDim.x) {
+  float v = xb[i]; sum = fmaf(v, v, sum);
+}
+sum = warp_reduce_sum(sum);
+
+__shared__ float warp_sums[1024 / WF_SIZE];
+const int lane = threadIdx.x & (WF_SIZE - 1);
+const int wid  = threadIdx.x >> 6;
+
+if (lane == 0) warp_sums[wid] = sum;
+__syncthreads();
+
+float total = 0.f;
+if (wid == 0) {
+  const int num_warps = blockDim.x / WF_SIZE;
+  total = (threadIdx.x < num_warps) ? warp_sums[threadIdx.x] : 0.f;
+  total = warp_reduce_sum(total);
+  if (lane == 0) {
+    float mean_sq = total / (float)H;
+    out_inv[b] = rsqrtf(mean_sq + 1e-5f);
+  }
+}
 }
 
 // Batched Top-K + Softmax kernel
@@ -315,14 +361,13 @@ __global__ void fused_topk_softmax_batch_kernel(
   }
 }
 
-static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
-                                     bf16_t *d_dst, int n_streams,
-                                     size_t chunk_bytes) {
-  if (count == 0)
+void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
+                               int n_streams, size_t chunk_bytes) {
+  if (n == 0)
     return;
 
   const size_t chunk_elems = chunk_bytes / sizeof(bf16_t);
-  const size_t actual_chunk_elems = (chunk_elems > count) ? count : chunk_elems;
+  const size_t actual_chunk_elems = (chunk_elems > n) ? n : chunk_elems;
 
   hipStream_t *streams = nullptr;
   hipEvent_t *events = nullptr;
@@ -404,12 +449,12 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     HIP_CHECK(
         hipHostMalloc((void **)&h_chunk, SYNC_CHUNK_ELEMS * sizeof(bf16_t)));
     size_t done = 0;
-    while (done < count) {
+    while (done < n) {
       size_t todo =
-          (count - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (count - done);
+          (n - done > SYNC_CHUNK_ELEMS) ? SYNC_CHUNK_ELEMS : (n - done);
       for (size_t i = 0; i < todo; ++i)
-        h_chunk[i] = hip_bfloat16(h_src[done + i]);
-      HIP_CHECK(hipMemcpy(d_dst + done, h_chunk, todo * sizeof(bf16_t),
+        h_chunk[i] = hip_bfloat16(src[done + i]);
+      HIP_CHECK(hipMemcpy(dst + done, h_chunk, todo * sizeof(bf16_t),
                           hipMemcpyHostToDevice));
       done += todo;
     }
@@ -423,9 +468,9 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
   for (int i = 0; i < n_streams; i++)
     buffer_ready[i] = true;
 
-  while (done < count) {
-    size_t todo = (count - done > actual_chunk_elems) ? actual_chunk_elems
-                                                      : (count - done);
+  while (done < n) {
+    size_t todo = (n - done > actual_chunk_elems) ? actual_chunk_elems
+                                                      : (n - done);
     if (!buffer_ready[stream_idx]) {
       HIP_CHECK(hipEventSynchronize(events[stream_idx]));
       buffer_ready[stream_idx] = true;
@@ -433,9 +478,9 @@ static void copy_fp32_to_bf16_device(const float *h_src, size_t count,
     bf16_t *chunk = pinned_chunks[stream_idx];
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < todo; ++i)
-      chunk[i] = hip_bfloat16(h_src[done + i]);
+      chunk[i] = hip_bfloat16(src[done + i]);
 
-    HIP_CHECK(hipMemcpyAsync(d_dst + done, chunk, todo * sizeof(bf16_t),
+    HIP_CHECK(hipMemcpyAsync(dst + done, chunk, todo * sizeof(bf16_t),
                              hipMemcpyHostToDevice, streams[stream_idx]));
     HIP_CHECK(hipEventRecord(events[stream_idx], streams[stream_idx]));
     buffer_ready[stream_idx] = false;

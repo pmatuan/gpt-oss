@@ -1,10 +1,6 @@
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
+#include "../common/defines.h"
+#include "attention.h"
 #include <math.h>
-
-typedef hip_bfloat16 bf16_t;
-
-#define WF_SIZE 64
 
 // Batched attention kernel: processes grid.y = batch dimension
 // Uses dynamic shared memory sized for (max_pos_in_batch + 2) floats
