@@ -24,6 +24,7 @@ struct GPUActivationBuffers {
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
   float *d_gate_up, *d_e_agg;
+  float *d_gate_up_workspace; // Pre-allocated workspace for MLP
   float *d_qkv, *d_q, *d_k, *d_v;
   float *d_key_cache, *d_value_cache;
   float *d_att, *d_logits, *d_mask;
@@ -104,6 +105,9 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up, IM * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_e_agg, H * sizeof(float)));
+  
+  // Pre-allocate workspace for maximum expected batch size
+  ctx.gpu_activations.d_gate_up_workspace = nullptr;
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (D * (Hq + 2 * Hk)) * sizeof(float)));
@@ -281,6 +285,8 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_topk_i));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_e_agg));
+  if (ctx.gpu_activations.d_gate_up_workspace)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_qkv));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_q));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_k));
@@ -395,6 +401,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   FREE_IF(ctx.gpu_activations.d_topk_i);
   FREE_IF(ctx.gpu_activations.d_gate_up);
   FREE_IF(ctx.gpu_activations.d_e_agg);
+  FREE_IF(ctx.gpu_activations.d_gate_up_workspace);
   FREE_IF(ctx.gpu_activations.d_qkv);
   FREE_IF(ctx.gpu_activations.d_q);
   FREE_IF(ctx.gpu_activations.d_k);
@@ -696,13 +703,15 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0,
                              (size_t)batch_size * H * sizeof(float)));
 
-    // --- NEW: alloc workspace [K, B, IM] cho gate_up (có thể chuyển vào
-    // DeviceContext để tái dùng)
+    // Use pre-allocated workspace from DeviceContext to avoid repeated malloc/free
     size_t gate_up_topk_bytes = (size_t)p->experts_per_token *
                                 (size_t)batch_size * (size_t)IM * sizeof(float);
-    float *d_gate_up_topk = nullptr;
-    HIP_CHECK(hipMalloc(&d_gate_up_topk, gate_up_topk_bytes));
-    HIP_CHECK(hipMemset(d_gate_up_topk, 0, gate_up_topk_bytes));
+    if (!ctx.gpu_activations.d_gate_up_workspace) {
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up_workspace, gate_up_topk_bytes));
+    }
+    float *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
+    HIP_CHECK(hipMemsetAsync(d_gate_up_topk, 0, 
+                            (size_t)p->experts_per_token * (size_t)batch_size * (size_t)IM * sizeof(float), 0));
 
     // --- MLP1: chạy 1 lần, grid.z quét toàn bộ kk
     {
@@ -743,8 +752,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*E,IM,H,B,K*/ E, IM, H, batch_size, p->experts_per_token);
     }
 
-    // --- free tạm (nếu bạn chưa đưa vào DeviceContext để tái sử dụng)
-    HIP_CHECK(hipFree(d_gate_up_topk));
+    // Keep workspace allocated in DeviceContext for reuse
 
     {
       PROFILE_GPU_SCOPE("residual_add_batch_kernel", 0);

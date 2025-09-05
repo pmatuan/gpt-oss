@@ -88,7 +88,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
 
   float sum = 0.0f;
   for (int i = lane; i < att_size; i += WF_SIZE) {
-    float v = expf(s_att[i] - maxv);
+    float v = __expf(s_att[i] - maxv); // Use faster exp
     s_att[i] = v;
     sum += v;
   }
@@ -97,7 +97,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     sum += __shfl_down(sum, off, WF_SIZE);
   sum = __shfl(sum, 0, WF_SIZE);
 
-  float inv_sum = 1.0f / sum;
+  float inv_sum = __frcp_rn(sum); // Use faster reciprocal
   for (int i = lane; i < att_size; i += WF_SIZE)
     s_att[i] *= inv_sum;
   __syncthreads();

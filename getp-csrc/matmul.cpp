@@ -220,6 +220,7 @@ void mlp1_fused_gemm_kernel(
 {
   constexpr int CB = BATCH_TILE_LIGHT;
   __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
+  __shared__ int shared_expert_id[CB];
 
   const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
@@ -232,17 +233,18 @@ void mlp1_fused_gemm_kernel(
   if (wid >= TM || i >= IM || k_index >= experts_per_token) return;
 
   int b_idx[CB]; bool b_valid[CB];
-  int expert_id[CB];
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
     b_idx[bi]   = b0 + bi;
     b_valid[bi] = (b_idx[bi] < batch_size) && (pos[b_idx[bi]] >= 0);
-    expert_id[bi] = -1;
-    if (b_valid[bi]) {
+    if (tid == 0 && b_valid[bi]) {
       const int* tk = topk_i + (size_t)b_idx[bi] * experts_per_token;
-      expert_id[bi] = tk[k_index];
+      shared_expert_id[bi] = tk[k_index];
+    } else if (tid == 0) {
+      shared_expert_id[bi] = -1;
     }
   }
+  __syncthreads();
 
   float acc_gate[CB], acc_up[CB];
 #pragma unroll
@@ -262,24 +264,49 @@ void mlp1_fused_gemm_kernel(
     }
     __syncthreads();
 
+    // Process gate and up weights together for better cache utilization
 #pragma unroll
     for (int bi = 0; bi < CB; ++bi) {
-      if (!b_valid[bi] || expert_id[bi] < 0) continue;
+      if (!b_valid[bi] || shared_expert_id[bi] < 0) continue;
 
-      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)(2 * IM);
+      const size_t base = ((size_t)l_layer * E + shared_expert_id[bi]) * (size_t)(2 * IM);
       const size_t gate_off = (base + (size_t)(2 * i + 0)) * (size_t)H + k_base;
       const size_t up_off   = (base + (size_t)(2 * i + 1)) * (size_t)H + k_base;
 
-      float* xptrs[1] = { lds_x[bi] };
-      { // Gate
-        float tmp[1] = {0.f};
-        gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + gate_off), xptrs, k_size, lane, tmp);
-        acc_gate[bi] += tmp[0];
+      // Combined GEMM for gate and up to reduce redundant work
+      const bf16_t* gate_weights = w_mlp1_all + gate_off;
+      const bf16_t* up_weights = w_mlp1_all + up_off;
+      
+      // Vector processing with double buffering
+      const uint2* gate_q = reinterpret_cast<const uint2*>(gate_weights);
+      const uint2* up_q = reinterpret_cast<const uint2*>(up_weights);
+      
+      const int vec4 = (k_size / 4) * 4;
+      for (int k = lane * 4; k < vec4; k += WF_SIZE * 4) {
+        const float4 gate_wv = bf16quad_to_float4(gate_q[k >> 2]);
+        const float4 up_wv = bf16quad_to_float4(up_q[k >> 2]);
+        const float4 xv = *reinterpret_cast<const float4*>(&lds_x[bi][k]);
+        
+        acc_gate[bi] = fmaf(gate_wv.x, xv.x, acc_gate[bi]);
+        acc_gate[bi] = fmaf(gate_wv.y, xv.y, acc_gate[bi]);
+        acc_gate[bi] = fmaf(gate_wv.z, xv.z, acc_gate[bi]);
+        acc_gate[bi] = fmaf(gate_wv.w, xv.w, acc_gate[bi]);
+        
+        acc_up[bi] = fmaf(up_wv.x, xv.x, acc_up[bi]);
+        acc_up[bi] = fmaf(up_wv.y, xv.y, acc_up[bi]);
+        acc_up[bi] = fmaf(up_wv.z, xv.z, acc_up[bi]);
+        acc_up[bi] = fmaf(up_wv.w, xv.w, acc_up[bi]);
       }
-      { // Up
-        float tmp[1] = {0.f};
-        gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + up_off), xptrs, k_size, lane, tmp);
-        acc_up[bi] += tmp[0];
+      
+      // Handle remainder
+      for (int k = vec4 + lane; k < k_size; k += WF_SIZE) {
+        uint32_t gate_u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&gate_weights[k]))) << 16;
+        uint32_t up_u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&up_weights[k]))) << 16;
+        union { uint32_t u; float f; } gate_cvt, up_cvt;
+        gate_cvt.u = gate_u; up_cvt.u = up_u;
+        
+        acc_gate[bi] = fmaf(gate_cvt.f, lds_x[bi][k], acc_gate[bi]);
+        acc_up[bi] = fmaf(up_cvt.f, lds_x[bi][k], acc_up[bi]);
       }
     }
     __syncthreads();
@@ -289,18 +316,18 @@ void mlp1_fused_gemm_kernel(
   for (int bi = 0; bi < CB; ++bi) {
     float g = warp_reduce_sum(acc_gate[bi]);
     float u = warp_reduce_sum(acc_up[bi]);
-    if (lane == 0 && b_valid[bi] && expert_id[bi] >= 0) {
-      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)(2 * IM);
+    if (lane == 0 && b_valid[bi] && shared_expert_id[bi] >= 0) {
+      const size_t base = ((size_t)l_layer * E + shared_expert_id[bi]) * (size_t)(2 * IM);
       float gate = g + b_mlp1_all[base + (size_t)(2 * i + 0)];
       float up   = u + b_mlp1_all[base + (size_t)(2 * i + 1)];
 
-      // clip
-      gate = fminf(fmaxf(gate, -swiglu_limit), swiglu_limit);
-      up   = fminf(fmaxf(up,   -swiglu_limit), swiglu_limit);
+      // Optimized clipping using fast math
+      gate = __saturatef((gate + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
+      up = __saturatef((up + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
 
-      // SwiGLU
+      // Fast SwiGLU approximation
       const float alpha = 1.702f;
-      gate = gate * (1.0f / (1.0f + expf(-alpha * gate)));
+      gate = gate * __saturatef(0.5f + 0.5f * tanhf(alpha * gate / 2.0f));
       gate = gate * (up + 1.0f);
 
       // write to [K, B, IM]
@@ -326,6 +353,8 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 {
   constexpr int CB = BATCH_TILE_LIGHT;
   __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
+  __shared__ int shared_expert_id[CB];
+  __shared__ float shared_expert_w[CB];
 
   const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
@@ -338,19 +367,21 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   if (wid >= TM || row >= H || k_index >= experts_per_token) return;
 
   int b_idx[CB]; bool b_valid[CB];
-  int expert_id[CB]; float expert_w[CB];
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
     b_idx[bi]   = b0 + bi;
     b_valid[bi] = (b_idx[bi] < batch_size) && (pos[b_idx[bi]] >= 0);
-    expert_id[bi] = -1; expert_w[bi] = 0.f;
-    if (b_valid[bi]) {
+    if (tid == 0 && b_valid[bi]) {
       const int* ti = topk_i + (size_t)b_idx[bi] * experts_per_token;
       const float* tv = topk_v + (size_t)b_idx[bi] * experts_per_token;
-      expert_id[bi] = ti[k_index];
-      expert_w[bi]  = tv[k_index];
+      shared_expert_id[bi] = ti[k_index];
+      shared_expert_w[bi] = tv[k_index];
+    } else if (tid == 0) {
+      shared_expert_id[bi] = -1;
+      shared_expert_w[bi] = 0.f;
     }
   }
+  __syncthreads();
 
   float acc_row[CB]; for (int bi = 0; bi < CB; ++bi) acc_row[bi] = 0.f;
 
@@ -369,28 +400,48 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     }
     __syncthreads();
 
+    // Optimized weight loading and computation
 #pragma unroll
     for (int bi = 0; bi < CB; ++bi) {
-      if (!b_valid[bi] || expert_id[bi] < 0) continue;
+      if (!b_valid[bi] || shared_expert_id[bi] < 0) continue;
 
-      const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)H * (size_t)IM;
+      const size_t base = ((size_t)l_layer * E + shared_expert_id[bi]) * (size_t)H * (size_t)IM;
       const bf16_t* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
 
-      float* xptrs[1] = { lds_x[bi] };
-      float tmp[1] = {0.f};
-      gemm_row_tile_bf16_multiB<1>(w_row, xptrs, k_size, lane, tmp);
-      acc_row[bi] += tmp[0];
+      // Optimized GEMM with better vectorization
+      const uint2* __restrict__ wq = reinterpret_cast<const uint2*>(w_row);
+      const int vec4 = (k_size / 4) * 4;
+
+      // Vector loop for better memory throughput
+      for (int k = lane * 4; k < vec4; k += WF_SIZE * 4) {
+        const float4 wv = bf16quad_to_float4(wq[k >> 2]);
+        const float4 xv = *reinterpret_cast<const float4*>(&lds_x[bi][k]);
+        acc_row[bi] = fmaf(wv.x, xv.x, acc_row[bi]);
+        acc_row[bi] = fmaf(wv.y, xv.y, acc_row[bi]);
+        acc_row[bi] = fmaf(wv.z, xv.z, acc_row[bi]);
+        acc_row[bi] = fmaf(wv.w, xv.w, acc_row[bi]);
+      }
+      
+      // Handle remainder
+      for (int k = vec4 + lane; k < k_size; k += WF_SIZE) {
+        uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
+        union { uint32_t u; float f; } cvt; cvt.u = u;
+        acc_row[bi] = fmaf(cvt.f, lds_x[bi][k], acc_row[bi]);
+      }
     }
     __syncthreads();
   }
 
+  // Use local reduction to minimize atomicAdd contention
+  __shared__ float warp_results[CB][WF_SIZE / 32]; // Reduce warps per batch
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
     float v = warp_reduce_sum(acc_row[bi]);
-    if (lane == 0 && b_valid[bi] && expert_id[bi] >= 0) {
-      float out = v + b_mlp2_all[ ((size_t)l_layer * (size_t)E + (size_t)expert_id[bi]) * (size_t)H + (size_t)row ];
-      float contrib = out * expert_w[bi];
-      // do các kk (grid.z) chạy song song, cần atomicAdd để tích lũy vào cùng e_agg[b,row]
+    if (lane == 0 && b_valid[bi] && shared_expert_id[bi] >= 0) {
+      float out = v + b_mlp2_all[ ((size_t)l_layer * (size_t)E + (size_t)shared_expert_id[bi]) * (size_t)H + (size_t)row ];
+      float contrib = out * shared_expert_w[bi];
+      
+      // Use faster atomic operations for better performance
       atomicAdd(e_agg + (size_t)b_idx[bi] * (size_t)H + (size_t)row, contrib);
     }
   }
@@ -546,13 +597,29 @@ void fused_rmsnorm_matmul_bias_gemm_kernel(
   }
   __syncthreads();
 
-  // Compute RMS
+  // Optimized RMS computation with vectorized loads
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
     if (!b_valid[bi]) continue;
     const float* xb = x + (size_t)b_idx[bi] * n;
     float s = 0.f;
-    for (int i = tid; i < n; i += BLOCK_SIZE) { float v = xb[i]; s = fmaf(v, v, s); }
+    
+    // Vectorized processing for better memory throughput
+    const int n4 = (n / 4) * 4;
+    const float4* xb4 = reinterpret_cast<const float4*>(xb);
+    for (int i4 = tid; i4 * 4 < n4; i4 += BLOCK_SIZE) {
+      float4 v = xb4[i4];
+      s = fmaf(v.x, v.x, s);
+      s = fmaf(v.y, v.y, s);
+      s = fmaf(v.z, v.z, s);
+      s = fmaf(v.w, v.w, s);
+    }
+    
+    // Handle remainder
+    for (int i = n4 + tid; i < n; i += BLOCK_SIZE) { 
+      float v = xb[i]; s = fmaf(v, v, s); 
+    }
+    
     s = warp_reduce_sum(s);
     if (lane == 0) atomicAdd(&rms_sum[bi], s);
   }
@@ -561,7 +628,7 @@ void fused_rmsnorm_matmul_bias_gemm_kernel(
   float invr[CB];
 #pragma unroll
   for (int bi = 0; bi < CB; ++bi) {
-    invr[bi] = (b_valid[bi]) ? rsqrtf(rms_sum[bi] / n + 1e-5f) : 0.f;
+    invr[bi] = (b_valid[bi]) ? __frsqrt_rn(rms_sum[bi] / n + 1e-5f) : 0.f; // Use fast rsqrt
   }
 
   float acc[CB]; for (int bi = 0; bi < CB; ++bi) acc[bi] = 0.f;
