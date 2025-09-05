@@ -3,7 +3,7 @@
 #include "utility/utility.cpp"
 #include "attention/attention.cpp"
 #include "matmul/matmul.cpp"
-#include "profiler/profiler.h"
+#include "profiler/profiler.cpp"
 #include "getp_eval.cpp"
 #include <math.h>
 #include <mutex>
