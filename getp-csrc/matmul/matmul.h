@@ -16,16 +16,6 @@ __device__ __forceinline__ void gemm_row_tile_bf16_multiB(
     int k_size, int lane, float acc[CB]);
 
 template<typename T>
-__global__ void fused_rmsnorm_matmul_bias_gemm_kernel(
-    float *out, const float *x, const T *w, const float *b,
-    const float *rms_w, const int *pos, int H, int D, int batch_size);
-
-template<typename T>
-__global__ void fused_matmul_bias_residual_gemm_kernel(
-    float *x, const float *tb, const T *w, const float *b,
-    const int *pos, int O_N, int H, int batch_size);
-
-template<typename T>
 __global__ void matmul_bias_gemm_kernel(
     float *out, const float *x, const T *w, const float *b,
     const int *pos, int H, int D, int batch_size);
