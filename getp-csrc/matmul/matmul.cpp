@@ -160,7 +160,7 @@ void matmul_bias_gemm_kernel(
     float v = warp_reduce_sum(acc[bi]);
     if (lane == 0 && b_valid[bi]) {
       float* yb = y + (size_t)b_idx[bi] * d;
-      yb[row] = v + b[row];
+      yb[row] = v + (b ? b[row] : 0.0f);
     }
   }
 }
@@ -402,79 +402,6 @@ void mlp2_bias_weighted_accum_gemm_kernel(
       
       // Use faster atomic operations for better performance
       atomicAdd(e_agg + (size_t)b_idx[bi] * (size_t)H + (size_t)row, contrib);
-    }
-  }
-}
-
-/**
- * y = (RMSNorm(x) * rms_w) @ W^T
- * x: [B,H], w:[V,H], y:[B,V], inv_rms:[B]
- */
-template <typename T>
-__launch_bounds__(1024, 1) __global__
-void fused_rmsnorm_matmul_gemm_kernel(
-    float* __restrict__ y,
-    const float* __restrict__ x,
-    const T* __restrict__ w,
-    const float* __restrict__ rms_w,
-    const int* __restrict__ pos,
-    const float* __restrict__ inv_rms,
-    int H, int V, int batch_size) {
-
-  constexpr int CB = BATCH_TILE_DEFAULT;
-  __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
-
-  const int tid  = threadIdx.x;
-  const int lane = tid & (WF_SIZE - 1);
-  const int warp_id = tid >> 6;
-  const int warps_per_block = blockDim.x / WF_SIZE;
-
-  const int row = blockIdx.x * warps_per_block + warp_id; // output in V
-  const int b0  = blockIdx.y * CB;
-  if (row >= V) return;
-
-  int b_idx[CB]; bool b_valid[CB]; float invv[CB];
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    b_idx[bi]   = b0 + bi;
-    b_valid[bi] = (b_idx[bi] < batch_size) && (pos[b_idx[bi]] >= 0);
-    invv[bi]    = b_valid[bi] ? inv_rms[b_idx[bi]] : 0.f;
-  }
-
-  float acc[CB]; for (int bi = 0; bi < CB; ++bi) acc[bi] = 0.f;
-
-  for (int k_base = 0; k_base < H; k_base += TK) {
-    const int k_size = min(TK, H - k_base);
-
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) {
-      if (b_valid[bi]) {
-        const float* xb = x + (size_t)b_idx[bi] * H + k_base;
-        for (int k = tid; k < k_size; k += blockDim.x) {
-          lds_x[bi][k] = xb[k] * invv[bi] * rms_w[k_base + k];
-        }
-      } else {
-        for (int k = tid; k < k_size; k += blockDim.x) lds_x[bi][k] = 0.f;
-      }
-    }
-    __syncthreads();
-
-    const T* w_row = w + (size_t)row * H + k_base;
-    float* xptrs[CB]; for (int bi = 0; bi < CB; ++bi) xptrs[bi] = lds_x[bi];
-
-    if constexpr (std::is_same_v<T, bf16_t>) {
-      gemm_row_tile_bf16_multiB<CB>((const bf16_t*)w_row, xptrs, k_size, lane, acc);
-    } else {
-      gemm_row_tile_fp32_multiB<CB>((const float*)w_row, xptrs, k_size, lane, acc);
-    }
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    float v = warp_reduce_sum(acc[bi]);
-    if (lane == 0 && b_valid[bi]) {
-      float* yb = y + (size_t)b_idx[bi] * V; yb[row] = v;
     }
   }
 }

@@ -30,11 +30,6 @@ __global__ void matmul_bias_gemm_kernel(
     float *out, const float *x, const T *w, const float *b,
     const int *pos, int H, int D, int batch_size);
 
-template<typename T>
-__global__ void fused_rmsnorm_matmul_gemm_kernel(
-    float *out, const float *x, const T *w, const float *rms_w,
-    const int *pos, const float *inv_rms, int H, int V, int batch_size);
-
 __global__ void mlp1_fused_gemm_kernel(
     float *gate_up_topk, const float *x, const bf16_t *w, const float *b,
     const int *topk_i, const int *pos, int layer, int E, int H, int IM,

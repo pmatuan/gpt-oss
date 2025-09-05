@@ -727,29 +727,25 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
   // Final head
   {
-    // 1) Compute per-sample inv_rms once (avoid redundant scans per block)
+    // 1) RMSNorm - separate kernel call
     {
-      PROFILE_GPU_SCOPE("compute_inv_rms_batch_kernel", 0);
-      dim3 gridInv(1, batch_size, 1);
-      dim3 blockInv(256, 1, 1);
-      compute_inv_rms_batch_kernel<<<gridInv, blockInv, 0>>>(
-          ctx.gpu_activations.d_inv_rms, ctx.gpu_activations.d_x,
-          ctx.gpu_activations.d_pos, H, batch_size);
+      PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
+      dim3 gridH_batch(gridH.x, batch_size, 1);
+      rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
+          ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
+          ctx.gpu_weights_fp32.d_rms_out_w, ctx.gpu_activations.d_pos,
+          H, batch_size);
     }
 
-    // 2) Fused (rmsnorm scale + matmul) for logits - GEMM version
+    // 2) MatMul for logits - separate GEMM version
     {
-      PROFILE_GPU_SCOPE("fused_rmsnorm_matmul_gemm_kernel", 0);
-      dim3 block_logits(1024, 1, 1); // 16 warps -> 16 rows per block
-      const int TM_logits = block_logits.x / WF_SIZE;
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
       constexpr int BATCH_TILE = 4;
-      dim3 gridV_gemm((V + TM_logits - 1) / TM_logits,
-                      (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
-      fused_rmsnorm_matmul_gemm_kernel<bf16_t><<<gridV_gemm, block_logits, 0>>>(
-          ctx.gpu_activations.d_logits, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_bf16.d_out_bf16, ctx.gpu_weights_fp32.d_rms_out_w,
-          ctx.gpu_activations.d_pos, ctx.gpu_activations.d_inv_rms, H, V,
-          batch_size);
+      dim3 gridV_gemm = get_gemm_grid_dim(V, batch_size, BATCH_TILE);
+      matmul_bias_gemm_kernel<bf16_t><<<gridV_gemm, block, 0>>>(
+          ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
+          ctx.gpu_weights_bf16.d_out_bf16, nullptr,
+          ctx.gpu_activations.d_pos, H, V, batch_size);
     }
   }
 
