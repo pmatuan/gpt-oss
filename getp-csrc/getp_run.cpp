@@ -155,6 +155,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.capacity_B = 1;
   ctx.gpu_activations.d_tokens = nullptr;
   ctx.gpu_activations.d_pos = nullptr;
+  ctx.gpu_activations.d_inv_rms = nullptr;
 
   debug_print_gpu_memory("after activations", device_id);
 
@@ -367,9 +368,9 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 // Ensure device has capacity for B batch slots (reallocates activations &
 // caches if needed)
 static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
-  if (B <= ctx.capacity_B)
-    return;
   HIP_CHECK(hipSetDevice(ctx.device_id));
+
+  const bool need_realloc = B > ctx.capacity_B;
 
   const Config *p = model_config;
   const int H = p->hidden_dim;
@@ -382,90 +383,101 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   const int IM = p->intermediate_dim;
   const int V = p->vocab_size;
 
-// Free previous activations to re-alloc at batch size B
-#define FREE_IF(p)                                                             \
-  if ((p))                                                                     \
-  HIP_CHECK(hipFree((p)))
-  FREE_IF(ctx.gpu_activations.d_x);
-  FREE_IF(ctx.gpu_activations.d_t);
-  FREE_IF(ctx.gpu_activations.d_tb);
-  FREE_IF(ctx.gpu_activations.d_tb2);
-  FREE_IF(ctx.gpu_activations.d_router_score);
-  FREE_IF(ctx.gpu_activations.d_topk_v);
-  FREE_IF(ctx.gpu_activations.d_topk_i);
-  FREE_IF(ctx.gpu_activations.d_gate_up);
-  FREE_IF(ctx.gpu_activations.d_e_agg);
-  FREE_IF(ctx.gpu_activations.d_qkv);
-  FREE_IF(ctx.gpu_activations.d_q);
-  FREE_IF(ctx.gpu_activations.d_k);
-  FREE_IF(ctx.gpu_activations.d_v);
-  FREE_IF(ctx.gpu_activations.d_key_cache);
-  FREE_IF(ctx.gpu_activations.d_value_cache);
-  FREE_IF(ctx.gpu_activations.d_att);
-  FREE_IF(ctx.gpu_activations.d_logits);
-  FREE_IF(ctx.gpu_activations.d_inv_rms);
-// mask & token2row remain shared
-#undef FREE_IF
+  // Free previous activations to re-alloc at batch size B
+  if (need_realloc) {
+    #define FREE_IF(p) if ((p)) HIP_CHECK(hipFree((p)))
 
-  // Re-allocate with batch dimension
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, (size_t)B * H * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_tb, (size_t)B * D * Hq * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_tb2, (size_t)B * H * sizeof(float)));
+    FREE_IF(ctx.gpu_activations.d_x);
+    FREE_IF(ctx.gpu_activations.d_t);
+    FREE_IF(ctx.gpu_activations.d_tb);
+    FREE_IF(ctx.gpu_activations.d_tb2);
+    FREE_IF(ctx.gpu_activations.d_router_score);
+    FREE_IF(ctx.gpu_activations.d_topk_v);
+    FREE_IF(ctx.gpu_activations.d_topk_i);
+    FREE_IF(ctx.gpu_activations.d_gate_up);
+    FREE_IF(ctx.gpu_activations.d_e_agg);
+    FREE_IF(ctx.gpu_activations.d_qkv);
+    FREE_IF(ctx.gpu_activations.d_q);
+    FREE_IF(ctx.gpu_activations.d_k);
+    FREE_IF(ctx.gpu_activations.d_v);
+    FREE_IF(ctx.gpu_activations.d_key_cache);
+    FREE_IF(ctx.gpu_activations.d_value_cache);
+    FREE_IF(ctx.gpu_activations.d_att);
+    FREE_IF(ctx.gpu_activations.d_logits);
+    // mask & token2row remain shared
+    #undef FREE_IF
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
-                      (size_t)B * p->n_experts * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
-                      (size_t)B * p->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_i,
-                      (size_t)B * p->experts_per_token * sizeof(int)));
+    // Re-allocate with batch dimension
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, (size_t)B * H * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_tb, (size_t)B * D * Hq * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_tb2, (size_t)B * H * sizeof(float)));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up,
-                      (size_t)B * IM * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
+                        (size_t)B * p->n_experts * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
+                        (size_t)B * p->experts_per_token * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_i,
+                        (size_t)B * p->experts_per_token * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                      (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_q, (size_t)B * Hq * D * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_k, (size_t)B * Hk * D * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_v, (size_t)B * Hk * D * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up,
+                        (size_t)B * IM * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
 
-  // Per-batch KV caches
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache,
-                      (size_t)B * L * S * KV * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                      (size_t)B * L * S * KV * sizeof(float)));
-  // Auxiliary buffers
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att,
-                      (size_t)B * Hq * S * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
+                        (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_q, (size_t)B * Hq * D * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_k, (size_t)B * Hk * D * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_v, (size_t)B * Hk * D * sizeof(float)));
+
+    // Per-batch KV caches
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache,
+                        (size_t)B * L * S * KV * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
+                        (size_t)B * L * S * KV * sizeof(float)));
+    // Auxiliary buffers
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att,
+                        (size_t)B * Hq * S * sizeof(float)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
+
+    ctx.capacity_B = B;
+  }
+  // Allocate per-sample inv_rms buffer
+  if (need_realloc) {
+    if (ctx.gpu_activations.d_inv_rms) {
+      HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
+    }
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms,
+                        (size_t)B * sizeof(float)));
+  } else if (!ctx.gpu_activations.d_inv_rms) {
+    // First-time allocation when capacity already sufficient
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms,
+                        (size_t)ctx.capacity_B * sizeof(float)));
+  }
 
   // Tokens and positions (host-to-device each step)
-  if (!ctx.gpu_activations.d_tokens)
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
-  else {
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
-  }
-  if (!ctx.gpu_activations.d_pos)
+  if (need_realloc) {
+    if (ctx.gpu_activations.d_tokens) HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
+
+    if (ctx.gpu_activations.d_pos) HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
-  else {
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
+  } else {
+    if (!ctx.gpu_activations.d_tokens)
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)ctx.capacity_B * sizeof(int)));
+
+    if (!ctx.gpu_activations.d_pos)
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)ctx.capacity_B * sizeof(int)));
   }
 
-  ctx.capacity_B = B;
-
+  // Ensure we have at least B stream
   if (!ctx.streams) {
     ctx.streams = (hipStream_t *)malloc(sizeof(hipStream_t) * B);
     ctx.n_streams = 0;
@@ -478,7 +490,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   for (int i = ctx.n_streams; i < B; ++i) {
     HIP_CHECK(hipStreamCreateWithFlags(&ctx.streams[i], hipStreamNonBlocking));
   }
-  ctx.n_streams = B;
+  if (ctx.n_streams < B) ctx.n_streams = B;
 }
 
 static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
@@ -782,6 +794,11 @@ static long long run_requests_on_device(Transformer *transformer,
   const int L = p->n_layers;
   const int S = p->seq_len;
   DeviceContext &dctx = g_devices[device_id];
+
+  // Clear K/V caches to avoid any stale data from previous runs
+  size_t kv_bytes = (size_t)B * L * S * KV * sizeof(float);
+  HIP_CHECK(hipMemset(dctx.gpu_activations.d_key_cache, 0, kv_bytes));
+  HIP_CHECK(hipMemset(dctx.gpu_activations.d_value_cache, 0, kv_bytes));
 
   // Temporary host buffer for batched logits
   const int V = p->vocab_size;
