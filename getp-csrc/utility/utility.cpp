@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
+static inline void debug_print_gpu_memory(const char *tag, int device_id) {
   size_t free_b = 0, total_b = 0;
   hipError_t err = hipMemGetInfo(&free_b, &total_b);
   if (err != hipSuccess) {
@@ -104,17 +104,16 @@ __global__ void split_qkv_scatter_to_cache_batch_kernel(
 
 // Batched variant reading pos[b] and scattering per batch
 __global__ void fused_inline_rope_qkv_batch_kernel(
-    float *q, float *key_cache, const int *pos, float rope_theta, int n_q_heads,
-    int n_k_heads, int head_dim, float scaling_factor,
-    float initial_context_length, int layer_offset, int kv_stride,
-    int batch_size) {
+    float *q, float *k_cache, const int *pos, float theta, int Hq, int Hk,
+    int D, float rope_scaling_factor, int initial_context_length, int loff,
+    int kv_total_size, int batch_size) {
   const int h = blockIdx.x;
   const int i = threadIdx.x;
   const int b = blockIdx.y;
   if (b >= batch_size)
     return;
 
-  const int half = head_dim >> 1;
+  const int half = D >> 1;
   if (i >= half)
     return;
 
@@ -122,19 +121,19 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
   if (pos_b < 0)
     return;
 
-  float freq = powf(rope_theta, (float)(2 * i) / (float)head_dim);
+  float freq = powf(theta, (float)(2 * i) / (float)D);
   float inv_freq;
   float concentration = 1.0f;
 
-  if (scaling_factor > 1.0f) {
-    concentration = 0.1f * logf(scaling_factor) + 1.0f;
+  if (rope_scaling_factor > 1.0f) {
+    concentration = 0.1f * logf(rope_scaling_factor) + 1.0f;
     float ntk_beta = 32.0f, ntk_alpha = 1.0f;
     float low = half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) /
-                logf(rope_theta);
+                logf(theta);
     float high = half *
                  logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) /
-                 logf(rope_theta);
-    float interpolation = 1.0f / (scaling_factor * freq);
+                 logf(theta);
+    float interpolation = 1.0f / (rope_scaling_factor * freq);
     float extrapolation = 1.0f / freq;
     float ramp = ((float)i - low) / (high - low);
     ramp = fmaxf(0.0f, fminf(1.0f, ramp));
@@ -149,22 +148,22 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
   float s = sinf(val) * concentration;
 
   // Apply to Q for this batch
-  if (h < n_q_heads) {
-    float *q_b = q + (size_t)b * n_q_heads * head_dim;
-    float x1 = q_b[h * head_dim + i];
-    float x2 = q_b[h * head_dim + half + i];
-    q_b[h * head_dim + i] = x1 * c - x2 * s;
-    q_b[h * head_dim + half + i] = x2 * c + x1 * s;
+  if (h < Hq) {
+    float *q_b = q + (size_t)b * Hq * D;
+    float x1 = q_b[h * D + i];
+    float x2 = q_b[h * D + half + i];
+    q_b[h * D + i] = x1 * c - x2 * s;
+    q_b[h * D + half + i] = x2 * c + x1 * s;
   }
 
-  if (h < n_k_heads) {
-    const int KV = n_k_heads * head_dim;
+  if (h < Hk) {
+    const int KV = Hk * D;
     const int cache_idx =
-        (size_t)b * kv_stride + layer_offset + pos_b * KV + h * head_dim;
-    float x1 = key_cache[cache_idx + i];
-    float x2 = key_cache[cache_idx + half + i];
-    key_cache[cache_idx + i] = x1 * c - x2 * s;
-    key_cache[cache_idx + half + i] = x2 * c + x1 * s;
+        (size_t)b * kv_total_size + loff + pos_b * KV + h * D;
+    float x1 = k_cache[cache_idx + i];
+    float x2 = k_cache[cache_idx + half + i];
+    k_cache[cache_idx + i] = x1 * c - x2 * s;
+    k_cache[cache_idx + half + i] = x2 * c + x1 * s;
   }
 }
 
