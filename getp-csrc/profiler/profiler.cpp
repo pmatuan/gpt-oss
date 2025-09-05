@@ -1,18 +1,9 @@
 #include "profiler.h"
+#include "../common/defines.h"
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
 #include <vector>
-
-#define HIP_CHECK(call)                                                        \
-  do {                                                                         \
-    hipError_t error = call;                                                   \
-    if (error != hipSuccess) {                                                 \
-      fprintf(stderr, "HIP error at %s:%d - %s\n", __FILE__, __LINE__,         \
-              hipGetErrorString(error));                                       \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
 
 #ifdef ENABLE_PROFILING
 

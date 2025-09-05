@@ -1,11 +1,11 @@
-#include "attention.cpp"
+#include "common/defines.h"
+#include "attention/attention.h"
+#include "attention/attention.cpp"
+#include "matmul/matmul.h"
+#include "matmul/matmul.cpp"
+#include "matmul/utility.cpp"
+#include "profiler/profiler.h"
 #include "getp_eval.cpp"
-#include "matmul.cpp"
-#include "profiler.h"
-#include "prompt_ctx.cpp"
-#include "utility.cpp"
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
 #include <math.h>
 #include <mutex>
 #include <omp.h>
@@ -18,53 +18,6 @@
 
 #ifndef GETP_RUN
 #define GETP_RUN
-
-struct GPUActivationBuffers {
-  float *d_x, *d_t, *d_tb, *d_tb2;
-  float *d_router_score, *d_topk_v;
-  int *d_topk_i;
-  float *d_gate_up, *d_e_agg;
-  float *d_gate_up_workspace; // Pre-allocated workspace for MLP
-  float *d_qkv, *d_q, *d_k, *d_v;
-  float *d_key_cache, *d_value_cache;
-  float *d_att, *d_logits, *d_mask;
-  float *d_cos_vals, *d_sin_vals;
-  int *d_token2row;
-  int *d_tokens;
-  int *d_pos;
-  float *d_inv_rms; // [B]
-};
-
-struct GPUWeightBuffersFP32 {
-  float *d_rms_attn_w, *d_rms_ffn_w;
-  float *d_b_qkv, *d_b_o, *d_attn_sinks;
-  float *d_w_router, *d_b_router;
-  float *d_rms_out_w;
-};
-
-struct GPUExpertBiasBuffers {
-  float *g_b_mlp1;
-  float *g_b_mlp2;
-};
-
-struct GPUWeightBuffersBF16 {
-  bf16_t *d_token_embedding_table_bf16;
-  bf16_t *d_w_qkv_bf16, *d_w_o_bf16;
-  bf16_t *d_w_mlp1_bf16, *d_w_mlp2_bf16;
-  bf16_t *d_out_bf16;
-};
-
-struct DeviceContext {
-  int device_id;
-
-  GPUActivationBuffers gpu_activations;
-  GPUWeightBuffersFP32 gpu_weights_fp32;
-  GPUExpertBiasBuffers gpu_expert_bias;
-  GPUWeightBuffersBF16 gpu_weights_bf16;
-  int capacity_B = 1;
-  hipStream_t *streams = nullptr;
-  int n_streams = 0;
-};
 
 static Config *model_config;
 

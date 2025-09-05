@@ -1,19 +1,7 @@
 // matmul.cpp — GEMM-tiled, multi-batch per block (no per-batch matvec loops)
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
+#include "../common/defines.h"
+#include "matmul.h"
 #include <math.h>
-
-typedef hip_bfloat16 bf16_t;
-
-// ============================ Configuration ============================
-#define TK 512
-#define TM 8
-#define BLOCK_SIZE 512
-#define LDS_PAD 16
-#define WF_SIZE 64
-
-#define BATCH_TILE_DEFAULT 4
-#define BATCH_TILE_LIGHT   2   // dùng cho kernel có nhiều truy cập W phụ thuộc batch (MoE)
 
 // ============================ Utility ============================
 

@@ -1,25 +1,9 @@
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
+#include "../common/defines.h"
+#include "matmul.h"
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-#define TM 8
-#define BLOCK_SIZE 512
-#define WF_SIZE 64
-#define TK 512
-#define LDS_PAD 16
-
-#define HIP_CHECK(call)                                                        \
-  do {                                                                         \
-    hipError_t error = call;                                                   \
-    if (error != hipSuccess) {                                                 \
-      fprintf(stderr, "HIP error at %s:%d - %s\n", __FILE__, __LINE__,         \
-              hipGetErrorString(error));                                       \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
 
 static inline void debug_print_gpu_memory(const char *tag, int device_id = 0) {
   size_t free_b = 0, total_b = 0;
