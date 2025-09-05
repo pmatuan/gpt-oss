@@ -1,5 +1,5 @@
 #include "../common/defines.h"
-#include "matmul.h"
+#include "utility.h"
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>

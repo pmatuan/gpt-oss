@@ -1,9 +1,10 @@
 #include "common/defines.h"
+#include "utility/utility.h"
+#include "utility/utility.cpp"
 #include "attention/attention.h"
 #include "attention/attention.cpp"
 #include "matmul/matmul.h"
 #include "matmul/matmul.cpp"
-#include "matmul/utility.cpp"
 #include "profiler/profiler.h"
 #include "getp_eval.cpp"
 #include <math.h>
