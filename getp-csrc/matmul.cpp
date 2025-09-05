@@ -207,12 +207,11 @@ void matmul_bias_gemm_kernel(
 }
 
 // ================= MLP1 (Gate & Up) : all-topk, single launch =================
-template <typename T>
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void mlp1_fused_gemm_kernel(
     float* __restrict__ gate_up_topk, // [K, B, IM]  (K=experts_per_token)
     const float* __restrict__ x,      // [B, H]
-    const T* __restrict__ w_mlp1_all, // [L, E, 2*IM, H]
+    const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H]
     const float* __restrict__ b_mlp1_all, // [L, E, 2*IM]
     const int* __restrict__ topk_i,   // [B, K]
     const int* __restrict__ pos,      // [B]
@@ -274,20 +273,12 @@ void mlp1_fused_gemm_kernel(
       float* xptrs[1] = { lds_x[bi] };
       { // Gate
         float tmp[1] = {0.f};
-        if constexpr (std::is_same_v<T, bf16_t>) {
-          gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + gate_off), xptrs, k_size, lane, tmp);
-        } else {
-          gemm_row_tile_fp32_multiB<1>((const float*)(w_mlp1_all + gate_off), xptrs, k_size, lane, tmp);
-        }
+        gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + gate_off), xptrs, k_size, lane, tmp);
         acc_gate[bi] += tmp[0];
       }
       { // Up
         float tmp[1] = {0.f};
-        if constexpr (std::is_same_v<T, bf16_t>) {
-          gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + up_off), xptrs, k_size, lane, tmp);
-        } else {
-          gemm_row_tile_fp32_multiB<1>((const float*)(w_mlp1_all + up_off), xptrs, k_size, lane, tmp);
-        }
+        gemm_row_tile_bf16_multiB<1>((const bf16_t*)(w_mlp1_all + up_off), xptrs, k_size, lane, tmp);
         acc_up[bi] += tmp[0];
       }
     }
@@ -321,12 +312,11 @@ void mlp1_fused_gemm_kernel(
 
 
 // ================= MLP2 (weighted accum) : all-topk, single launch ============
-template <typename T>
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void mlp2_bias_weighted_accum_gemm_kernel(
     float* __restrict__ e_agg,         // [B, H]
     const float* __restrict__ gate_up_topk, // [K, B, IM]
-    const T* __restrict__ w_mlp2_all,  // [L, E, H, IM]
+    const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
     const float* __restrict__ b_mlp2_all,   // [L, E, H]
     const int* __restrict__ topk_i,    // [B, K]
     const float* __restrict__ topk_v,  // [B, K]
@@ -384,15 +374,11 @@ void mlp2_bias_weighted_accum_gemm_kernel(
       if (!b_valid[bi] || expert_id[bi] < 0) continue;
 
       const size_t base = ((size_t)l_layer * E + expert_id[bi]) * (size_t)H * (size_t)IM;
-      const T* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
+      const bf16_t* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
 
       float* xptrs[1] = { lds_x[bi] };
       float tmp[1] = {0.f};
-      if constexpr (std::is_same_v<T, bf16_t>) {
-        gemm_row_tile_bf16_multiB<1>((const bf16_t*)w_row, xptrs, k_size, lane, tmp);
-      } else {
-        gemm_row_tile_fp32_multiB<1>((const float*)w_row, xptrs, k_size, lane, tmp);
-      }
+      gemm_row_tile_bf16_multiB<1>(w_row, xptrs, k_size, lane, tmp);
       acc_row[bi] += tmp[0];
     }
     __syncthreads();

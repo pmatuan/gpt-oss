@@ -710,7 +710,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       constexpr int BATCH_TILE = 2;
       dim3 gridIM_gemm = get_gemm_grid_dim(IM, batch_size, BATCH_TILE);
       gridIM_gemm.z = p->experts_per_token; // <--- added
-      mlp1_fused_gemm_kernel<bf16_t><<<gridIM_gemm, block, 0>>>(
+      mlp1_fused_gemm_kernel<<<gridIM_gemm, block, 0>>>(
           /*gate_up_topk[K,B,IM]*/ d_gate_up_topk,
           /*x[B,H]*/ ctx.gpu_activations.d_t,
           /*w*/ ctx.gpu_weights_bf16.d_w_mlp1_bf16,
@@ -731,7 +731,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       constexpr int BATCH_TILE = 2;
       dim3 gridHB_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
       gridHB_gemm.z = p->experts_per_token; // <--- added
-      mlp2_bias_weighted_accum_gemm_kernel<bf16_t><<<gridHB_gemm, block, 0>>>(
+      mlp2_bias_weighted_accum_gemm_kernel<<<gridHB_gemm, block, 0>>>(
           /*e_agg[B,H]*/ ctx.gpu_activations.d_e_agg,
           /*gate_up[K,B,IM]*/ d_gate_up_topk,
           /*w*/ ctx.gpu_weights_bf16.d_w_mlp2_bf16,
