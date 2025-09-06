@@ -591,8 +591,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       // Then apply MatMul + Bias
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-        constexpr int BATCH_TILE = 2;
-        dim3 gridQKV_gemm = get_gemm_grid_dim(QKV_D, batch_size, BATCH_TILE);
+        dim3 gridQKV_gemm = get_gemm_grid_dim(QKV_D, batch_size);
         matmul_bias_gemm_kernel<bf16_t><<<gridQKV_gemm, block, 0>>>(
             ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
@@ -646,8 +645,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-        constexpr int BATCH_TILE = 2;
-        dim3 gridO_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
+        dim3 gridO_gemm = get_gemm_grid_dim(H, batch_size);
         matmul_bias_gemm_kernel<bf16_t><<<gridO_gemm, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
@@ -677,8 +675,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
     {
       PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-      constexpr int BATCH_TILE = 8; // Use larger tile for smaller matrices
-      dim3 gridE_gemm = get_gemm_grid_dim(E, batch_size, BATCH_TILE);
+      dim3 gridE_gemm = get_gemm_grid_dim(E, batch_size);
       matmul_bias_gemm_kernel<float><<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
           ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
@@ -777,8 +774,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     // 2) MatMul for logits - separate GEMM version
     {
       PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-      constexpr int BATCH_TILE = 4;
-      dim3 gridV_gemm = get_gemm_grid_dim(V, batch_size, BATCH_TILE);
+      dim3 gridV_gemm = get_gemm_grid_dim(V, batch_size);
       matmul_bias_gemm_kernel<bf16_t><<<gridV_gemm, block, 0>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_out_bf16, nullptr, ctx.gpu_activations.d_pos,
