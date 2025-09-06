@@ -9,6 +9,7 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
 // Grid Dimension Utilities
 inline dim3 get_gemv_grid_dim(int d);
 inline dim3 get_gemm_grid_dim(int d, int batch_size);
+inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile);
 
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1);
 __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
