@@ -86,84 +86,91 @@ __device__ __forceinline__ void gemm_row_tile_bf16_multiB(
  * x: [B, n], w: [d, n], y: [B, d]
  * Grid: (ceil(d/TM), ceil(B/CB))
  */
-template <typename T>
-__launch_bounds__(BLOCK_SIZE, 1) __global__
-void matmul_bias_gemm_kernel(
-    float* __restrict__ y,
-    const float* __restrict__ x,
-    const T* __restrict__ w,
-    const float* __restrict__ b,
-    const int* __restrict__ pos,
-    int n, int d, int batch_size) {
-
-  constexpr int CB = BATCH_TILE_DEFAULT;
-  __shared__ __align__(16) float lds_x[CB][TK + LDS_PAD];
-
-  const int tid  = threadIdx.x;
-  const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6; // warp id in block
-  const int row  = blockIdx.x * TM + wid;
-  const int b0   = blockIdx.y * CB;
-
-  if (wid >= TM || row >= d) return;
-
-  // Valid mask per batch col
-  int b_idx[CB];
-  bool b_valid[CB];
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    b_idx[bi] = b0 + bi;
-    b_valid[bi] = (b_idx[bi] < batch_size) && (pos[b_idx[bi]] >= 0);
-  }
-
-  // Accumulators per batch column
-  float acc[CB];
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) acc[bi] = 0.f;
-
-  // K loop
-  for (int k_base = 0; k_base < n; k_base += TK) {
-    const int k_size = min(TK, n - k_base);
-
-    // Load CB columns of X into shared once
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) {
-      const int b = b_idx[bi];
-      if (b_valid[bi]) {
-        const float* xb = x + (size_t)b * n + k_base;
-        for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = xb[k];
-      } else {
-        for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[bi][k] = 0.f;
-      }
-    }
-    __syncthreads();
-
-    // One weight row slice (shared across CB)
-    const T* __restrict__ w_row = w + (size_t)row * n + k_base;
-
-    // Build pointer list for inner
-    float* xptrs[CB];
-#pragma unroll
-    for (int bi = 0; bi < CB; ++bi) xptrs[bi] = lds_x[bi];
-
-    if constexpr (std::is_same_v<T, bf16_t>) {
-      gemm_row_tile_bf16_multiB<CB>(reinterpret_cast<const bf16_t*>(w_row), xptrs, k_size, lane, acc);
-    } else {
-      gemm_row_tile_fp32_multiB<CB>(reinterpret_cast<const float*>(w_row), xptrs, k_size, lane, acc);
-    }
-    __syncthreads();
-  }
-
-  // Reduce within warp and write
-#pragma unroll
-  for (int bi = 0; bi < CB; ++bi) {
-    float v = warp_reduce_sum(acc[bi]);
-    if (lane == 0 && b_valid[bi]) {
-      float* yb = y + (size_t)b_idx[bi] * d;
-      yb[row] = v + (b ? b[row] : 0.0f);
-    }
-  }
-}
+ template <typename T>
+ __launch_bounds__(BLOCK_SIZE, 1) __global__
+ void matmul_bias_gemm_kernel(
+     float* __restrict__ y,          // [B, d]
+     const float* __restrict__ x,    // [B, n]
+     const T* __restrict__ w,        // [d, n] (row-major theo n)
+     const float* __restrict__ bias, // [d] (có thể null)
+     const int* __restrict__ pos,    // [B] (slot inactive nếu pos[b] < 0)
+     int n, int d, int batch_size)
+ {
+   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+ 
+   const int tid  = threadIdx.x;
+   const int lane = tid & (WF_SIZE - 1);
+   const int wid  = tid >> 6;                 // warp id trong block (0..TM-1)
+ 
+   const int row  = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+   const int b    = blockIdx.y;               // batch index (0..B-1)
+ 
+   if (wid >= TM || row >= d || b >= batch_size) return;
+   if (pos[b] < 0) return; // slot inactive
+ 
+   float acc = 0.f;
+ 
+   // Vòng K
+   for (int k_base = 0; k_base < n; k_base += TK) {
+     const int k_size = min(TK, n - k_base);
+ 
+     // 1) Tải 1 cột X của batch b vào shared (không CB)
+     const float* __restrict__ xb = x + (size_t)b * n + k_base;
+     for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[k] = xb[k];
+     __syncthreads();
+ 
+     // 2) Lấy 1 lát hàng của W (row fixed), tính dot với lds_x
+     const T* __restrict__ w_row = w + (size_t)row * n + k_base;
+ 
+     if constexpr (std::is_same_v<T, bf16_t>) {
+       // tải bf16 -> fp32, vector theo cặp
+       const unsigned short* wbf = reinterpret_cast<const unsigned short*>(w_row);
+       const int vec2 = (k_size >> 1); // 2 phần tử mỗi lần
+       for (int v = lane; v < vec2; v += WF_SIZE) {
+         // pack 2 bf16 thành 1 u32 rồi convert ra 2 float
+         const uint32_t packed =
+             ((uint32_t)wbf[(v << 1) + 0]) |
+             (((uint32_t)wbf[(v << 1) + 1]) << 16);
+         float f0, f1; bf16pair_to_float2(packed, f0, f1);
+         const int k = v << 1;
+         acc = fmaf(f0, lds_x[k + 0], acc);
+         acc = fmaf(f1, lds_x[k + 1], acc);
+       }
+       // phần lẻ
+       if (k_size & 1) {
+         const int k = k_size - 1;
+         if ((k & (WF_SIZE - 1)) == lane) {
+           uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
+           union { uint32_t u; float f; } cvt; cvt.u = u;
+           acc = fmaf(cvt.f, lds_x[k], acc);
+         }
+       }
+     } else {
+       // w là float32
+       const int vec4 = (k_size >> 2);
+       const float4* __restrict__ w4 = reinterpret_cast<const float4*>(w_row);
+       for (int v = lane; v < vec4; v += WF_SIZE) {
+         const float4 wv = w4[v];
+         const float4 xv = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
+         acc = fmaf(wv.x, xv.x, acc);
+         acc = fmaf(wv.y, xv.y, acc);
+         acc = fmaf(wv.z, xv.z, acc);
+         acc = fmaf(wv.w, xv.w, acc);
+       }
+       for (int k = (vec4 << 2) + lane; k < k_size; k += WF_SIZE) {
+         acc = fmaf(reinterpret_cast<const float*>(w_row)[k], lds_x[k], acc);
+       }
+     }
+     __syncthreads();
+   }
+ 
+   // reduce trong warp
+   float v = warp_reduce_sum(acc);
+   if (lane == 0) {
+     float* __restrict__ yb = y + (size_t)b * d;
+     yb[row] = v + (bias ? bias[row] : 0.0f);
+   }
+ }
 
 // ================= MLP1 (Gate & Up) : per-batch, no CB =================
 __launch_bounds__(BLOCK_SIZE, 1) __global__

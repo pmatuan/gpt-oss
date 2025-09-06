@@ -23,8 +23,8 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id) {
 
 inline dim3 get_gemv_grid_dim(int d) { return dim3((d + TM - 1) / TM, 1, 1); }
 
-inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile) { 
-  return dim3((d + TM - 1) / TM, (batch_size + batch_tile - 1) / batch_tile, 1); 
+inline dim3 get_gemm_grid_dim(int d, int batch_size) {
+  return dim3((d + TM - 1) / TM, batch_size, 1);
 }
 
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
