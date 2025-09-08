@@ -75,6 +75,7 @@ OMP_NUM_THREADS=4 ./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m generate -i "test"
 
 ### EDITING RESTRICTIONS
 - **ONLY edit files in `getp-csrc/` folder** (this is the only area for modifications)
+- **DO NOT CREATE NEW FILES** - Only modify existing files within allowed directories
 - **DO NOT MODIFY**:
   - `run.cpp` - Main program file
   - `getp-csrc/getp_eval.cpp` - Evaluation logic  
