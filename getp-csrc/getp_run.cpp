@@ -815,11 +815,6 @@ static long long run_requests_on_device(Transformer *transformer,
   const int S = p->seq_len;
   DeviceContext &dctx = g_devices[device_id];
 
-  // Clear K/V caches to avoid any stale data from previous runs
-  size_t kv_bytes = (size_t)B * L * S * KV * sizeof(float);
-  HIP_CHECK(hipMemset(dctx.gpu_activations.d_key_cache, 0, kv_bytes));
-  HIP_CHECK(hipMemset(dctx.gpu_activations.d_value_cache, 0, kv_bytes));
-
   // Temporary host buffer for batched logits
   const int V = p->vocab_size;
   std::vector<float> h_logits_batch((size_t)B * V);
