@@ -552,8 +552,6 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   const int L = p->n_layers;
   const int V = p->vocab_size;
 
-  ensure_device_capacity(ctx, batch_size);
-
   // Copy host tokens/positions into device buffers
   HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_tokens, tokens,
                       (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
