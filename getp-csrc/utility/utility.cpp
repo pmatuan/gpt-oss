@@ -188,26 +188,43 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   const float *x_b = x + (size_t)b * size;
   float *o_b = o + (size_t)b * size;
 
+  // Vectorized sum of squares using float4
   float sum = 0.0f;
-  for (int i = tid; i < size; i += blockDim.x) {
-    float v = x_b[i];
-    sum += v * v;
+  const int size4 = size >> 2;
+  
+  // Process float4 chunks
+  for (int i = tid; i < size4; i += blockDim.x) {
+    float4 v = reinterpret_cast<const float4*>(x_b)[i];
+    sum = fmaf(v.x, v.x, sum);
+    sum = fmaf(v.y, v.y, sum);
+    sum = fmaf(v.z, v.z, sum);
+    sum = fmaf(v.w, v.w, sum);
   }
+  
+  // Handle remaining elements
+  for (int i = (size4 << 2) + tid; i < size; i += blockDim.x) {
+    float v = x_b[i];
+    sum = fmaf(v, v, sum);
+  }
+
+  // Warp reduction
 #pragma unroll
   for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
     sum += __shfl_down(sum, off, WF_SIZE);
   }
+  
   __shared__ float warp_sums[BLOCK_SIZE / WF_SIZE];
   if (lane == 0)
     warp_sums[wid] = sum;
   __syncthreads();
 
-  float total = 0.f;
+  // Block reduction
+  float total = 0.0f;
   if (tid < BLOCK_SIZE / WF_SIZE)
     total = warp_sums[tid];
 
   if (wid == 0) {
-    float t = (tid < BLOCK_SIZE / WF_SIZE) ? total : 0.f;
+    float t = (tid < BLOCK_SIZE / WF_SIZE) ? total : 0.0f;
 #pragma unroll
     for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
       t += __shfl_down(t, off, WF_SIZE);
@@ -217,14 +234,31 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   }
   __syncthreads();
 
-  const float inv = rsqrtf(warp_sums[0] / (float)size + 1e-5f);
-  for (int i = tid; i < size; i += blockDim.x) {
-    o_b[i] = weight[i] * (x_b[i] * inv);
+  // Use rsqrt directly as in Python reference
+  const float mean_sq = warp_sums[0] / (float)size;
+  const float inv_rms = rsqrtf(mean_sq + 1e-5f);
+  
+  // Vectorized output computation
+  for (int i = tid; i < size4; i += blockDim.x) {
+    float4 v = reinterpret_cast<const float4*>(x_b)[i];
+    float4 w = reinterpret_cast<const float4*>(weight)[i];
+    float4 result;
+    result.x = w.x * (v.x * inv_rms);
+    result.y = w.y * (v.y * inv_rms);
+    result.z = w.z * (v.z * inv_rms);
+    result.w = w.w * (v.w * inv_rms);
+    reinterpret_cast<float4*>(o_b)[i] = result;
+  }
+  
+  // Handle remaining elements
+  for (int i = (size4 << 2) + tid; i < size; i += blockDim.x) {
+    o_b[i] = weight[i] * (x_b[i] * inv_rms);
   }
 }
 
 /**
  * Compute inv RMS per sample: inv_rms = rsqrt(mean(x^2)+eps)
+ * Optimized with vectorization
  */
  __global__ void compute_inv_rms_batch_kernel(
   float* __restrict__ out_inv,
@@ -238,11 +272,23 @@ if (b >= batch_size) return;
 if (pos[b] < 0) { if (threadIdx.x == 0) out_inv[b] = 0.0f; return; }
 
 const float* xb = x + (size_t)b * H;
+const int H4 = H >> 2;
 
-float sum = 0.f;
-for (int i = threadIdx.x; i < H; i += blockDim.x) {
-  float v = xb[i]; sum = fmaf(v, v, sum);
+// Vectorized sum of squares
+float sum = 0.0f;
+for (int i = threadIdx.x; i < H4; i += blockDim.x) {
+  float4 v = reinterpret_cast<const float4*>(xb)[i];
+  sum = fmaf(v.x, v.x, sum);
+  sum = fmaf(v.y, v.y, sum);
+  sum = fmaf(v.z, v.z, sum);
+  sum = fmaf(v.w, v.w, sum);
 }
+// Handle remainder
+for (int i = (H4 << 2) + threadIdx.x; i < H; i += blockDim.x) {
+  float v = xb[i];
+  sum = fmaf(v, v, sum);
+}
+
 sum = warp_reduce_sum(sum);
 
 __shared__ float warp_sums[1024 / WF_SIZE];
@@ -252,10 +298,10 @@ const int wid  = threadIdx.x >> 6;
 if (lane == 0) warp_sums[wid] = sum;
 __syncthreads();
 
-float total = 0.f;
+float total = 0.0f;
 if (wid == 0) {
   const int num_warps = blockDim.x / WF_SIZE;
-  total = (threadIdx.x < num_warps) ? warp_sums[threadIdx.x] : 0.f;
+  total = (threadIdx.x < num_warps) ? warp_sums[threadIdx.x] : 0.0f;
   total = warp_reduce_sum(total);
   if (lane == 0) {
     float mean_sq = total / (float)H;
@@ -337,20 +383,20 @@ __global__ void fused_topk_softmax_batch_kernel(
     __syncthreads();
   }
 
-  // Step 2: Fused Softmax on top-k values
+  // Step 2: Fused Softmax on top-k values with fast intrinsics
   if (tid == 0) {
     float max_val = topk_values_b[0];
     for (int i = 1; i < experts_per_token; i++)
-      max_val = fmax(max_val, topk_values_b[i]);
+      max_val = fmaxf(max_val, topk_values_b[i]);
 
     float sum = 0.0f;
     for (int i = 0; i < experts_per_token; i++) {
-      float ev = expf(topk_values_b[i] - max_val);
+      float ev = __expf(topk_values_b[i] - max_val); // Use fast exp
       topk_values_b[i] = ev;
       sum += ev;
     }
 
-    float inv_sum = 1.0f / sum;
+    float inv_sum = __frcp_rn(sum); // Use fast reciprocal
     for (int i = 0; i < experts_per_token; i++)
       topk_values_b[i] *= inv_sum;
   }

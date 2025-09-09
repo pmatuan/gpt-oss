@@ -37,7 +37,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
 
   extern __shared__ float s_att[];
 
-  // Compute attention scores
+  // Compute attention scores with enhanced vectorization
   for (int t = lane; t <= pos_b; t += WF_SIZE) {
     const float *k_ptr = k_layer + t * kv_dim + kv_head * D;
     const float *q_ptr = q_b + head * D;
@@ -47,6 +47,8 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     const float4 *k4 = reinterpret_cast<const float4 *>(k_ptr);
     const float4 *q4 = reinterpret_cast<const float4 *>(q_ptr);
 
+    // Unrolled vectorized dot product for better ILP
+    #pragma unroll 4
     for (int d4 = 0; d4 < D4; ++d4) {
       float4 kv = k4[d4];
       float4 qv = q4[d4];
@@ -55,9 +57,13 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
       score = fmaf(qv.z, kv.z, score);
       score = fmaf(qv.w, kv.w, score);
     }
+    
+    // Handle remainder
     for (int d = (D4 << 2); d < D; ++d) {
       score = fmaf(q_ptr[d], k_ptr[d], score);
     }
+    
+    // Scale and apply mask
     score *= rsqrt_D;
     if (mask)
       score += mask[pos_b * S + t];
@@ -72,9 +78,11 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
   }
   __syncthreads();
 
-  // Softmax over 0..pos_b+1
+  // Softmax over 0..pos_b+1 with optimizations from Python reference
   const int att_size = pos_b + 2;
   float maxv = -INFINITY;
+  
+  // Find max in warp-parallel fashion
   for (int i = lane; i < att_size; i += WF_SIZE)
     maxv = fmaxf(maxv, s_att[i]);
 #pragma unroll
@@ -82,35 +90,56 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     maxv = fmaxf(maxv, __shfl_down(maxv, off, WF_SIZE));
   maxv = __shfl(maxv, 0, WF_SIZE);
 
+  // Compute exp and sum in one pass
   float sum = 0.0f;
   for (int i = lane; i < att_size; i += WF_SIZE) {
-    float v = __expf(s_att[i] - maxv); // Use faster exp
+    float v = __expf(s_att[i] - maxv); // Use fast exp intrinsic
     s_att[i] = v;
     sum += v;
   }
+  
+  // Warp reduction for sum
 #pragma unroll
   for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
     sum += __shfl_down(sum, off, WF_SIZE);
   sum = __shfl(sum, 0, WF_SIZE);
 
-  float inv_sum = __frcp_rn(sum); // Use faster reciprocal
+  // Use fast reciprocal approximation (like Python's 1/sum)
+  float inv_sum = __frcp_rn(sum); // Fast reciprocal
   for (int i = lane; i < att_size; i += WF_SIZE)
     s_att[i] *= inv_sum;
   __syncthreads();
 
-  // Weighted sum of V
+  // Weighted sum of V with improved memory access pattern
   const int threads_per_dim = min(WF_SIZE, D);
   if (lane < threads_per_dim) {
     const int dims_per_thread = (D + threads_per_dim - 1) / threads_per_dim;
     const int start_dim = lane * dims_per_thread;
     const int end_dim = min(start_dim + dims_per_thread, D);
 
+    // Process multiple dimensions per thread for better memory coalescing
     for (int d = start_dim; d < end_dim; ++d) {
       float result = 0.0f;
-      for (int t = 0; t <= pos_b; ++t) {
+      
+      // Tile the loop for better cache utilization
+      const int TILE = 8;
+      int t = 0;
+      
+      // Process in tiles
+      for (; t <= pos_b - TILE + 1; t += TILE) {
+        #pragma unroll
+        for (int ti = 0; ti < TILE; ++ti) {
+          const float *v_ptr = v_layer + (t + ti) * kv_dim + kv_head * D;
+          result = fmaf(s_att[t + ti], v_ptr[d], result);
+        }
+      }
+      
+      // Handle remainder
+      for (; t <= pos_b; ++t) {
         const float *v_ptr = v_layer + t * kv_dim + kv_head * D;
         result = fmaf(s_att[t], v_ptr[d], result);
       }
+      
       out_b[head * D + d] = result;
     }
   }
