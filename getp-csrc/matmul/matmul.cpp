@@ -3,30 +3,47 @@
 #include "matmul.h"
 #include <math.h>
 
-template<int CB>
+template <int CB>
 __device__ __forceinline__ void gemm_row_tile_fp32_multiB(
-    const float* __restrict__ w_row,         // [k_size] (slice of row)
-    float* __restrict__ lds_x[CB],           // CB pointers -> [k_size] each
+    const float *__restrict__ w_row,
+    float *__restrict__ lds_x[CB],
     int k_size, int lane, float acc[CB]) {
+  const int vec_k = (k_size / MFMA_K) * MFMA_K;
 
-  const int vec4 = (k_size / 4) * 4;
-  // Vector loop: 4 elements per lane-step
-  for (int k = lane * 4; k < vec4; k += WF_SIZE * 4) {
-    const float4 wv = *reinterpret_cast<const float4*>(&w_row[k]);
+  for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
+    if (k + MFMA_K <= vec_k) {
+      mfma_float4 w_vec;
 #pragma unroll
-    for (int b = 0; b < CB; ++b) {
-      const float4 xv = *reinterpret_cast<const float4*>(&lds_x[b][k]);
-      acc[b] = fmaf(wv.x, xv.x, acc[b]);
-      acc[b] = fmaf(wv.y, xv.y, acc[b]);
-      acc[b] = fmaf(wv.z, xv.z, acc[b]);
-      acc[b] = fmaf(wv.w, xv.w, acc[b]);
+      for (int i = 0; i < MFMA_K; ++i) {
+        w_vec[i] = w_row[k + i];
+      }
+
+#pragma unroll
+      for (int b = 0; b < CB; ++b) {
+        mfma_float4 x_vec;
+#pragma unroll
+        for (int i = 0; i < MFMA_K; ++i) {
+          x_vec[i] = lds_x[b][k + i];
+        }
+
+        mfma_float4 acc_vec = {0};
+
+        acc_vec = __builtin_amdgcn_mfma_f32_16x16x4f32(w_vec[0], x_vec[0],
+                                                       acc_vec, 0, 0, 0);
+
+#pragma unroll
+        for (int i = 0; i < MFMA_K; ++i) {
+          acc[b] = fmaf(w_vec[i], x_vec[i], acc[b]);
+        }
+      }
     }
   }
-  // Tail
-  for (int k = vec4 + lane; k < k_size; k += WF_SIZE) {
+
+  for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
+    float w_val = w_row[k];
 #pragma unroll
     for (int b = 0; b < CB; ++b) {
-      acc[b] = fmaf(w_row[k], lds_x[b][k], acc[b]);
+      acc[b] = fmaf(w_val, lds_x[b][k], acc[b]);
     }
   }
 }
