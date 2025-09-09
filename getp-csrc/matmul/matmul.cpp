@@ -53,47 +53,47 @@ __device__ __forceinline__ void gemm_row_tile_bf16_multiB(
     const bf16_t* __restrict__ w_row_bf16,   // [k_size] (slice of row, bf16)
     float* __restrict__ lds_x[CB],           // CB pointers -> [k_size] each (fp32)
     int k_size, int lane, float acc[CB]) {
+  
+  const int vec_k = (k_size / MFMA_K) * MFMA_K;
 
-  // Treat weights as bf16 quad (uint2)
-  const uint2* __restrict__ wq = reinterpret_cast<const uint2*>(w_row_bf16);
-  const int vec4 = (k_size / 4) * 4;
-
-  // 4-wide vector loop
-  for (int k = lane * 4; k < vec4; k += WF_SIZE * 4) {
-    const float4 wv = bf16quad_to_float4(wq[k >> 2]);
+  for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
+    if (k + MFMA_K <= vec_k) {
+      mfma_float4 w_vec;
 #pragma unroll
-    for (int b = 0; b < CB; ++b) {
-      const float4 xv = *reinterpret_cast<const float4*>(&lds_x[b][k]);
-      acc[b] = fmaf(wv.x, xv.x, acc[b]);
-      acc[b] = fmaf(wv.y, xv.y, acc[b]);
-      acc[b] = fmaf(wv.z, xv.z, acc[b]);
-      acc[b] = fmaf(wv.w, xv.w, acc[b]);
+      for (int i = 0; i < MFMA_K; ++i) {
+        uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row_bf16[k + i]))) << 16;
+        union { uint32_t u; float f; } cvt; cvt.u = u;
+        w_vec[i] = cvt.f;
+      }
+
+#pragma unroll
+      for (int b = 0; b < CB; ++b) {
+        mfma_float4 x_vec;
+#pragma unroll
+        for (int i = 0; i < MFMA_K; ++i) {
+          x_vec[i] = lds_x[b][k + i];
+        }
+
+        mfma_float4 acc_vec = {0};
+
+        acc_vec = __builtin_amdgcn_mfma_f32_16x16x4f32(w_vec[0], x_vec[0],
+                                                       acc_vec, 0, 0, 0);
+
+#pragma unroll
+        for (int i = 0; i < MFMA_K; ++i) {
+          acc[b] = fmaf(w_vec[i], x_vec[i], acc[b]);
+        }
+      }
     }
   }
-  // Tail (pairs + singles)
-  // pairs
-  const uint32_t* __restrict__ w32 = reinterpret_cast<const uint32_t*>(w_row_bf16);
-  const int pairs = k_size >> 1;
-  const int vec_pairs = (vec4 >> 1);
-  for (int p = vec_pairs + lane; p < pairs; p += WF_SIZE) {
-    const int k = p << 1;
-    float w0, w1; bf16pair_to_float2(w32[p], w0, w1);
+
+  for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
+    uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row_bf16[k]))) << 16;
+    union { uint32_t u; float f; } cvt; cvt.u = u;
+    float w_val = cvt.f;
 #pragma unroll
     for (int b = 0; b < CB; ++b) {
-      float a = fmaf(w0, lds_x[b][k], 0.f);
-      float bacc = a;
-      if (k + 1 < k_size) bacc = fmaf(w1, lds_x[b][k + 1], bacc);
-      acc[b] += bacc;
-    }
-  }
-  // odd
-  if (k_size & 1) {
-    const int k = k_size - 1;
-    if ((k & (WF_SIZE - 1)) == lane) {
-      uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row_bf16[k]))) << 16;
-      union { uint32_t u; float f; } cvt; cvt.u = u;
-#pragma unroll
-      for (int b = 0; b < CB; ++b) acc[b] = fmaf(cvt.f, lds_x[b][k], acc[b]);
+      acc[b] = fmaf(w_val, lds_x[b][k], acc[b]);
     }
   }
 }
