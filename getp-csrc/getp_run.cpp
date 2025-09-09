@@ -569,7 +569,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
       // Then apply MatMul + Bias
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
+        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel<bf16>", 0);
         constexpr int BATCH_TILE = 4;
         dim3 gridQKV_gemm((QKV_D + TM - 1) / TM, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
         matmul_bias_gemm_kernel<bf16_t><<<gridQKV_gemm, block, 0>>>(
@@ -624,7 +624,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
+        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel<bf16>", 0);
         constexpr int BATCH_TILE = 4;
         dim3 gridO_gemm((H + TM - 1) / TM, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
         matmul_bias_gemm_kernel<bf16_t><<<gridO_gemm, block, 0>>>(
@@ -655,7 +655,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     }
 
     {
-      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel<float>", 0);
       constexpr int BATCH_TILE = 4;
       dim3 gridE_gemm((E + TM - 1) / TM, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
       matmul_bias_gemm_kernel<float><<<gridE_gemm, block, 0>>>(
@@ -757,7 +757,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
     // 2) MatMul for logits - separate GEMM version
     {
-      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel<bf16>", 0);
       constexpr int BATCH_TILE = 4;
       dim3 gridV_gemm((V + TM - 1) / TM, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1);
       matmul_bias_gemm_kernel<bf16_t><<<gridV_gemm, block, 0>>>(
