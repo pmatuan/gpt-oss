@@ -509,25 +509,6 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
     if (first_piece)
       ctx.output_str += first_piece;
   }
-
-  // debug print, will be removed
-  printf("PromptCtx:\n"
-         "  idx: %d\n"
-         "  input_seq: %s\n"
-         "  num_prompt_tokens: %d\n"
-         "  logits_size: %d\n"
-         "  pos: %d\n"
-         "  token: %d\n"
-         "  is_context_phase: %d\n"
-         "  finished: %d\n"
-         "  num_generated: %lld\n"
-         "  start_time: %f\n"
-         "  end_time: %f\n"
-         "  user_data: %p\n",
-         ctx.idx, ctx.input_seq.c_str(), ctx.num_prompt_tokens, ctx.logits_size,
-         ctx.pos, ctx.token, ctx.is_context_phase, ctx.finished,
-         ctx.num_generated, ctx.start_time, ctx.end_time, ctx.user_data);
-  fflush(stdout);
 }
 
 // Batched single-step decode forward. Expects pos[b] >= 0 for active slots;

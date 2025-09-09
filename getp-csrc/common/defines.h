@@ -15,6 +15,11 @@ typedef hip_bfloat16 bf16_t;
 #define TM 8
 #define TK 512
 #define LDS_PAD 16
+#define MFMA_M 16
+#define MFMA_N 16
+#define MFMA_K 4
+
+using mfma_float4 = __attribute__( (__vector_size__(MFMA_K * sizeof(float)) )) float;
 
 // Batch Processing Constants
 #define BATCH_TILE_DEFAULT 4
