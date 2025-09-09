@@ -175,10 +175,10 @@ __global__ void residual_add_batch_kernel(float *x, const float *residual,
 }
 
 __global__ void rmsnorm_batch_kernel(float *o, const float *x,
-                                     const float *weight, const int *pos,
-                                     int size, int batch_size) {
+                                     const float *weight, int size, 
+                                     int batch_size) {
   const int b = blockIdx.y;
-  if (b >= batch_size || pos[b] < 0)
+  if (b >= batch_size)
     return;
 
   const int tid = threadIdx.x;

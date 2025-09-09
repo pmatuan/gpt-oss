@@ -564,7 +564,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
             ctx.gpu_weights_fp32.d_rms_attn_w + l * H,
-            ctx.gpu_activations.d_pos, H, batch_size);
+            H, batch_size);
       }
 
       // Then apply MatMul + Bias
@@ -650,7 +650,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(gridH.x, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, ctx.gpu_activations.d_pos,
+          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H,
           H, batch_size);
     }
 
@@ -751,7 +751,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(gridH.x, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_fp32.d_rms_out_w, ctx.gpu_activations.d_pos, H,
+          ctx.gpu_weights_fp32.d_rms_out_w, H,
           batch_size);
     }
 

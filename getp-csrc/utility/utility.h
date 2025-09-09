@@ -20,8 +20,7 @@ __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
 
 // Normalization Kernels
 __global__ void rmsnorm_batch_kernel(float *out, const float *x,
-                                     const float *weight, const int *pos,
-                                     int dim, int batch_size);
+                                     const float *weight, int dim, int batch_size);
 
 __global__ void compute_inv_rms_batch_kernel(float *inv_rms, const float *x,
                                              const int *pos, int dim, int batch_size);
