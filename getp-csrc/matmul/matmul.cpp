@@ -3,179 +3,224 @@
 #include "matmul.h"
 #include <math.h>
 
-template <int CB>
-__device__ __forceinline__ void gemm_row_tile_fp32_multiB(
-    const float *__restrict__ w_row,
-    float *__restrict__ lds_x[CB],
-    int k_size, int lane, float acc[CB]) {
-  const int vec_k = (k_size / MFMA_K) * MFMA_K;
 
-  for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
-    if (k + MFMA_K <= vec_k) {
-      mfma_float4 w_vec;
-#pragma unroll
-      for (int i = 0; i < MFMA_K; ++i) {
-        w_vec[i] = w_row[k + i];
-      }
+/**
+ * Y = X @ W^T + B (bf16 version)
+ * x: [B, n], w: [d, n], y: [B, d]
+ * Grid: (ceil(d/TM), ceil(B/CB))
+ */
+__launch_bounds__(BLOCK_SIZE, 1) __global__
+void matmul_bias_gemm_kernel_bf16(
+    float* __restrict__ y,          // [B, d]
+    const float* __restrict__ x,    // [B, n]
+    const bf16_t* __restrict__ w,   // [d, n] (row-major theo n)
+    const float* __restrict__ bias, // [d] (có thể null)
+    const int* __restrict__ pos,    // [B] (slot inactive nếu pos[b] < 0)
+    int n, int d, int batch_size)
+{
+  constexpr int BATCH_TILE = 4; // denser layers can handle a larger tile
+  const int batch_base = blockIdx.y * BATCH_TILE;
+  const int bmax = (batch_size - batch_base > BATCH_TILE) ? BATCH_TILE : (batch_size - batch_base);
+  if (bmax <= 0) return;
 
+  __shared__ __align__(16) float lds_x[BATCH_TILE][TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;                 // warp id trong block (0..TM-1)
+
+  const int row  = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+
+  if (wid >= TM || row >= d) return;
+
+  float acc[BATCH_TILE];
 #pragma unroll
-      for (int b = 0; b < CB; ++b) {
-        mfma_float4 x_vec;
+  for (int b = 0; b < BATCH_TILE; ++b) {
+    acc[b] = 0.f;
+  }
+
+  // Vòng K
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    // 1) Load X columns for each batch in the tile
+    for (int b = 0; b < BATCH_TILE; ++b) {
+      if (b >= bmax) break;
+      const int bb = batch_base + b;
+      if (pos[bb] < 0) continue;
+      const float* __restrict__ xb = x + (size_t)bb * n + k_base;
+      for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[b][k] = xb[k];
+    }
+    __syncthreads();
+
+    // 2) Compute dot products with weight row for all active batches
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+    
+    // Inlined gemm_row_tile_bf16_multiB logic
+    const int vec_k = (k_size / MFMA_K) * MFMA_K;
+
+    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
+      if (k + MFMA_K <= vec_k) {
+        mfma_float4 w_vec;
 #pragma unroll
         for (int i = 0; i < MFMA_K; ++i) {
-          x_vec[i] = lds_x[b][k + i];
+          uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k + i]))) << 16;
+          union { uint32_t u; float f; } cvt; cvt.u = u;
+          w_vec[i] = cvt.f;
         }
 
-        mfma_float4 acc_vec = {0};
+#pragma unroll
+        for (int b = 0; b < BATCH_TILE; ++b) {
+          mfma_float4 x_vec;
+#pragma unroll
+          for (int i = 0; i < MFMA_K; ++i) {
+            x_vec[i] = lds_x[b][k + i];
+          }
 
-        acc_vec = __builtin_amdgcn_mfma_f32_16x16x4f32(w_vec[0], x_vec[0],
-                                                       acc_vec, 0, 0, 0);
+          mfma_float4 acc_vec = {0};
+
+          acc_vec = __builtin_amdgcn_mfma_f32_16x16x4f32(w_vec[0], x_vec[0],
+                                                         acc_vec, 0, 0, 0);
 
 #pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          acc[b] = fmaf(w_vec[i], x_vec[i], acc[b]);
+          for (int i = 0; i < MFMA_K; ++i) {
+            acc[b] = fmaf(w_vec[i], x_vec[i], acc[b]);
+          }
         }
       }
     }
-  }
 
-  for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-    float w_val = w_row[k];
+    for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
+      uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
+      union { uint32_t u; float f; } cvt; cvt.u = u;
+      float w_val = cvt.f;
 #pragma unroll
-    for (int b = 0; b < CB; ++b) {
-      acc[b] = fmaf(w_val, lds_x[b][k], acc[b]);
-    }
-  }
-}
-
-template<int CB>
-__device__ __forceinline__ void gemm_row_tile_bf16_multiB(
-    const bf16_t* __restrict__ w_row_bf16,   // [k_size] (slice of row, bf16)
-    float* __restrict__ lds_x[CB],           // CB pointers -> [k_size] each (fp32)
-    int k_size, int lane, float acc[CB]) {
-  
-  const int vec_k = (k_size / MFMA_K) * MFMA_K;
-
-  for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
-    if (k + MFMA_K <= vec_k) {
-      mfma_float4 w_vec;
-#pragma unroll
-      for (int i = 0; i < MFMA_K; ++i) {
-        uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row_bf16[k + i]))) << 16;
-        union { uint32_t u; float f; } cvt; cvt.u = u;
-        w_vec[i] = cvt.f;
-      }
-
-#pragma unroll
-      for (int b = 0; b < CB; ++b) {
-        mfma_float4 x_vec;
-#pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          x_vec[i] = lds_x[b][k + i];
-        }
-
-        mfma_float4 acc_vec = {0};
-
-        acc_vec = __builtin_amdgcn_mfma_f32_16x16x4f32(w_vec[0], x_vec[0],
-                                                       acc_vec, 0, 0, 0);
-
-#pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          acc[b] = fmaf(w_vec[i], x_vec[i], acc[b]);
-        }
+      for (int b = 0; b < BATCH_TILE; ++b) {
+        acc[b] = fmaf(w_val, lds_x[b][k], acc[b]);
       }
     }
+    __syncthreads();
   }
 
-  for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-    uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row_bf16[k]))) << 16;
-    union { uint32_t u; float f; } cvt; cvt.u = u;
-    float w_val = cvt.f;
-#pragma unroll
-    for (int b = 0; b < CB; ++b) {
-      acc[b] = fmaf(w_val, lds_x[b][k], acc[b]);
+  // reduce and write outputs for each batch
+  for (int b = 0; b < BATCH_TILE; ++b) {
+    if (b >= bmax) break;
+    const int bb = batch_base + b;
+    if (pos[bb] < 0) continue;
+    float v = warp_reduce_sum(acc[b]);
+    if (lane == 0) {
+      float* __restrict__ yb = y + (size_t)bb * d;
+      yb[row] = v + (bias ? bias[row] : 0.0f);
     }
   }
 }
 
 /**
- * Y = X @ W^T + B
+ * Y = X @ W^T + B (float version)
  * x: [B, n], w: [d, n], y: [B, d]
  * Grid: (ceil(d/TM), ceil(B/CB))
  */
- template <typename T>
- __launch_bounds__(BLOCK_SIZE, 1) __global__
- void matmul_bias_gemm_kernel(
-     float* __restrict__ y,          // [B, d]
-     const float* __restrict__ x,    // [B, n]
-     const T* __restrict__ w,        // [d, n] (row-major theo n)
-     const float* __restrict__ bias, // [d] (có thể null)
-     const int* __restrict__ pos,    // [B] (slot inactive nếu pos[b] < 0)
-     int n, int d, int batch_size)
- {
-   constexpr int BATCH_TILE = 4; // denser layers can handle a larger tile
-   const int batch_base = blockIdx.y * BATCH_TILE;
-   const int bmax = (batch_size - batch_base > BATCH_TILE) ? BATCH_TILE : (batch_size - batch_base);
-   if (bmax <= 0) return;
+__launch_bounds__(BLOCK_SIZE, 1) __global__
+void matmul_bias_gemm_kernel_float(
+    float* __restrict__ y,          // [B, d]
+    const float* __restrict__ x,    // [B, n]
+    const float* __restrict__ w,    // [d, n] (row-major theo n)
+    const float* __restrict__ bias, // [d] (có thể null)
+    const int* __restrict__ pos,    // [B] (slot inactive nếu pos[b] < 0)
+    int n, int d, int batch_size)
+{
+  constexpr int BATCH_TILE = 4; // denser layers can handle a larger tile
+  const int batch_base = blockIdx.y * BATCH_TILE;
+  const int bmax = (batch_size - batch_base > BATCH_TILE) ? BATCH_TILE : (batch_size - batch_base);
+  if (bmax <= 0) return;
 
-   __shared__ __align__(16) float lds_x[BATCH_TILE][TK + LDS_PAD];
- 
-   const int tid  = threadIdx.x;
-   const int lane = tid & (WF_SIZE - 1);
-   const int wid  = tid >> 6;                 // warp id trong block (0..TM-1)
- 
-   const int row  = blockIdx.x * TM + wid;    // hàng output (0..d-1)
- 
-   if (wid >= TM || row >= d) return;
- 
-   float acc[BATCH_TILE];
+  __shared__ __align__(16) float lds_x[BATCH_TILE][TK + LDS_PAD];
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;                 // warp id trong block (0..TM-1)
+
+  const int row  = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+
+  if (wid >= TM || row >= d) return;
+
+  float acc[BATCH_TILE];
 #pragma unroll
-   for (int b = 0; b < BATCH_TILE; ++b) {
-     acc[b] = 0.f;
-   }
- 
-   // Vòng K
-   for (int k_base = 0; k_base < n; k_base += TK) {
-     const int k_size = min(TK, n - k_base);
- 
-     // 1) Load X columns for each batch in the tile
-     for (int b = 0; b < BATCH_TILE; ++b) {
-       if (b >= bmax) break;
-       const int bb = batch_base + b;
-       if (pos[bb] < 0) continue;
-       const float* __restrict__ xb = x + (size_t)bb * n + k_base;
-       for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[b][k] = xb[k];
-     }
-     __syncthreads();
- 
-     // 2) Compute dot products with weight row for all active batches
-     const T* __restrict__ w_row = w + (size_t)row * n + k_base;
-     float* __restrict__ lds_x_ptrs[BATCH_TILE];
+  for (int b = 0; b < BATCH_TILE; ++b) {
+    acc[b] = 0.f;
+  }
+
+  // Vòng K
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    // 1) Load X columns for each batch in the tile
+    for (int b = 0; b < BATCH_TILE; ++b) {
+      if (b >= bmax) break;
+      const int bb = batch_base + b;
+      if (pos[bb] < 0) continue;
+      const float* __restrict__ xb = x + (size_t)bb * n + k_base;
+      for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[b][k] = xb[k];
+    }
+    __syncthreads();
+
+    // 2) Compute dot products with weight row for all active batches
+    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
+    
+    // Inlined gemm_row_tile_fp32_multiB logic
+    const int vec_k = (k_size / MFMA_K) * MFMA_K;
+
+    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
+      if (k + MFMA_K <= vec_k) {
+        mfma_float4 w_vec;
 #pragma unroll
-     for (int b = 0; b < BATCH_TILE; ++b) {
-       lds_x_ptrs[b] = lds_x[b];
-     }
- 
-     if constexpr (std::is_same_v<T, bf16_t>) {
-       gemm_row_tile_bf16_multiB<BATCH_TILE>(w_row, lds_x_ptrs, k_size, lane, acc);
-     } else {
-       gemm_row_tile_fp32_multiB<BATCH_TILE>(w_row, lds_x_ptrs, k_size, lane, acc);
-     }
-     __syncthreads();
-   }
- 
-   // reduce and write outputs for each batch
-   for (int b = 0; b < BATCH_TILE; ++b) {
-     if (b >= bmax) break;
-     const int bb = batch_base + b;
-     if (pos[bb] < 0) continue;
-     float v = warp_reduce_sum(acc[b]);
-     if (lane == 0) {
-       float* __restrict__ yb = y + (size_t)bb * d;
-       yb[row] = v + (bias ? bias[row] : 0.0f);
-     }
-   }
- }
+        for (int i = 0; i < MFMA_K; ++i) {
+          w_vec[i] = w_row[k + i];
+        }
+
+#pragma unroll
+        for (int b = 0; b < BATCH_TILE; ++b) {
+          mfma_float4 x_vec;
+#pragma unroll
+          for (int i = 0; i < MFMA_K; ++i) {
+            x_vec[i] = lds_x[b][k + i];
+          }
+
+          mfma_float4 acc_vec = {0};
+
+          acc_vec = __builtin_amdgcn_mfma_f32_16x16x4f32(w_vec[0], x_vec[0],
+                                                         acc_vec, 0, 0, 0);
+
+#pragma unroll
+          for (int i = 0; i < MFMA_K; ++i) {
+            acc[b] = fmaf(w_vec[i], x_vec[i], acc[b]);
+          }
+        }
+      }
+    }
+
+    for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
+      float w_val = w_row[k];
+#pragma unroll
+      for (int b = 0; b < BATCH_TILE; ++b) {
+        acc[b] = fmaf(w_val, lds_x[b][k], acc[b]);
+      }
+    }
+    __syncthreads();
+  }
+
+  // reduce and write outputs for each batch
+  for (int b = 0; b < BATCH_TILE; ++b) {
+    if (b >= bmax) break;
+    const int bb = batch_base + b;
+    if (pos[bb] < 0) continue;
+    float v = warp_reduce_sum(acc[b]);
+    if (lane == 0) {
+      float* __restrict__ yb = y + (size_t)bb * d;
+      yb[row] = v + (bias ? bias[row] : 0.0f);
+    }
+  }
+}
 
 // ================= MLP1 (Gate & Up) : per-batch, no CB =================
 __launch_bounds__(BLOCK_SIZE, 1) __global__

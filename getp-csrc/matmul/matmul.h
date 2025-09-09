@@ -3,21 +3,13 @@
 
 #include "../common/defines.h"
 
-template<int CB>
-__device__ __forceinline__ void gemm_row_tile_fp32_multiB(
-    const float* __restrict__ w_row,         // [k_size] (slice of row)
-    float* __restrict__ lds_x[CB],           // CB pointers -> [k_size] each
-    int k_size, int lane, float acc[CB]);
 
-template<int CB>
-__device__ __forceinline__ void gemm_row_tile_bf16_multiB(
-    const bf16_t* __restrict__ w_row,        // [k_size] (slice of row)
-    float* __restrict__ lds_x[CB],           // CB pointers -> [k_size] each  
-    int k_size, int lane, float acc[CB]);
+__global__ void matmul_bias_gemm_kernel_bf16(
+    float *out, const float *x, const bf16_t *w, const float *b,
+    const int *pos, int H, int D, int batch_size);
 
-template<typename T>
-__global__ void matmul_bias_gemm_kernel(
-    float *out, const float *x, const T *w, const float *b,
+__global__ void matmul_bias_gemm_kernel_float(
+    float *out, const float *x, const float *w, const float *b,
     const int *pos, int H, int D, int batch_size);
 
 __global__ void mlp1_fused_gemm_kernel(
