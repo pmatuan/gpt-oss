@@ -21,9 +21,6 @@ typedef hip_bfloat16 bf16_t;
 
 using mfma_float4 = __attribute__( (__vector_size__(MFMA_K * sizeof(float)) )) float;
 
-// Batch Processing Constants
-#define BATCH_TILE_DEFAULT 4
-
 // HIP Error Checking Macro
 #define HIP_CHECK(call)                                                        \
   do {                                                                         \

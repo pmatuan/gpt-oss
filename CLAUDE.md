@@ -23,7 +23,6 @@ This is a high-performance C++ implementation of GPT-OSS models with optimized G
 - Uses HIP/ROCm for AMD GPUs (gfx90a architecture)
 - Optimized kernels with configurable block sizes (BLOCK_SIZE=512)
 - Warp-level optimizations (WF_SIZE=64)
-- Batch processing with tiling (BATCH_TILE_DEFAULT=4)
 - Mixed precision with bfloat16 support
 
 ## Essential Commands
