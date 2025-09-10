@@ -47,13 +47,12 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
                                                  const int *tokens,
-                                                 const int *pos, int batch_size,
+                                                 int batch_size,
                                                  int hidden_dim) {
   int batch_idx = blockIdx.y;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (batch_idx < batch_size && i < hidden_dim && pos[batch_idx] >= 0 &&
-      tokens[batch_idx] >= 0) {
+  if (batch_idx < batch_size && i < hidden_dim && tokens[batch_idx] >= 0) {
     int token = tokens[batch_idx];
     dst[(size_t)batch_idx * hidden_dim + i] =
         static_cast<float>(src[(size_t)token * hidden_dim + i]);
@@ -163,11 +162,11 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
 }
 
 __global__ void residual_add_batch_kernel(float *x, const float *residual,
-                                          const int *pos, int size,
+                                          int size,
                                           int batch_size) {
   const int b = blockIdx.y;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= batch_size || pos[b] < 0)
+  if (b >= batch_size)
     return;
   if (i < size) {
     x[(size_t)b * size + i] += residual[(size_t)b * size + i];
@@ -263,13 +262,12 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
  __global__ void compute_inv_rms_batch_kernel(
   float* __restrict__ out_inv,
   const float* __restrict__ x,
-  const int* __restrict__ pos,
   int H, int batch_size) {
 
 const int b = blockIdx.y;
 if (b >= batch_size) return;
 
-if (pos[b] < 0) { if (threadIdx.x == 0) out_inv[b] = 0.0f; return; }
+if (threadIdx.x == 0) out_inv[b] = 0.0f; return;
 
 const float* xb = x + (size_t)b * H;
 const int H4 = H >> 2;
@@ -312,11 +310,11 @@ if (wid == 0) {
 
 // Batched Top-K + Softmax kernel
 __global__ void fused_topk_softmax_batch_kernel(
-    float *topk_values, int *topk_indices, float *router_score, const int *pos,
-    int num_experts, int experts_per_token, int batch_size) {
+    float *topk_values, int *topk_indices, float *router_score,
+    int E, int K, int batch_size) {
   extern __shared__ float smem[];
   const int b = blockIdx.y;
-  if (b >= batch_size || pos[b] < 0)
+  if (b >= batch_size)
     return;
 
   float *scores = smem;
@@ -324,11 +322,11 @@ __global__ void fused_topk_softmax_batch_kernel(
   const int lane = tid & (WF_SIZE - 1);
   const int wid = tid >> 6;
 
-  float *router_score_b = router_score + (size_t)b * num_experts;
-  float *topk_values_b = topk_values + (size_t)b * experts_per_token;
-  int *topk_indices_b = topk_indices + (size_t)b * experts_per_token;
+  float *router_score_b = router_score + (size_t)b * E;
+  float *topk_values_b = topk_values + (size_t)b * K;
+  int *topk_indices_b = topk_indices + (size_t)b * K;
 
-  for (int i = tid; i < num_experts; i += blockDim.x) {
+  for (int i = tid; i < E; i += blockDim.x) {
     scores[i] = router_score_b[i];
   }
   __syncthreads();
@@ -337,10 +335,10 @@ __global__ void fused_topk_softmax_batch_kernel(
   __shared__ int warp_idxs[BLOCK_SIZE / WF_SIZE];
 
   // Step 1: Top-K selection
-  for (int k = 0; k < experts_per_token; k++) {
+  for (int k = 0; k < K; k++) {
     float local_best = -INFINITY;
     int local_idx = -1;
-    for (int i = tid; i < num_experts; i += blockDim.x) {
+    for (int i = tid; i < E; i += blockDim.x) {
       float v = scores[i];
       if (v > local_best) {
         local_best = v;
@@ -386,18 +384,18 @@ __global__ void fused_topk_softmax_batch_kernel(
   // Step 2: Fused Softmax on top-k values with fast intrinsics
   if (tid == 0) {
     float max_val = topk_values_b[0];
-    for (int i = 1; i < experts_per_token; i++)
+    for (int i = 1; i < K; i++)
       max_val = fmaxf(max_val, topk_values_b[i]);
 
     float sum = 0.0f;
-    for (int i = 0; i < experts_per_token; i++) {
+    for (int i = 0; i < K; i++) {
       float ev = __expf(topk_values_b[i] - max_val); // Use fast exp
       topk_values_b[i] = ev;
       sum += ev;
     }
 
     float inv_sum = __frcp_rn(sum); // Use fast reciprocal
-    for (int i = 0; i < experts_per_token; i++)
+    for (int i = 0; i < K; i++)
       topk_values_b[i] *= inv_sum;
   }
 }

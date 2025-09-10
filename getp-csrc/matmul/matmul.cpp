@@ -15,7 +15,6 @@ void matmul_bias_gemm_kernel_bf16(
     const float* __restrict__ x,    // [B, n]
     const bf16_t* __restrict__ w,   // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
-    const int* __restrict__ pos,    // [B] (slot inactive nếu pos[b] < 0)
     int n, int d, int batch_size)
 {
   constexpr int BATCH_TILE = 4; // denser layers can handle a larger tile
@@ -47,7 +46,6 @@ void matmul_bias_gemm_kernel_bf16(
     for (int b = 0; b < BATCH_TILE; ++b) {
       if (b >= bmax) break;
       const int bb = batch_base + b;
-      if (pos[bb] < 0) continue;
       const float* __restrict__ xb = x + (size_t)bb * n + k_base;
       for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[b][k] = xb[k];
     }
@@ -106,7 +104,6 @@ void matmul_bias_gemm_kernel_bf16(
   for (int b = 0; b < BATCH_TILE; ++b) {
     if (b >= bmax) break;
     const int bb = batch_base + b;
-    if (pos[bb] < 0) continue;
     float v = warp_reduce_sum(acc[b]);
     if (lane == 0) {
       float* __restrict__ yb = y + (size_t)bb * d;
@@ -126,7 +123,6 @@ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ x,    // [B, n]
     const float* __restrict__ w,    // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
-    const int* __restrict__ pos,    // [B] (slot inactive nếu pos[b] < 0)
     int n, int d, int batch_size)
 {
   constexpr int BATCH_TILE = 4; // denser layers can handle a larger tile
@@ -158,7 +154,6 @@ void matmul_bias_gemm_kernel_float(
     for (int b = 0; b < BATCH_TILE; ++b) {
       if (b >= bmax) break;
       const int bb = batch_base + b;
-      if (pos[bb] < 0) continue;
       const float* __restrict__ xb = x + (size_t)bb * n + k_base;
       for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[b][k] = xb[k];
     }
@@ -213,7 +208,6 @@ void matmul_bias_gemm_kernel_float(
   for (int b = 0; b < BATCH_TILE; ++b) {
     if (b >= bmax) break;
     const int bb = batch_base + b;
-    if (pos[bb] < 0) continue;
     float v = warp_reduce_sum(acc[b]);
     if (lane == 0) {
       float* __restrict__ yb = y + (size_t)bb * d;
@@ -230,7 +224,6 @@ void mlp1_fused_gemm_kernel(
     const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
     const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
     const int* __restrict__ topk_i,   // [B, K]
-    const int* __restrict__ pos,      // [B] (inactive: pos[b] < 0)
     int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size, int experts_per_token)
 {
@@ -256,11 +249,7 @@ void mlp1_fused_gemm_kernel(
   if (tid < BATCH_TILE) {
     if (tid < bmax) {
       const int bb = batch_base + tid;
-      if (pos[bb] >= 0) {
-        s_expert_id[tid] = topk_i[(size_t)bb * experts_per_token + kidx];
-      } else {
-        s_expert_id[tid] = -1;
-      }
+      s_expert_id[tid] = topk_i[(size_t)bb * experts_per_token + kidx];
     } else {
       s_expert_id[tid] = -1;
     }
@@ -282,7 +271,7 @@ void mlp1_fused_gemm_kernel(
     for (int b = 0; b < BATCH_TILE; ++b) {
       if (b >= bmax) break;
       const int bb = batch_base + b;
-      if (pos[bb] < 0 || s_expert_id[b] < 0) continue;
+      if (s_expert_id[b] < 0) continue;
       
       const float* __restrict__ xb = x + (size_t)bb * H + k_base;
       // vec4 part
@@ -301,7 +290,7 @@ void mlp1_fused_gemm_kernel(
     for (int b = 0; b < BATCH_TILE; ++b) {
       if (b >= bmax) break;
       const int bb = batch_base + b;
-      if (pos[bb] < 0 || s_expert_id[b] < 0) continue;
+      if (s_expert_id[b] < 0) continue;
 
       // weights layout:
       // base = ((l * E + expert) * (2*IM)) * H + (2*i + {0,1}) * H + k_base
@@ -348,7 +337,7 @@ void mlp1_fused_gemm_kernel(
   for (int b = 0; b < BATCH_TILE; ++b) {
     if (b >= bmax) break;
     const int bb = batch_base + b;
-    if (pos[bb] < 0 || s_expert_id[b] < 0) continue;
+    if (s_expert_id[b] < 0) continue;
 
     float gate_sum = warp_reduce_sum(acc_gate[b]);
     float up_sum   = warp_reduce_sum(acc_up[b]);
@@ -381,7 +370,6 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     const float* __restrict__ b_mlp2_all,   // [L, E, H]
     const int* __restrict__ topk_i,         // [B, K]
     const float* __restrict__ topk_v,       // [B, K]
-    const int* __restrict__ pos,            // [B]
     int l_layer, int E, int IM, int H,
     int batch_size, int experts_per_token)
 {
@@ -408,13 +396,8 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   if (tid < BATCH_TILE) {
     if (tid < bmax) {
       const int bb = batch_base + tid;
-      if (pos[bb] >= 0) {
-        s_expert_id[tid] = topk_i[(size_t)bb * experts_per_token + kidx];
-        s_expert_w[tid] = topk_v[(size_t)bb * experts_per_token + kidx];
-      } else {
-        s_expert_id[tid] = -1;
-        s_expert_w[tid] = 0.f;
-      }
+      s_expert_id[tid] = topk_i[(size_t)bb * experts_per_token + kidx];
+      s_expert_w[tid] = topk_v[(size_t)bb * experts_per_token + kidx];
     } else {
       s_expert_id[tid] = -1;
       s_expert_w[tid] = 0.f;
@@ -436,7 +419,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     for (int b = 0; b < BATCH_TILE; ++b) {
       if (b >= bmax) break;
       const int bb = batch_base + b;
-      if (pos[bb] < 0 || s_expert_id[b] < 0 || s_expert_w[b] == 0.f) continue;
+      if (s_expert_id[b] < 0 || s_expert_w[b] == 0.f) continue;
 
       const float* __restrict__ xb =
           gate_up_topk + (((size_t)kidx * (size_t)batch_size + (size_t)bb) * (size_t)IM + (size_t)k_base);
@@ -456,7 +439,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     for (int b = 0; b < BATCH_TILE; ++b) {
       if (b >= bmax) break;
       const int bb = batch_base + b;
-      if (pos[bb] < 0 || s_expert_id[b] < 0 || s_expert_w[b] == 0.f) continue;
+      if (s_expert_id[b] < 0 || s_expert_w[b] == 0.f) continue;
 
       // weight row: w[l, expert, row, k_base: ]
       const size_t base = ((size_t)l_layer * (size_t)E + (size_t)s_expert_id[b]) * (size_t)H * (size_t)IM;
@@ -487,7 +470,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   for (int b = 0; b < BATCH_TILE; ++b) {
     if (b >= bmax) break;
     const int bb = batch_base + b;
-    if (pos[bb] < 0 || s_expert_id[b] < 0 || s_expert_w[b] == 0.f) continue;
+    if (s_expert_id[b] < 0 || s_expert_w[b] == 0.f) continue;
 
     float acc_sum = warp_reduce_sum(acc[b]);
     if (lane == 0) {

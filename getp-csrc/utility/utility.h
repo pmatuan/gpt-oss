@@ -15,7 +15,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v);
 // Embedding and Data Movement Kernels
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
                                                  const int *tokens,
-                                                 const int *pos, int batch_size,
+                                                 int batch_size,
                                                  int hidden_dim);
 
 // Normalization Kernels
@@ -23,11 +23,11 @@ __global__ void rmsnorm_batch_kernel(float *out, const float *x,
                                      const float *weight, int dim, int batch_size);
 
 __global__ void compute_inv_rms_batch_kernel(float *inv_rms, const float *x,
-                                             const int *pos, int dim, int batch_size);
+                                             int dim, int batch_size);
 
 // Utility Operations
 __global__ void residual_add_batch_kernel(float *x, const float *residual,
-                                          const int *pos, int dim, int batch_size);
+                                          int dim, int batch_size);
 
 // QKV Processing Kernels
 __global__ void split_qkv_scatter_to_cache_batch_kernel(
@@ -42,8 +42,7 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
 
 // Expert/MoE Utility Kernels
 __global__ void fused_topk_softmax_batch_kernel(
-    float *topk_v, int *topk_i, const float *scores, const int *pos, int E,
-    int K, int batch_size);
+    float *topk_v, int *topk_i, const float *scores, int E, int K, int batch_size);
 
 // Data Type Conversion Utilities
 void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
