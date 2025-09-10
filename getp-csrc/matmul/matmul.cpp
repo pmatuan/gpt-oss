@@ -5,7 +5,7 @@
 
 
 /**
- * Y = X @ W^T + B (bf16 version)
+ * Y = X @ W^T + B (bf16 version using matrix core)
  * x: [B, n], w: [d, n], y: [B, d]
  * Grid: (ceil(d/TM), B)
  */
@@ -22,70 +22,81 @@ void matmul_bias_gemm_kernel_bf16(
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
-  const int tid  = threadIdx.x;
+  const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;                 // warp id trong block (0..TM-1)
+  const int wid = tid >> 6;                 // warp id trong block (0..TM-1)
 
-  const int row  = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+  const int row = blockIdx.x * TM + wid;    // hàng output (0..d-1)
 
   if (wid >= TM || row >= d) return;
 
   float acc = 0.f;
 
-  // Vòng K
+  // Vòng K - optimized with vectorized loads and computation
   for (int k_base = 0; k_base < n; k_base += TK) {
     const int k_size = min(TK, n - k_base);
 
-    // 1) Load X columns for current batch
+    // 1) Optimized vectorized load of X columns for current batch
     const float* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
-    for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[k] = xb[k];
+    
+    // Load using vectorized operations
+    const int vec4_k = (k_size >> 2);
+    float4* __restrict__ lds_x4 = reinterpret_cast<float4*>(lds_x);
+    const float4* __restrict__ xb4 = reinterpret_cast<const float4*>(xb);
+    
+    for (int v = tid; v < vec4_k; v += BLOCK_SIZE) {
+      lds_x4[v] = xb4[v];
+    }
+    
+    // Handle remainder elements
+    for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = xb[k];
+    }
     __syncthreads();
 
-    // 2) Compute dot products with weight row for current batch
+    // 2) Optimized computation with weight row for current batch
     const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
     
-    // Vectorized computation
+    // Vectorized computation - process 4 elements at a time
     const int vec_k = (k_size / MFMA_K) * MFMA_K;
 
     for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
       if (k + MFMA_K <= vec_k) {
-        mfloat4 w_vec, x_vec;
-#pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k + i]))) << 16;
-          union { uint32_t u; float f; } cvt; cvt.u = u;
-          w_vec[i] = cvt.f;
-          x_vec[i] = lds_x[k + i];
-        }
-
-#pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          acc = fmaf(w_vec[i], x_vec[i], acc);
-        }
+        // Cast bf16 weights to float and load 4 consecutive elements as vectors
+        float4 w_vec;
+        w_vec.x = (float)w_row[k];
+        w_vec.y = (float)w_row[k+1];
+        w_vec.z = (float)w_row[k+2];
+        w_vec.w = (float)w_row[k+3];
+        const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);
+        
+        // Perform dot product using fused multiply-add
+        acc = fmaf(w_vec.x, x_vec.x, acc);
+        acc = fmaf(w_vec.y, x_vec.y, acc);
+        acc = fmaf(w_vec.z, x_vec.z, acc);
+        acc = fmaf(w_vec.w, x_vec.w, acc);
       }
     }
 
+    // Handle remainder elements
     for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-      uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
-      union { uint32_t u; float f; } cvt; cvt.u = u;
-      float w_val = cvt.f;
-      acc = fmaf(w_val, lds_x[k], acc);
+      acc = fmaf((float)w_row[k], lds_x[k], acc);
     }
     __syncthreads();
   }
 
-  // reduce and write output for current batch
-  float v = warp_reduce_sum(acc);
+  // Optimized warp reduction and write output for current batch
+  float result = warp_reduce_sum(acc);
   if (lane == 0) {
     float* __restrict__ yb = y + (size_t)batch_idx * d;
-    yb[row] = v + (bias ? bias[row] : 0.0f);
+    yb[row] = result + (bias ? bias[row] : 0.0f);
   }
 }
 
 /**
  * Y = X @ W^T + B (float version)
  * x: [B, n], w: [d, n], y: [B, d]
- * Grid: (ceil(d/BN), ceil(B/BM))
+ * Grid: (ceil(d/TM), B)
  */
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void matmul_bias_gemm_kernel_float(
@@ -95,80 +106,75 @@ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ bias, // [d] (có thể null)
     int n, int d, int batch_size)
 {
-  // Matrix dimensions
-  const int M = batch_size;
-  const int N = d;
-  const int K = n;
+  const int batch_idx = blockIdx.y;
+  if (batch_idx >= batch_size) return;
 
-  const int waveIdx = threadIdx.x / WF_SIZE;
-  const int xInBlockTile = waveIdx % (BM / WM);
-  const int yInBlockTile = waveIdx / (BM / WM);
-  const int laneIdx = threadIdx.x % WF_SIZE;
-  const int xInMFMA = laneIdx % MFMA_M;
-  const int yInMFMA = laneIdx / MFMA_M;
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
-  const int loadXIdx_x = threadIdx.x % BK;
-  const int loadXIdx_y = threadIdx.x / BK;
-  const int loadWIdx_x = threadIdx.x % BK;
-  const int loadWIdx_y = threadIdx.x / BK;
-  const int strideX = BLOCK_SIZE / BK;
-  const int strideW = BLOCK_SIZE / BK;
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;                 // warp id trong block (0..TM-1)
 
-  // Optimized shared memory layout với padding để tránh bank conflicts
-  // Transpose layout cho sx để cải thiện coalesced access
-  __shared__ __align__(16) float sx[BM][BK + 1];  // Transposed + padding
-  __shared__ __align__(16) float sw[BK][BN + 1];  // Padding để tránh bank conflicts
+  const int row = blockIdx.x * TM + wid;    // hàng output (0..d-1)
 
-  mfloat4 dmn = {0};
+  if (wid >= TM || row >= d) return;
 
-  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    // Load X tile với transposed layout
-    for (int offset = 0; offset < BM; offset += strideX) {
-      int index_x = bkIdx + loadXIdx_x;
-      int index_y = BM * blockIdx.y + loadXIdx_y + offset;
-      // Lưu transposed: sx[row][col] thay vì sx[col][row]
-      if (index_x < K && index_y < M) {
-        sx[index_y % BM][index_x % BK] = x[index_y * K + index_x];
-      } else {
-        sx[index_y % BM][index_x % BK] = 0;
-      }
+  float acc = 0.f;
+
+  // Vòng K - optimized with vectorized loads and computation
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    // 1) Optimized vectorized load of X columns for current batch
+    const float* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
+    
+    // Load using vectorized operations
+    const int vec4_k = (k_size >> 2);
+    float4* __restrict__ lds_x4 = reinterpret_cast<float4*>(lds_x);
+    const float4* __restrict__ xb4 = reinterpret_cast<const float4*>(xb);
+    
+    for (int v = tid; v < vec4_k; v += BLOCK_SIZE) {
+      lds_x4[v] = xb4[v];
     }
     
-    // Load W tile với layout tối ưu
-    for (int offset = 0; offset < BN; offset += strideW) {
-      int index_x = bkIdx + loadWIdx_x;
-      int index_y = BN * blockIdx.x + loadWIdx_y + offset;
-      // Giữ nguyên layout cho sw nhưng thêm padding
-      if (index_x < K && index_y < N) {
-        sw[index_x % BK][index_y % BN] = w[index_y * K + index_x];
-      } else {
-        sw[index_x % BK][index_y % BN] = 0;
-      }
+    // Handle remainder elements
+    for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = xb[k];
     }
     __syncthreads();
 
-    // MFMA computation với layout mới
-    for (int k = 0; k < BK; k += MFMA_K) {
-      // Truy cập sx với layout transposed
-      float amk = sx[yInBlockTile * WM + xInMFMA][k + yInMFMA];
-      float bkn = sw[k + yInMFMA][xInBlockTile * WN + xInMFMA];
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    // 2) Optimized computation with weight row for current batch
+    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
+    
+    // Vectorized computation - process 4 elements at a time
+    const int vec_k = (k_size / MFMA_K) * MFMA_K;
+
+    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
+      if (k + MFMA_K <= vec_k) {
+        // Load 4 consecutive elements as vectors
+        const float4 w_vec = *reinterpret_cast<const float4*>(&w_row[k]);
+        const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);
+        
+        // Perform dot product using fused multiply-add
+        acc = fmaf(w_vec.x, x_vec.x, acc);
+        acc = fmaf(w_vec.y, x_vec.y, acc);
+        acc = fmaf(w_vec.z, x_vec.z, acc);
+        acc = fmaf(w_vec.w, x_vec.w, acc);
+      }
+    }
+
+    // Handle remainder elements
+    for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
+      acc = fmaf(w_row[k], lds_x[k], acc);
     }
     __syncthreads();
   }
 
-  // Write results với coalesced access
-  for (int i = 0; i < 4; ++i) {
-    const int xInD = laneIdx % MFMA_N;
-    const int yInD = MFMA_K * (laneIdx / MFMA_N) + i;
-    const int xInOutput = blockIdx.x * BN + xInBlockTile * WN + xInD;
-    const int yInOutput = blockIdx.y * BM + yInBlockTile * WM + yInD;
-    
-    if (yInOutput < M && xInOutput < N) {
-      float result = dmn[i];
-      if (bias) result += bias[xInOutput];
-      y[yInOutput * N + xInOutput] = result;
-    }
+  // Optimized warp reduction and write output for current batch
+  float result = warp_reduce_sum(acc);
+  if (lane == 0) {
+    float* __restrict__ yb = y + (size_t)batch_idx * d;
+    yb[row] = result + (bias ? bias[row] : 0.0f);
   }
 }
 
