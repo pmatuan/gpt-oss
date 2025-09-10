@@ -114,8 +114,8 @@ void matmul_bias_gemm_kernel_float(
   const int strideX = BLOCK_SIZE / BK;
   const int strideW = BLOCK_SIZE / BK;
 
-  __shared__ float sx[BK][BM];
-  __shared__ float sw[BK][BN];
+  __shared__ __align__(16) float sx[BK][BM];
+  __shared__ __align__(16) float sw[BK][BN];
 
   mfloat4 dmn = {0};
 
