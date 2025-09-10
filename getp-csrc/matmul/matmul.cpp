@@ -49,7 +49,7 @@ void matmul_bias_gemm_kernel_bf16(
 
     for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
       if (k + MFMA_K <= vec_k) {
-        mfma_float4 w_vec, x_vec;
+        mfloat4 w_vec, x_vec;
 #pragma unroll
         for (int i = 0; i < MFMA_K; ++i) {
           uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k + i]))) << 16;
@@ -85,7 +85,7 @@ void matmul_bias_gemm_kernel_bf16(
 /**
  * Y = X @ W^T + B (float version)
  * x: [B, n], w: [d, n], y: [B, d]
- * Grid: (ceil(d/TM), B)
+ * Grid: (ceil(d/BN), ceil(B/BM))
  */
 __launch_bounds__(BLOCK_SIZE, 1) __global__
 void matmul_bias_gemm_kernel_float(
@@ -95,64 +95,69 @@ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ bias, // [d] (có thể null)
     int n, int d, int batch_size)
 {
-  const int batch_idx = blockIdx.y;
-  if (batch_idx >= batch_size) return;
+  // Matrix dimensions
+  const int M = batch_size;
+  const int N = d;
+  const int K = n;
 
-  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+  const int waveIdx = threadIdx.x / WF_SIZE;
+  const int xInBlockTile = waveIdx % (BM / WM);
+  const int yInBlockTile = waveIdx / (BM / WM);
+  const int laneIdx = threadIdx.x % WF_SIZE;
+  const int xInMFMA = laneIdx % MFMA_M;
+  const int yInMFMA = laneIdx / MFMA_M;
 
-  const int tid  = threadIdx.x;
-  const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;                 // warp id trong block (0..TM-1)
+  const int loadXIdx_x = threadIdx.x % BK;
+  const int loadXIdx_y = threadIdx.x / BK;
+  const int loadWIdx_x = threadIdx.x % BK;
+  const int loadWIdx_y = threadIdx.x / BK;
+  const int strideX = BLOCK_SIZE / BK;
+  const int strideW = BLOCK_SIZE / BK;
 
-  const int row  = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+  __shared__ float sx[BK][BM];
+  __shared__ float sw[BK][BN];
 
-  if (wid >= TM || row >= d) return;
+  mfloat4 dmn = {0};
 
-  float acc = 0.f;
-
-  // Vòng K
-  for (int k_base = 0; k_base < n; k_base += TK) {
-    const int k_size = min(TK, n - k_base);
-
-    // 1) Load X columns for current batch
-    const float* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
-    for (int k = tid; k < k_size; k += BLOCK_SIZE) lds_x[k] = xb[k];
+  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    // Load X tile
+    for (int offset = 0; offset < BM; offset += strideX) {
+      int index_x = bkIdx + loadXIdx_x;
+      int index_y = BM * blockIdx.y + loadXIdx_y + offset;
+      sx[index_x % BK][index_y % BM] =
+          (index_x < K && index_y < M) ? x[index_y * K + index_x] : 0;
+    }
+    
+    // Load W tile
+    for (int offset = 0; offset < BN; offset += strideW) {
+      int index_x = bkIdx + loadWIdx_x;
+      int index_y = BN * blockIdx.x + loadWIdx_y + offset;
+      sw[index_x % BK][index_y % BN] =
+          (index_x < K && index_y < N) ? w[index_y * K + index_x] : 0;
+    }
     __syncthreads();
 
-    // 2) Compute dot products with weight row for current batch
-    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
-    
-    // Vectorized computation
-    const int vec_k = (k_size / MFMA_K) * MFMA_K;
-
-    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
-      if (k + MFMA_K <= vec_k) {
-        mfma_float4 w_vec, x_vec;
-#pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          w_vec[i] = w_row[k + i];
-          x_vec[i] = lds_x[k + i];
-        }
-
-#pragma unroll
-        for (int i = 0; i < MFMA_K; ++i) {
-          acc = fmaf(w_vec[i], x_vec[i], acc);
-        }
-      }
-    }
-
-    for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-      float w_val = w_row[k];
-      acc = fmaf(w_val, lds_x[k], acc);
+    // MFMA computation
+    for (int k = 0; k < BK; k += MFMA_K) {
+      float amk = sx[k + yInMFMA][yInBlockTile * WM + xInMFMA];
+      float bkn = sw[k + yInMFMA][xInBlockTile * WN + xInMFMA];
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
 
-  // reduce and write output for current batch
-  float v = warp_reduce_sum(acc);
-  if (lane == 0) {
-    float* __restrict__ yb = y + (size_t)batch_idx * d;
-    yb[row] = v + (bias ? bias[row] : 0.0f);
+  // Write results
+  for (int i = 0; i < 4; ++i) {
+    const int xInD = laneIdx % MFMA_N;
+    const int yInD = MFMA_K * (laneIdx / MFMA_N) + i;
+    const int xInOutput = blockIdx.x * BN + xInBlockTile * WN + xInD;
+    const int yInOutput = blockIdx.y * BM + yInBlockTile * WM + yInD;
+    
+    if (yInOutput < M && xInOutput < N) {
+      float result = dmn[i];
+      if (bias) result += bias[xInOutput];
+      y[yInOutput * N + xInOutput] = result;
+    }
   }
 }
 
