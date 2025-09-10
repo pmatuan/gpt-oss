@@ -114,39 +114,50 @@ void matmul_bias_gemm_kernel_float(
   const int strideX = BLOCK_SIZE / BK;
   const int strideW = BLOCK_SIZE / BK;
 
-  __shared__ __align__(16) float sx[BK][BM];
-  __shared__ __align__(16) float sw[BK][BN];
+  // Optimized shared memory layout với padding để tránh bank conflicts
+  // Transpose layout cho sx để cải thiện coalesced access
+  __shared__ __align__(16) float sx[BM][BK + 1];  // Transposed + padding
+  __shared__ __align__(16) float sw[BK][BN + 1];  // Padding để tránh bank conflicts
 
   mfloat4 dmn = {0};
 
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    // Load X tile
+    // Load X tile với transposed layout
     for (int offset = 0; offset < BM; offset += strideX) {
       int index_x = bkIdx + loadXIdx_x;
       int index_y = BM * blockIdx.y + loadXIdx_y + offset;
-      sx[index_x % BK][index_y % BM] =
-          (index_x < K && index_y < M) ? x[index_y * K + index_x] : 0;
+      // Lưu transposed: sx[row][col] thay vì sx[col][row]
+      if (index_x < K && index_y < M) {
+        sx[index_y % BM][index_x % BK] = x[index_y * K + index_x];
+      } else {
+        sx[index_y % BM][index_x % BK] = 0;
+      }
     }
     
-    // Load W tile
+    // Load W tile với layout tối ưu
     for (int offset = 0; offset < BN; offset += strideW) {
       int index_x = bkIdx + loadWIdx_x;
       int index_y = BN * blockIdx.x + loadWIdx_y + offset;
-      sw[index_x % BK][index_y % BN] =
-          (index_x < K && index_y < N) ? w[index_y * K + index_x] : 0;
+      // Giữ nguyên layout cho sw nhưng thêm padding
+      if (index_x < K && index_y < N) {
+        sw[index_x % BK][index_y % BN] = w[index_y * K + index_x];
+      } else {
+        sw[index_x % BK][index_y % BN] = 0;
+      }
     }
     __syncthreads();
 
-    // MFMA computation
+    // MFMA computation với layout mới
     for (int k = 0; k < BK; k += MFMA_K) {
-      float amk = sx[k + yInMFMA][yInBlockTile * WM + xInMFMA];
+      // Truy cập sx với layout transposed
+      float amk = sx[yInBlockTile * WM + xInMFMA][k + yInMFMA];
       float bkn = sw[k + yInMFMA][xInBlockTile * WN + xInMFMA];
       dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
     }
     __syncthreads();
   }
 
-  // Write results
+  // Write results với coalesced access
   for (int i = 0; i < 4; ++i) {
     const int xInD = laneIdx % MFMA_N;
     const int yInD = MFMA_K * (laneIdx / MFMA_N) + i;
