@@ -4,7 +4,6 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <string>
-#include <stdio.h>
 #include <stdlib.h>
 
 typedef hip_bfloat16 bf16_t;
@@ -18,11 +17,6 @@ typedef hip_bfloat16 bf16_t;
 #define MFMA_M 16
 #define MFMA_N 16
 #define MFMA_K 4
-#define BM 32
-#define BN 32
-#define BK 8
-#define WM 16
-#define WN 16
 
 using mfloat4 = __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
 

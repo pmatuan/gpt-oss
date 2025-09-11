@@ -1,0 +1,8 @@
+CompileFlags:
+  Add:
+    - -x
+    - hip
+    - --offload-arch=gfx90a
+    - --rocm-path=/opt/rocm
+    - -I/opt/rocm/hip/include
+    - -std=c++17
