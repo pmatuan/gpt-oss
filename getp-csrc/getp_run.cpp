@@ -509,25 +509,6 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
     if (first_piece)
       ctx.output_str += first_piece;
   }
-
-  // debug print, will be removed
-  printf("PromptCtx:\n"
-         "  idx: %d\n"
-         "  input_seq: %s\n"
-         "  num_prompt_tokens: %d\n"
-         "  logits_size: %d\n"
-         "  pos: %d\n"
-         "  token: %d\n"
-         "  is_context_phase: %d\n"
-         "  finished: %d\n"
-         "  num_generated: %lld\n"
-         "  start_time: %f\n"
-         "  end_time: %f\n"
-         "  user_data: %p\n",
-         ctx.idx, ctx.input_seq.c_str(), ctx.num_prompt_tokens, ctx.logits_size,
-         ctx.pos, ctx.token, ctx.is_context_phase, ctx.finished,
-         ctx.num_generated, ctx.start_time, ctx.end_time, ctx.user_data);
-  fflush(stdout);
 }
 
 // Batched single-step decode forward. Expects pos[b] >= 0 for active slots;
@@ -552,8 +533,6 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   const int L = p->n_layers;
   const int V = p->vocab_size;
 
-  ensure_device_capacity(ctx, batch_size);
-
   // Copy host tokens/positions into device buffers
   HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_tokens, tokens,
                       (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
@@ -561,7 +540,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
                       (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
 
   dim3 block(BLOCK_SIZE, 1, 1);
-  dim3 gridH = get_gemv_grid_dim(H);
+  dim3 gridH((H + TM - 1) / TM, 1, 1);
 
   // Launch batched embedding kernel
   {
@@ -570,12 +549,12 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     copy_embedding_bf16_batch_kernel<<<gridH_batch, block, 0>>>(
         ctx.gpu_activations.d_x,
         ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
-        ctx.gpu_activations.d_tokens, ctx.gpu_activations.d_pos, batch_size, H);
+        ctx.gpu_activations.d_tokens, batch_size, H);
   }
 
   for (int l = 0; l < L; ++l) {
     const int QKV_D = D * (Hq + 2 * Hk);
-    dim3 gridQKV = get_gemv_grid_dim(QKV_D);
+    dim3 gridQKV((QKV_D + TM - 1) / TM, 1, 1);
     // Batched QKV projection (RMSNorm + MatMul + Bias) - separate kernels
     {
       // First apply RMSNorm
@@ -584,20 +563,17 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         dim3 gridH_batch(gridH.x, batch_size, 1);
         rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-            ctx.gpu_weights_fp32.d_rms_attn_w + l * H,
-            ctx.gpu_activations.d_pos, H, batch_size);
+            ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H);
       }
 
       // Then apply MatMul + Bias
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-        constexpr int BATCH_TILE = 4;
-        dim3 gridQKV_gemm = get_gemm_grid_dim(QKV_D, batch_size, BATCH_TILE);
-        matmul_bias_gemm_kernel<bf16_t><<<gridQKV_gemm, block, 0>>>(
+        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16", 0);
+        dim3 gridQKV_gemm((QKV_D + TM - 1) / TM, batch_size, 1);
+        matmul_bias_gemm_kernel_bf16<<<gridQKV_gemm, block, 0>>>(
             ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-            ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D, ctx.gpu_activations.d_pos,
-            H, QKV_D, batch_size);
+            ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D, H, QKV_D, batch_size);
       }
     }
 
@@ -645,14 +621,12 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-        constexpr int BATCH_TILE = 4;
-        dim3 gridO_gemm = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
-        matmul_bias_gemm_kernel<bf16_t><<<gridO_gemm, block, 0>>>(
+        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16", 0);
+        dim3 gridO_gemm((H + TM - 1) / TM, batch_size, 1);
+        matmul_bias_gemm_kernel_bf16<<<gridO_gemm, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
-            ctx.gpu_weights_fp32.d_b_o + l * H, ctx.gpu_activations.d_pos, O_N,
-            H, batch_size);
+            ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size);
       }
 
       // Then do residual add: x = x + temp
@@ -661,7 +635,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         dim3 gridH_batch(gridH.x, batch_size, 1);
         residual_add_batch_kernel<<<gridH_batch, block, 0>>>(
             ctx.gpu_activations.d_x, ctx.gpu_activations.d_t,
-            ctx.gpu_activations.d_pos, H, batch_size);
+            H, batch_size);
       }
     }
 
@@ -671,19 +645,16 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(gridH.x, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, ctx.gpu_activations.d_pos,
-          H, batch_size);
+          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H);
     }
 
     {
-      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-      constexpr int BATCH_TILE = 4;
-      dim3 gridE_gemm = get_gemm_grid_dim(E, batch_size, BATCH_TILE);
-      matmul_bias_gemm_kernel<float><<<gridE_gemm, block, 0>>>(
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_float", 0);
+      dim3 gridE_gemm((E + TM - 1) / TM, batch_size, 1);
+      matmul_bias_gemm_kernel_float<<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
           ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
-          ctx.gpu_weights_fp32.d_b_router + l * E, ctx.gpu_activations.d_pos, H,
-          E, batch_size);
+          ctx.gpu_weights_fp32.d_b_router + l * E, H, E, batch_size);
     }
 
     {
@@ -693,7 +664,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       fused_topk_softmax_batch_kernel<<<gridTopK_batch, BLOCK_SIZE,
                                         shared_mem_size>>>(
           ctx.gpu_activations.d_topk_v, ctx.gpu_activations.d_topk_i,
-          ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_pos, E,
+          ctx.gpu_activations.d_router_score, E,
           p->experts_per_token, batch_size);
     }
 
@@ -718,8 +689,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      constexpr int BATCH_TILE = 2;
-      dim3 gridIM = get_gemm_grid_dim(IM, batch_size, BATCH_TILE);
+      dim3 gridIM((IM + TM - 1) / TM, batch_size, 1);
       gridIM.z = p->experts_per_token;
       mlp1_fused_gemm_kernel<<<gridIM, block, 0>>>(
           /*gate_up_topk[K,B,IM]*/ d_gate_up_topk,
@@ -727,7 +697,6 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*w*/ ctx.gpu_weights_bf16.d_w_mlp1_bf16,
           /*b*/ ctx.gpu_expert_bias.g_b_mlp1,
           /*topk_i*/ ctx.gpu_activations.d_topk_i,
-          /*pos*/ ctx.gpu_activations.d_pos,
           /*layer*/ l,
           /*E,H,IM*/ E, H, IM,
           /*clip*/ p->swiglu_limit,
@@ -738,8 +707,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      constexpr int BATCH_TILE = 2;
-      dim3 gridH = get_gemm_grid_dim(H, batch_size, BATCH_TILE);
+      dim3 gridH((H + TM - 1) / TM, batch_size, 1);
       gridH.z = p->experts_per_token;
       mlp2_bias_weighted_accum_gemm_kernel<<<gridH, block, 0>>>(
           /*e_agg[B,H]*/ ctx.gpu_activations.d_e_agg,
@@ -748,7 +716,6 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*b*/ ctx.gpu_expert_bias.g_b_mlp2,
           /*topk_i, topk_v*/ ctx.gpu_activations.d_topk_i,
           ctx.gpu_activations.d_topk_v,
-          /*pos*/ ctx.gpu_activations.d_pos,
           /*layer*/ l,
           /*E,IM,H,B,K*/ E, IM, H, batch_size, p->experts_per_token);
     }
@@ -760,7 +727,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(gridH.x, batch_size, 1);
       residual_add_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg,
-          ctx.gpu_activations.d_pos, H, batch_size);
+          H, batch_size);
     }
   }
 
@@ -772,19 +739,16 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(gridH.x, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_fp32.d_rms_out_w, ctx.gpu_activations.d_pos, H,
-          batch_size);
+          ctx.gpu_weights_fp32.d_rms_out_w, H);
     }
 
     // 2) MatMul for logits - separate GEMM version
     {
-      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel", 0);
-      constexpr int BATCH_TILE = 4;
-      dim3 gridV_gemm = get_gemm_grid_dim(V, batch_size, BATCH_TILE);
-      matmul_bias_gemm_kernel<bf16_t><<<gridV_gemm, block, 0>>>(
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16", 0);
+      dim3 gridV_gemm((V + TM - 1) / TM, batch_size, 1);
+      matmul_bias_gemm_kernel_bf16<<<gridV_gemm, block, 0>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
-          ctx.gpu_weights_bf16.d_out_bf16, nullptr, ctx.gpu_activations.d_pos,
-          H, V, batch_size);
+          ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V, batch_size);
     }
   }
 
@@ -816,11 +780,6 @@ static long long run_requests_on_device(Transformer *transformer,
   const int L = p->n_layers;
   const int S = p->seq_len;
   DeviceContext &dctx = g_devices[device_id];
-
-  // Clear K/V caches to avoid any stale data from previous runs
-  size_t kv_bytes = (size_t)B * L * S * KV * sizeof(float);
-  HIP_CHECK(hipMemset(dctx.gpu_activations.d_key_cache, 0, kv_bytes));
-  HIP_CHECK(hipMemset(dctx.gpu_activations.d_value_cache, 0, kv_bytes));
 
   // Temporary host buffer for batched logits
   const int V = p->vocab_size;

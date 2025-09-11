@@ -6,10 +6,7 @@
 // GPU Memory Debugging
 static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
 
-// Grid Dimension Utilities
-inline dim3 get_gemv_grid_dim(int d);
-inline dim3 get_gemm_grid_dim(int d, int batch_size);
-inline dim3 get_gemm_grid_dim(int d, int batch_size, int batch_tile);
+// Grid Dimension Utilities (removed - using direct dim3 initialization)
 
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1);
 __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
@@ -18,20 +15,19 @@ __device__ __forceinline__ float warp_reduce_sum(float v);
 // Embedding and Data Movement Kernels
 __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
                                                  const int *tokens,
-                                                 const int *pos, int batch_size,
+                                                 int batch_size,
                                                  int hidden_dim);
 
 // Normalization Kernels
 __global__ void rmsnorm_batch_kernel(float *out, const float *x,
-                                     const float *weight, const int *pos,
-                                     int dim, int batch_size);
+                                     const float *weight, int dim);
 
 __global__ void compute_inv_rms_batch_kernel(float *inv_rms, const float *x,
-                                             const int *pos, int dim, int batch_size);
+                                             int dim, int batch_size);
 
 // Utility Operations
 __global__ void residual_add_batch_kernel(float *x, const float *residual,
-                                          const int *pos, int dim, int batch_size);
+                                          int dim, int batch_size);
 
 // QKV Processing Kernels
 __global__ void split_qkv_scatter_to_cache_batch_kernel(
@@ -46,8 +42,7 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
 
 // Expert/MoE Utility Kernels
 __global__ void fused_topk_softmax_batch_kernel(
-    float *topk_v, int *topk_i, const float *scores, const int *pos, int E,
-    int K, int batch_size);
+    float *topk_v, int *topk_i, const float *scores, int E, int K, int batch_size);
 
 // Data Type Conversion Utilities
 void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,

@@ -15,9 +15,16 @@ typedef hip_bfloat16 bf16_t;
 #define TM 8
 #define TK 512
 #define LDS_PAD 16
+#define MFMA_M 16
+#define MFMA_N 16
+#define MFMA_K 4
+#define BM 32
+#define BN 32
+#define BK 8
+#define WM 16
+#define WN 16
 
-// Batch Processing Constants
-#define BATCH_TILE_DEFAULT 4
+using mfloat4 = __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
 
 // HIP Error Checking Macro
 #define HIP_CHECK(call)                                                        \
