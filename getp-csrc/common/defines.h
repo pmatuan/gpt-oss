@@ -10,8 +10,8 @@ typedef hip_bfloat16 bf16_t;
 
 // GPU Compute Constants
 #define WF_SIZE 64
-#define BLOCK_SIZE 512
-#define TM 8
+#define BLOCK_SIZE 256
+#define TM (BLOCK_SIZE / WF_SIZE)
 #define TK 512
 #define LDS_PAD 16
 #define MFMA_M 16
