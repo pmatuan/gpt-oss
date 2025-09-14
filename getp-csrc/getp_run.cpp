@@ -642,7 +642,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     // FFN (batched)
     {
       PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
-      dim3 gridH_batch(gridH.x, batch_size, 1);
+      dim3 gridH_batch(1, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
           ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H);
@@ -736,7 +736,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     // 1) RMSNorm - separate kernel call
     {
       PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
-      dim3 gridH_batch(gridH.x, batch_size, 1);
+      dim3 gridH_batch(1, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
           ctx.gpu_weights_fp32.d_rms_out_w, H);
