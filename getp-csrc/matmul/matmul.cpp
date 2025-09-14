@@ -4,92 +4,95 @@
 #include <math.h>
 
 
-/**
- * Y = X @ W^T + B (bf16 version using matrix core)
- * x: [B, n], w: [d, n], y: [B, d]
- * Grid: (ceil(d/TM), B)
- */
-__launch_bounds__(BLOCK_SIZE, 1) __global__
+// x:[B,n], w:[d,n], y:[B,d]
+// Grid: (ceil(d/TM), ceil(B/B_TILE))
+__launch_bounds__(BLOCK_SIZE, 8) __global__
 void matmul_bias_gemm_kernel_bf16(
-    float* __restrict__ y,          // [B, d]
-    const float* __restrict__ x,    // [B, n]
-    const bf16_t* __restrict__ w,   // [d, n] (row-major theo n)
-    const float* __restrict__ bias, // [d] (có thể null)
-    int n, int d, int batch_size)
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const bf16_t* __restrict__ w,
+    const float* __restrict__ bias,
+    int n, int d, int batch_size, const int *pos)
 {
-  const int batch_idx = blockIdx.y;
-  if (batch_idx >= batch_size) return;
+  const int btile = blockIdx.y;
+  const int b0    = btile * B_TILE;
 
-  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+  __shared__ __align__(16) float lds_x[B_TILE][TK + LDS_PAD];
 
-  const int tid = threadIdx.x;
+  const int tid  = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
-  const int wid = tid >> 6;                 // warp id trong block (0..TM-1)
-
-  const int row = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+  const int wid  = tid >> 6;
+  const int row  = blockIdx.x * TM + wid;
 
   if (wid >= TM || row >= d) return;
 
-  float acc = 0.f;
+  // Per-sample accumulators inside the warp
+  float acc[B_TILE] = {0.f};
 
-  // Vòng K - optimized with vectorized loads and computation
   for (int k_base = 0; k_base < n; k_base += TK) {
     const int k_size = min(TK, n - k_base);
 
-    // 1) Optimized vectorized load of X columns for current batch
-    const float* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
-    
-    // Load using vectorized operations
-    const int vec4_k = (k_size >> 2);
-    float4* __restrict__ lds_x4 = reinterpret_cast<float4*>(lds_x);
-    const float4* __restrict__ xb4 = reinterpret_cast<const float4*>(xb);
-    
-    for (int v = tid; v < vec4_k; v += BLOCK_SIZE) {
-      lds_x4[v] = xb4[v];
-    }
-    
-    // Handle remainder elements
-    for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
-      lds_x[k] = xb[k];
+    // Load X tiles for up to B_TILE samples
+    #pragma unroll
+    for (int bi = 0; bi < B_TILE; ++bi) {
+      const int b = b0 + bi;
+      if (b < batch_size && !(pos && pos[b] < 0)) {
+        const float* __restrict__ xb = x + (size_t)b * n + k_base;
+        // vec4 load
+        const int vec4 = (k_size >> 2);
+        float4* s4 = reinterpret_cast<float4*>(lds_x[bi]);
+        const float4* x4 = reinterpret_cast<const float4*>(xb);
+        for (int v = tid; v < vec4; v += BLOCK_SIZE) s4[v] = x4[v];
+        for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE)
+          lds_x[bi][k] = xb[k];
+      }
     }
     __syncthreads();
 
-    // 2) Optimized computation with weight row for current batch
+    // All warps reuse the same W[row,:] for the 4 samples
     const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
-    
-    // Vectorized computation - process 4 elements at a time
-    const int vec_k = (k_size / MFMA_K) * MFMA_K;
 
-    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
-      if (k + MFMA_K <= vec_k) {
-        // Cast bf16 weights to float and load 4 consecutive elements as vectors
-        float4 w_vec;
-        w_vec.x = (float)w_row[k];
-        w_vec.y = (float)w_row[k+1];
-        w_vec.z = (float)w_row[k+2];
-        w_vec.w = (float)w_row[k+3];
-        const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);
-        
-        // Perform dot product using fused multiply-add
-        acc = fmaf(w_vec.x, x_vec.x, acc);
-        acc = fmaf(w_vec.y, x_vec.y, acc);
-        acc = fmaf(w_vec.z, x_vec.z, acc);
-        acc = fmaf(w_vec.w, x_vec.w, acc);
+    const int vec4k = (k_size >> 2);
+    const uint2* wq = reinterpret_cast<const uint2*>(w_row);
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 wv = bf16quad_to_float4(wq[v]);
+      #pragma unroll
+      for (int bi = 0; bi < B_TILE; ++bi) {
+        const int b = b0 + bi;
+        if (b < batch_size && !(pos && pos[b] < 0)) {
+          const float4 xv = *reinterpret_cast<const float4*>(&lds_x[bi][v << 2]);
+          acc[bi] = fmaf(wv.x, xv.x, acc[bi]);
+          acc[bi] = fmaf(wv.y, xv.y, acc[bi]);
+          acc[bi] = fmaf(wv.z, xv.z, acc[bi]);
+          acc[bi] = fmaf(wv.w, xv.w, acc[bi]);
+        }
       }
     }
-
-    // Handle remainder elements
-    for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-      acc = fmaf((float)w_row[k], lds_x[k], acc);
+    for (int k = vec4k * 4 + lane; k < k_size; k += WF_SIZE) {
+      const float wv = (float)w_row[k];
+      #pragma unroll
+      for (int bi = 0; bi < B_TILE; ++bi) {
+        const int b = b0 + bi;
+        if (b < batch_size && !(pos && pos[b] < 0)) {
+          acc[bi] = fmaf(wv, lds_x[bi][k], acc[bi]);
+        }
+      }
     }
     __syncthreads();
   }
 
-  // Optimized warp reduction and write output for current batch
-  float result = warp_reduce_sum(acc);
-  if (lane == 0) {
-    float* __restrict__ yb = y + (size_t)batch_idx * d;
-    yb[row] = result + (bias ? bias[row] : 0.0f);
+  // Reduce and write
+  #pragma unroll
+  for (int bi = 0; bi < B_TILE; ++bi) {
+    float v = acc[bi];
+    v = warp_reduce_sum(v);
+    if (lane == 0) {
+      const int b = b0 + bi;
+      if (b < batch_size && !(pos && pos[b] < 0)) {
+        float* yb = y + (size_t)b * d;
+        yb[row] = v + (bias ? bias[row] : 0.0f);
+      }
+    }
   }
 }
 
@@ -98,16 +101,17 @@ void matmul_bias_gemm_kernel_bf16(
  * x: [B, n], w: [d, n], y: [B, d]
  * Grid: (ceil(d/TM), B)
  */
-__launch_bounds__(BLOCK_SIZE, 1) __global__
+__launch_bounds__(BLOCK_SIZE, 8) __global__
 void matmul_bias_gemm_kernel_float(
     float* __restrict__ y,          // [B, d]
     const float* __restrict__ x,    // [B, n]
     const float* __restrict__ w,    // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
-    int n, int d, int batch_size)
+    int n, int d, int batch_size, const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -179,18 +183,20 @@ void matmul_bias_gemm_kernel_float(
 }
 
 // ================= MLP1 (Gate & Up) : per-batch, no CB =================
-__launch_bounds__(BLOCK_SIZE, 1) __global__
+__launch_bounds__(BLOCK_SIZE, 8) __global__
 void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up_topk, // [K, B, IM] (K = experts_per_token)
+    float* __restrict__ gate_up_topk, // [K, B, IM] (K = EXPERT_PER_TOKEN)
     const float* __restrict__ x,      // [B, H]
     const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
     const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
     const int* __restrict__ topk_i,   // [B, K]
     int l_layer, int E, int H, int IM,
-    float swiglu_limit, int batch_size, int experts_per_token)
+    float swiglu_limit, int batch_size,
+    const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
   int expert_id;
@@ -202,11 +208,11 @@ void mlp1_fused_gemm_kernel(
   const int i    = blockIdx.x * TM + wid;   // output row in IM (0..IM-1)
   const int kidx = blockIdx.z;              // expert index per token
 
-  if (wid >= TM || i >= IM || kidx >= experts_per_token)
+  if (wid >= TM || i >= IM || kidx >= EXPERT_PER_TOKEN)
     return;
 
   // Load expert ID for current batch
-  expert_id = topk_i[(size_t)batch_idx * experts_per_token + kidx];
+  expert_id = topk_i[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
   if (expert_id < 0) return;
 
   float acc_gate = 0.f, acc_up = 0.f;
@@ -292,7 +298,7 @@ void mlp1_fused_gemm_kernel(
 
 
 // ============ MLP2 (weighted accum) : per-batch, no CB ==============
-__launch_bounds__(BLOCK_SIZE, 1) __global__
+__launch_bounds__(BLOCK_SIZE, 8) __global__
 void mlp2_bias_weighted_accum_gemm_kernel(
     float* __restrict__ e_agg,              // [B, H] (accumulator)
     const float* __restrict__ gate_up_topk, // [K, B, IM]
@@ -301,10 +307,11 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     const int* __restrict__ topk_i,         // [B, K]
     const float* __restrict__ topk_v,       // [B, K]
     int l_layer, int E, int IM, int H,
-    int batch_size, int experts_per_token)
+    int batch_size, const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
   int expert_id;
@@ -317,12 +324,12 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   const int row  = blockIdx.x * TM + wid;   // output H row
   const int kidx = blockIdx.z;              // expert index per token
 
-  if (wid >= TM || row >= H || kidx >= experts_per_token)
+  if (wid >= TM || row >= H || kidx >= EXPERT_PER_TOKEN)
     return;
 
   // Load expert ID and weight for current batch
-  expert_id = topk_i[(size_t)batch_idx * experts_per_token + kidx];
-  expert_w = topk_v[(size_t)batch_idx * experts_per_token + kidx];
+  expert_id = topk_i[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
+  expert_w = topk_v[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
   if (expert_id < 0 || expert_w == 0.f) return;
 
   float acc = 0.f;

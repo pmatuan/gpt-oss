@@ -163,10 +163,13 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
 
 __global__ void residual_add_batch_kernel(float *x, const float *residual,
                                           int size,
-                                          int batch_size) {
+                                          int batch_size,
+                                          const int *pos) {
   const int b = blockIdx.y;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= batch_size)
+    return;
+  if (pos && pos[b] < 0)
     return;
   if (i < size) {
     x[(size_t)b * size + i] += residual[(size_t)b * size + i];
@@ -174,12 +177,16 @@ __global__ void residual_add_batch_kernel(float *x, const float *residual,
 }
 
 __global__ void rmsnorm_batch_kernel(float *o, const float *x,
-                                     const float *weight, int size) {
+                                     const float *weight, int size,
+                                     const int *pos) {
   const int b = blockIdx.y;
 
   const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
   const int wid = tid >> 6;
+
+  if (pos && pos[b] < 0)
+    return;
 
   const float *x_b = x + (size_t)b * size;
   float *o_b = o + (size_t)b * size;
@@ -308,10 +315,12 @@ if (wid == 0) {
 // Batched Top-K + Softmax kernel
 __global__ void fused_topk_softmax_batch_kernel(
     float *topk_values, int *topk_indices, float *router_score,
-    int E, int K, int batch_size) {
+    int E, int K, int batch_size, const int *pos) {
   extern __shared__ float smem[];
   const int b = blockIdx.y;
   if (b >= batch_size)
+    return;
+  if (pos && pos[b] < 0)
     return;
 
   float *scores = smem;
