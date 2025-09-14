@@ -15,10 +15,11 @@ void matmul_bias_gemm_kernel_bf16(
     const float* __restrict__ x,    // [B, n]
     const bf16_t* __restrict__ w,   // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
-    int n, int d, int batch_size)
+    int n, int d, int batch_size, const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -104,10 +105,11 @@ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ x,    // [B, n]
     const float* __restrict__ w,    // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
-    int n, int d, int batch_size)
+    int n, int d, int batch_size, const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -187,10 +189,12 @@ void mlp1_fused_gemm_kernel(
     const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
     const int* __restrict__ topk_i,   // [B, K]
     int l_layer, int E, int H, int IM,
-    float swiglu_limit, int batch_size, int experts_per_token)
+    float swiglu_limit, int batch_size, int experts_per_token,
+    const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
   int expert_id;
@@ -301,10 +305,12 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     const int* __restrict__ topk_i,         // [B, K]
     const float* __restrict__ topk_v,       // [B, K]
     int l_layer, int E, int IM, int H,
-    int batch_size, int experts_per_token)
+    int batch_size, int experts_per_token,
+    const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
   int expert_id;
