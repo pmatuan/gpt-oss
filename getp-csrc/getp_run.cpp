@@ -530,6 +530,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   const int S = p->seq_len;
   const int L = p->n_layers;
   const int V = p->vocab_size;
+  const int QKV_D = D * (Hq + 2 * Hk);
 
   // Copy host tokens/positions into device buffers
   HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_tokens, tokens,
@@ -551,7 +552,6 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   }
 
   for (int l = 0; l < L; ++l) {
-    const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV((QKV_D + TM - 1) / TM, 1, 1);
     // Batched QKV projection (RMSNorm + MatMul + Bias) - separate kernels
     {
