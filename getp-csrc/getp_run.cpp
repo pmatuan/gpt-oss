@@ -704,8 +704,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*layer*/ l,
           /*E,H,IM*/ E, H, IM,
           /*clip*/ p->swiglu_limit,
-          /*B,K*/ batch_size, p->experts_per_token,
-          ctx.gpu_activations.d_pos);
+          /*B,K*/ batch_size, ctx.gpu_activations.d_pos);
     }
 
     // --- MLP2: per-batch per-expert, no CB
@@ -722,8 +721,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*topk_i, topk_v*/ ctx.gpu_activations.d_topk_i,
           ctx.gpu_activations.d_topk_v,
           /*layer*/ l,
-          /*E,IM,H,B,K*/ E, IM, H, batch_size, p->experts_per_token,
-          ctx.gpu_activations.d_pos);
+          /*E,IM,H,B,K*/ E, IM, H, batch_size, ctx.gpu_activations.d_pos);
     }
 
     // Keep workspace allocated in DeviceContext for reuse

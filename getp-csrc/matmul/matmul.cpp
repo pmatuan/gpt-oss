@@ -185,13 +185,13 @@ void matmul_bias_gemm_kernel_float(
 // ================= MLP1 (Gate & Up) : per-batch, no CB =================
 __launch_bounds__(BLOCK_SIZE, 8) __global__
 void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up_topk, // [K, B, IM] (K = experts_per_token)
+    float* __restrict__ gate_up_topk, // [K, B, IM] (K = EXPERT_PER_TOKEN)
     const float* __restrict__ x,      // [B, H]
     const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
     const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
     const int* __restrict__ topk_i,   // [B, K]
     int l_layer, int E, int H, int IM,
-    float swiglu_limit, int batch_size, int experts_per_token,
+    float swiglu_limit, int batch_size,
     const int *pos)
 {
   const int batch_idx = blockIdx.y;
@@ -208,11 +208,11 @@ void mlp1_fused_gemm_kernel(
   const int i    = blockIdx.x * TM + wid;   // output row in IM (0..IM-1)
   const int kidx = blockIdx.z;              // expert index per token
 
-  if (wid >= TM || i >= IM || kidx >= experts_per_token)
+  if (wid >= TM || i >= IM || kidx >= EXPERT_PER_TOKEN)
     return;
 
   // Load expert ID for current batch
-  expert_id = topk_i[(size_t)batch_idx * experts_per_token + kidx];
+  expert_id = topk_i[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
   if (expert_id < 0) return;
 
   float acc_gate = 0.f, acc_up = 0.f;
@@ -307,8 +307,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     const int* __restrict__ topk_i,         // [B, K]
     const float* __restrict__ topk_v,       // [B, K]
     int l_layer, int E, int IM, int H,
-    int batch_size, int experts_per_token,
-    const int *pos)
+    int batch_size, const int *pos)
 {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) return;
@@ -325,12 +324,12 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   const int row  = blockIdx.x * TM + wid;   // output H row
   const int kidx = blockIdx.z;              // expert index per token
 
-  if (wid >= TM || row >= H || kidx >= experts_per_token)
+  if (wid >= TM || row >= H || kidx >= EXPERT_PER_TOKEN)
     return;
 
   // Load expert ID and weight for current batch
-  expert_id = topk_i[(size_t)batch_idx * experts_per_token + kidx];
-  expert_w = topk_v[(size_t)batch_idx * experts_per_token + kidx];
+  expert_id = topk_i[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
+  expert_w = topk_v[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
   if (expert_id < 0 || expert_w == 0.f) return;
 
   float acc = 0.f;
