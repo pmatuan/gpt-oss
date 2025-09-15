@@ -149,10 +149,10 @@ __global__ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ w_row = w + (size_t)row * n + k_base;
     
     // Vectorized computation - process 4 elements at a time
-    const int vec_k = (k_size / MFMA_K) * MFMA_K;
+    const int vec_k = (k_size / B_TILE) * B_TILE;
 
-    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
-      if (k + MFMA_K <= vec_k) {
+    for (int k = lane * B_TILE; k < vec_k; k += WF_SIZE * B_TILE) {
+      if (k + B_TILE <= vec_k) {
         // Load 4 consecutive elements as vectors
         const float4 w_vec = *reinterpret_cast<const float4*>(&w_row[k]);
         const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);

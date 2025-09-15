@@ -14,11 +14,8 @@ typedef hip_bfloat16 bf16_t;
 #define BLOCK_SIZE (WF_SIZE * TM)
 #define TK 512
 #define LDS_PAD 16
-#define MFMA_K 4
 #define B_TILE 4
 #define EXPERT_PER_TOKEN 4
-
-using mfloat4 = __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
 
 // HIP Error Checking Macro
 #define HIP_CHECK(call)                                                        \
