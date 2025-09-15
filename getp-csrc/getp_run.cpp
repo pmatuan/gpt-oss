@@ -693,8 +693,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridIM((IM + TM - 1) / TM, batch_size, 1);
-      gridIM.z = p->experts_per_token;
+      dim3 gridIM((IM + TM - 1) / TM, batch_size, EXPERT_PER_TOKEN);
       mlp1_fused_gemm_kernel<<<gridIM, block, 0>>>(
           /*gate_up_topk[K,B,IM]*/ d_gate_up_topk,
           /*x[B,H]*/ ctx.gpu_activations.d_t,
@@ -711,8 +710,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridH((H + TM - 1) / TM, batch_size, 1);
-      gridH.z = p->experts_per_token;
+      dim3 gridH((H + TM - 1) / TM, batch_size, EXPERT_PER_TOKEN);
       mlp2_bias_weighted_accum_gemm_kernel<<<gridH, block, 0>>>(
           /*e_agg[B,H]*/ ctx.gpu_activations.d_e_agg,
           /*gate_up[K,B,IM]*/ d_gate_up_topk,
