@@ -10,7 +10,7 @@ This is a high-performance C++ implementation of GPT-OSS models with optimized G
 
 ### Key Components
 - **Main inference engine**: `run.cpp` - Entry point for model inference with chat, generate, and getp modes
-- **GETP implementation**: `getp-csrc/` - GPU-optimized inference kernels for batch processing
+- **GETP implementation**: `getp-csrc/` - GPU-optimized inference kernels
   - `getp_run.cpp`: Main GETP runner with GPU kernels
   - `getp_eval.cpp`: Evaluation logic (DO NOT MODIFY)
   - `attention/`: Flash attention implementation
@@ -47,7 +47,7 @@ make clean        # Clean all build artifacts
 # Chat mode (interactive)
 ./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m chat
 
-# GETP mode (batch processing)
+# GETP mode
 ./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m getp -i data/input.txt -o data/output.txt
 ./decode -i data/output.txt  # Convert output tokens to text
 ```
