@@ -60,8 +60,9 @@ __global__ void copy_embedding_bf16_kernel(float *dst, const bf16_t *src,
 }
 
 // grid.y is batch, uses d_pos to compute offset per sample
+// Optimized to scatter directly to cache without intermediate q buffer
 __global__ void split_qkv_scatter_to_cache_kernel(
-    float *q, float *key_cache, float *value_cache, const float *qkv,
+    float *q_temp, float *key_cache, float *value_cache, const float *qkv,
     int n_attn_heads, int n_kv_heads, int head_dim, int layer_offset,
     const int *pos, int batch_size, int kv_stride) {
   const int b = blockIdx.y;
@@ -79,14 +80,14 @@ __global__ void split_qkv_scatter_to_cache_kernel(
   if (idx >= total)
     return;
 
-  float *q_b = q + (size_t)b * q_size;
   float *kcache_b = key_cache + (size_t)b * kv_stride;
   float *vcache_b = value_cache + (size_t)b * kv_stride;
   const float *qkv_b = qkv + (size_t)b * total;
 
   const int pos_offset = pos_b * kv_size;
   if (idx < q_size) {
-    q_b[idx] = qkv_b[idx];
+    // Store Q data in the qkv buffer itself for in-place processing
+    // No separate q buffer needed
   } else if (idx < q_size + kv_size) {
     int k_idx = idx - q_size;
     kcache_b[layer_offset + pos_offset + k_idx] = qkv_b[idx];
@@ -97,8 +98,9 @@ __global__ void split_qkv_scatter_to_cache_kernel(
 }
 
 // variant reading pos[b] and scattering per batch
+// Optimized to work with in-place QKV buffer
 __global__ void fused_inline_rope_qkv_kernel(
-    float *q, float *k_cache, const int *pos, float theta, int Hq, int Hk,
+    float *qkv, float *k_cache, const int *pos, float theta, int Hq, int Hk,
     int D, float rope_scaling_factor, int initial_context_length, int loff,
     int kv_total_size, int batch_size) {
   const int h = blockIdx.x;
@@ -141,13 +143,16 @@ __global__ void fused_inline_rope_qkv_kernel(
   float c = cosf(val) * concentration;
   float s = sinf(val) * concentration;
 
-  // Apply to Q for this batch
+  // Apply to Q in the QKV buffer for this batch
   if (h < Hq) {
-    float *q_b = q + (size_t)b * Hq * D;
-    float x1 = q_b[h * D + i];
-    float x2 = q_b[h * D + half + i];
-    q_b[h * D + i] = x1 * c - x2 * s;
-    q_b[h * D + half + i] = x2 * c + x1 * s;
+    const int q_size = Hq * D;
+    const int kv_size = Hk * D;
+    const int total = q_size + 2 * kv_size;
+    float *qkv_b = qkv + (size_t)b * total;
+    float x1 = qkv_b[h * D + i];
+    float x2 = qkv_b[h * D + half + i];
+    qkv_b[h * D + i] = x1 * c - x2 * s;
+    qkv_b[h * D + half + i] = x2 * c + x1 * s;
   }
 
   if (h < Hk) {

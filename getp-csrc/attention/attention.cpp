@@ -4,9 +4,10 @@
 
 // attention kernel: processes grid.y = batch dimension
 // Uses dynamic shared memory sized for (max_pos_in_batch + 2) floats
+// Optimized to read Q directly from QKV buffer
 __launch_bounds__(64, 8) __global__ void attention_kernel(
     float *__restrict__ out_tb,  // [B, Hq*D]
-    const float *__restrict__ q, // [B, Hq*D], FP32 (already rotary-applied)
+    const float *__restrict__ qkv, // [B, (Hq+2*Hk)*D], FP32 (already rotary-applied)
     const float *__restrict__ k_cache,    // [B, L*S*KV], FP32
     const float *__restrict__ v_cache,    // [B, L*S*KV], FP32
     const float *__restrict__ attn_sinks, // [L*Hq]
@@ -28,7 +29,10 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
   const float rsqrt_D = rsqrtf((float)D);
 
   // Base pointers for batch b and layer layer_idx
-  const float *__restrict__ q_b = q + (size_t)b * Hq * D;
+  const int q_size = Hq * D;
+  const int kv_size = Hk * D;
+  const int total = q_size + 2 * kv_size;
+  const float *__restrict__ qkv_b = qkv + (size_t)b * total;
   const float *__restrict__ k_layer =
       k_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
   const float *__restrict__ v_layer =
@@ -40,7 +44,7 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
   // Compute attention scores with enhanced vectorization
   for (int t = lane; t <= pos_b; t += WF_SIZE) {
     const float *k_ptr = k_layer + t * kv_dim + kv_head * D;
-    const float *q_ptr = q_b + head * D;
+    const float *q_ptr = qkv_b + head * D; // Read Q directly from QKV buffer
 
     float score = 0.0f;
     const int D4 = D >> 2;

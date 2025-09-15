@@ -30,12 +30,12 @@ typedef hip_bfloat16 bf16_t;
 
 // GPU Buffer Structures
 struct GPUActivationBuffers {
-  float *d_x, *d_t, *d_tb, *d_tb2;
+  float *d_x, *d_t, *d_tb;
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
   float *d_gate_up, *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
-  float *d_qkv, *d_q, *d_k, *d_v;
+  float *d_qkv;
   float *d_key_cache, *d_value_cache;
   float *d_att, *d_logits, *d_mask;
   float *d_cos_vals, *d_sin_vals;

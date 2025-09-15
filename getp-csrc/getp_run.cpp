@@ -47,7 +47,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, H * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, H * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb, D * Hq * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb2, H * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score, E * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
@@ -63,9 +62,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (D * (Hq + 2 * Hk)) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k, Hk * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v, Hk * D * sizeof(float)));
 
   HIP_CHECK(
       hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(float)));
@@ -78,17 +74,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
       hipMalloc(&ctx.gpu_activations.d_cos_vals, (D / 2) * sizeof(float)));
   HIP_CHECK(
       hipMalloc(&ctx.gpu_activations.d_sin_vals, (D / 2) * sizeof(float)));
-
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_token2row, S * sizeof(int)));
-  {
-    int *h_token2row = (int *)malloc(S * sizeof(int));
-#pragma omp parallel for
-    for (int i = 0; i < S; ++i)
-      h_token2row[i] = i;
-    HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_token2row, h_token2row,
-                        S * sizeof(int), hipMemcpyHostToDevice));
-    free(h_token2row);
-  }
 
   if (model_config->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_mask, S * S * sizeof(float)));
@@ -112,6 +97,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.gpu_activations.d_tokens = nullptr;
   ctx.gpu_activations.d_pos = nullptr;
   ctx.gpu_activations.d_inv_rms = nullptr;
+  ctx.gpu_activations.d_token2row = nullptr;
 
   debug_print_gpu_memory("after activations", device_id);
 
@@ -232,7 +218,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_x));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_t));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_tb));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_tb2));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_router_score));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_topk_v));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_topk_i));
@@ -241,9 +226,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   if (ctx.gpu_activations.d_gate_up_workspace)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_qkv));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_q));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_k));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_v));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_key_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_value_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_att));
@@ -254,8 +236,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_sin_vals));
   if (ctx.gpu_activations.d_mask)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_mask));
-  if (ctx.gpu_activations.d_token2row)
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_token2row));
   if (ctx.gpu_activations.d_tokens)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
   if (ctx.gpu_activations.d_pos)
@@ -349,21 +329,17 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int capacity) {
     FREE_IF(ctx.gpu_activations.d_x);
     FREE_IF(ctx.gpu_activations.d_t);
     FREE_IF(ctx.gpu_activations.d_tb);
-    FREE_IF(ctx.gpu_activations.d_tb2);
     FREE_IF(ctx.gpu_activations.d_router_score);
     FREE_IF(ctx.gpu_activations.d_topk_v);
     FREE_IF(ctx.gpu_activations.d_topk_i);
     FREE_IF(ctx.gpu_activations.d_gate_up);
     FREE_IF(ctx.gpu_activations.d_e_agg);
     FREE_IF(ctx.gpu_activations.d_qkv);
-    FREE_IF(ctx.gpu_activations.d_q);
-    FREE_IF(ctx.gpu_activations.d_k);
-    FREE_IF(ctx.gpu_activations.d_v);
     FREE_IF(ctx.gpu_activations.d_key_cache);
     FREE_IF(ctx.gpu_activations.d_value_cache);
     FREE_IF(ctx.gpu_activations.d_att);
     FREE_IF(ctx.gpu_activations.d_logits);
-// mask & token2row remain shared
+// mask remains shared
 #undef FREE_IF
 
     // Re-allocate for single request
@@ -373,8 +349,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int capacity) {
         hipMalloc(&ctx.gpu_activations.d_t, H * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb,
                         D * Hq * sizeof(float)));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tb2, H * sizeof(float)));
 
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
                         p->n_experts * sizeof(float)));
@@ -390,12 +364,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int capacity) {
 
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                         (D * (Hq + 2 * Hk)) * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
-                        Hq * D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k,
-                        Hk * D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v,
-                        Hk * D * sizeof(float)));
 
     // KV caches
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache,
@@ -567,36 +535,36 @@ static float *gpu_forward_device(Transformer *transformer,
       }
     }
 
-    // Scatter QKV to q / caches
+    // Scatter QKV to caches (K and V only, Q remains in QKV buffer)
     const int loff = l * S * KV;
     {
       PROFILE_GPU_SCOPE("split_qkv_scatter_to_cache_kernel", 0);
       dim3 gridQKV_batch(gridQKV.x, 1, 1);
       split_qkv_scatter_to_cache_kernel<<<gridQKV_batch, block, 0>>>(
-          ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
+          nullptr, ctx.gpu_activations.d_key_cache,
           ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk,
           D, loff, ctx.gpu_activations.d_pos, 1, L * S * KV);
     }
 
-    // Apply RoPE to q and cached k
+    // Apply RoPE to q (in QKV buffer) and cached k
     {
       PROFILE_GPU_SCOPE("fused_inline_rope_qkv_kernel", 0);
       dim3 gridApply_batch(max(Hq, Hk), 1, 1);
       fused_inline_rope_qkv_kernel<<<gridApply_batch, D / 2, 0>>>(
-          ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
+          ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_key_cache,
           ctx.gpu_activations.d_pos, p->rope_theta, Hq, Hk, D,
           p->rope_scaling_factor, p->initial_context_length, loff, L * S * KV,
           1);
     }
 
-    // Attention
+    // Attention (reads Q directly from QKV buffer)
     {
       PROFILE_GPU_SCOPE("attention_kernel", 0);
       dim3 gridAttn(Hq, 1, 1);
       dim3 blockA(WF_SIZE);
       size_t shmem_size = (size_t)(pos + 2) * sizeof(float);
       attention_kernel<<<gridAttn, blockA, shmem_size>>>(
-          ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+          ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
           ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
           ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
           Hq, Hk, S,
