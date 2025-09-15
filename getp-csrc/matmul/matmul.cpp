@@ -6,8 +6,7 @@
 
 // x:[B,n], w:[d,n], y:[B,d]
 // Grid: (ceil(d/TM), ceil(B/B_TILE))
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void matmul_bias_gemm_kernel_bf16(
+__global__ void matmul_bias_gemm_kernel_bf16(
     float* __restrict__ y,
     const float* __restrict__ x,
     const bf16_t* __restrict__ w,
@@ -101,8 +100,7 @@ void matmul_bias_gemm_kernel_bf16(
  * x: [B, n], w: [d, n], y: [B, d]
  * Grid: (ceil(d/TM), B)
  */
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void matmul_bias_gemm_kernel_float(
+__global__ void matmul_bias_gemm_kernel_float(
     float* __restrict__ y,          // [B, d]
     const float* __restrict__ x,    // [B, n]
     const float* __restrict__ w,    // [d, n] (row-major theo n)
@@ -183,8 +181,7 @@ void matmul_bias_gemm_kernel_float(
 }
 
 // ================= MLP1 (Gate & Up) : per-batch, no CB =================
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void mlp1_fused_gemm_kernel(
+__global__ void mlp1_fused_gemm_kernel(
     float* __restrict__ gate_up_topk, // [K, B, IM] (K = EXPERT_PER_TOKEN)
     const float* __restrict__ x,      // [B, H]
     const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
@@ -298,8 +295,7 @@ void mlp1_fused_gemm_kernel(
 
 
 // ============ MLP2 (weighted accum) : per-batch, no CB ==============
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void mlp2_bias_weighted_accum_gemm_kernel(
+__global__ void mlp2_bias_weighted_accum_gemm_kernel(
     float* __restrict__ e_agg,              // [B, H] (accumulator)
     const float* __restrict__ gate_up_topk, // [K, B, IM]
     const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
