@@ -45,10 +45,10 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   return v;
 }
 
-__global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
-                                                 const int *tokens,
-                                                 int batch_size,
-                                                 int hidden_dim) {
+__global__ void copy_embedding_bf16_kernel(float *dst, const bf16_t *src,
+                                           const int *tokens,
+                                           int batch_size,
+                                           int hidden_dim) {
   int batch_idx = blockIdx.y;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -59,8 +59,8 @@ __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
   }
 }
 
-// Batched: grid.y is batch, uses d_pos to compute offset per sample
-__global__ void split_qkv_scatter_to_cache_batch_kernel(
+// grid.y is batch, uses d_pos to compute offset per sample
+__global__ void split_qkv_scatter_to_cache_kernel(
     float *q, float *key_cache, float *value_cache, const float *qkv,
     int n_attn_heads, int n_kv_heads, int head_dim, int layer_offset,
     const int *pos, int batch_size, int kv_stride) {
@@ -96,8 +96,8 @@ __global__ void split_qkv_scatter_to_cache_batch_kernel(
   }
 }
 
-// Batched variant reading pos[b] and scattering per batch
-__global__ void fused_inline_rope_qkv_batch_kernel(
+// variant reading pos[b] and scattering per batch
+__global__ void fused_inline_rope_qkv_kernel(
     float *q, float *k_cache, const int *pos, float theta, int Hq, int Hk,
     int D, float rope_scaling_factor, int initial_context_length, int loff,
     int kv_total_size, int batch_size) {
@@ -161,10 +161,10 @@ __global__ void fused_inline_rope_qkv_batch_kernel(
   }
 }
 
-__global__ void residual_add_batch_kernel(float *x, const float *residual,
-                                          int size,
-                                          int batch_size,
-                                          const int *pos) {
+__global__ void residual_add_kernel(float *x, const float *residual,
+                                    int size,
+                                    int batch_size,
+                                    const int *pos) {
   const int b = blockIdx.y;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= batch_size)
@@ -176,9 +176,9 @@ __global__ void residual_add_batch_kernel(float *x, const float *residual,
   }
 }
 
-__global__ void rmsnorm_batch_kernel(float *o, const float *x,
-                                     const float *weight, int size,
-                                     const int *pos) {
+__global__ void rmsnorm_kernel(float *o, const float *x,
+                               const float *weight, int size,
+                               const int *pos) {
   const int b = blockIdx.y;
 
   const int tid = threadIdx.x;
@@ -263,7 +263,7 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
  * Compute inv RMS per sample: inv_rms = rsqrt(mean(x^2)+eps)
  * Optimized with vectorization
  */
- __global__ void compute_inv_rms_batch_kernel(
+ __global__ void compute_inv_rms_kernel(
   float* __restrict__ out_inv,
   const float* __restrict__ x,
   int H, int batch_size) {
@@ -312,8 +312,8 @@ if (wid == 0) {
 }
 }
 
-// Batched Top-K + Softmax kernel
-__global__ void fused_topk_softmax_batch_kernel(
+// Top-K + Softmax kernel
+__global__ void fused_topk_softmax_kernel(
     float *topk_values, int *topk_indices, float *router_score,
     int E, int K, int batch_size, const int *pos) {
   extern __shared__ float smem[];

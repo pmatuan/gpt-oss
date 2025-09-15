@@ -2,9 +2,9 @@
 #include "attention.h"
 #include <math.h>
 
-// Batched attention kernel: processes grid.y = batch dimension
+// attention kernel: processes grid.y = batch dimension
 // Uses dynamic shared memory sized for (max_pos_in_batch + 2) floats
-__launch_bounds__(64, 8) __global__ void attention_batch_kernel(
+__launch_bounds__(64, 8) __global__ void attention_kernel(
     float *__restrict__ out_tb,  // [B, Hq*D]
     const float *__restrict__ q, // [B, Hq*D], FP32 (already rotary-applied)
     const float *__restrict__ k_cache,    // [B, L*S*KV], FP32

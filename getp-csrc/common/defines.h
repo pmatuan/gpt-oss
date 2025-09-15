@@ -14,8 +14,6 @@ typedef hip_bfloat16 bf16_t;
 #define BLOCK_SIZE (WF_SIZE * TM)
 #define TK 512
 #define LDS_PAD 16
-#define MFMA_M 16
-#define MFMA_N 16
 #define MFMA_K 4
 #define B_TILE 4
 #define EXPERT_PER_TOKEN 4
@@ -94,7 +92,7 @@ struct PromptCtx {
   bool finished;          // EOS reached or step limit
   int max_steps;          // maximum steps allowed for this prompt
 
-  // Runtime state useful for batching / scheduling
+  // Runtime state useful for scheduling
   float *h_logits;  // host logits buffer (per step)
   int logits_size;  // vocab size (for allocation)
   Sampler *sampler; // pointer to sampler (per prompt, if needed)
