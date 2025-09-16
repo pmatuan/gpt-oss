@@ -40,7 +40,11 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   const int S = model_config->seq_len;
   const int IM = model_config->intermediate_dim;
 
-  printf("Initializing device %d...\n", device_id);
+  ctx.stage_start = (L / g_num_devices) * device_id;
+  ctx.stage_end = (device_id == g_num_devices - 1) ? L : (L / g_num_devices) * (device_id + 1);
+  const int local_L = ctx.stage_end - ctx.stage_start;
+
+  printf("Initializing device %d (layers [%d, %d))...\n", device_id, ctx.stage_start, ctx.stage_end);
   debug_print_gpu_memory("before allocations", device_id);
 
   // Activations
@@ -68,9 +72,9 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v, Hk * D * sizeof(float)));
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(float)));
+    hipMalloc(&ctx.gpu_activations.d_key_cache, (size_t)local_L * S * KV * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                      L * S * KV * sizeof(float)));
+            (size_t)local_L * S * KV * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att, Hq * S * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
 
@@ -120,43 +124,43 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   const int H_ = H;
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_attn_w, w->rms_attn_w,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+    hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, (size_t)local_L * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_attn_w, w->rms_attn_w + (size_t)ctx.stage_start * H_,
+            (size_t)local_L * H_ * sizeof(float), hipMemcpyHostToDevice));
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_ffn_w, w->rms_ffn_w,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+    hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, (size_t)local_L * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_ffn_w, w->rms_ffn_w + (size_t)ctx.stage_start * H_,
+            (size_t)local_L * H_ * sizeof(float), hipMemcpyHostToDevice));
 
   const int D_ = model_config->head_dim;
   const int Hq_ = model_config->n_attn_heads;
   const int Hk_ = model_config->n_kv_heads;
   const int QKV_D = D_ * (Hq_ + 2 * Hk_);
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, L * QKV_D * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_qkv, w->b_qkv,
-                      L * QKV_D * sizeof(float), hipMemcpyHostToDevice));
+    hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, (size_t)local_L * QKV_D * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_qkv, w->b_qkv + (size_t)ctx.stage_start * QKV_D,
+            (size_t)local_L * QKV_D * sizeof(float), hipMemcpyHostToDevice));
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_o, w->b_o,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, (size_t)local_L * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_o, w->b_o + (size_t)ctx.stage_start * H_,
+                      (size_t)local_L * H_ * sizeof(float), hipMemcpyHostToDevice));
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_attn_sinks, w->attn_sinks,
-                      L * Hq_ * sizeof(float), hipMemcpyHostToDevice));
+    hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, (size_t)local_L * Hq_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_attn_sinks, w->attn_sinks + (size_t)ctx.stage_start * Hq_,
+            (size_t)local_L * Hq_ * sizeof(float), hipMemcpyHostToDevice));
 
   const int E_ = model_config->n_experts;
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H_ * E_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_w_router, w->w_router,
-                      L * H_ * E_ * sizeof(float), hipMemcpyHostToDevice));
+    hipMalloc(&ctx.gpu_weights_fp32.d_w_router, (size_t)local_L * H_ * E_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_w_router, w->w_router + (size_t)ctx.stage_start * H_ * E_,
+            (size_t)local_L * H_ * E_ * sizeof(float), hipMemcpyHostToDevice));
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_router, w->b_router,
-                      L * E_ * sizeof(float), hipMemcpyHostToDevice));
+    hipMalloc(&ctx.gpu_weights_fp32.d_b_router, (size_t)local_L * E_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_router, w->b_router + (size_t)ctx.stage_start * E_,
+            (size_t)local_L * E_ * sizeof(float), hipMemcpyHostToDevice));
 
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w, H_ * sizeof(float)));
   HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_out_w, w->rms_out_w,
@@ -167,14 +171,16 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   // Expert biases FP32
   const int IM_ = model_config->intermediate_dim;
   HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1,
-                      (size_t)L * E_ * (2 * IM_) * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1, w->b_mlp1,
-                      (size_t)L * E_ * (2 * IM_) * sizeof(float),
+                      (size_t)local_L * E_ * (2 * IM_) * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1,
+                      w->b_mlp1 + (size_t)ctx.stage_start * E_ * (size_t)(2 * IM_),
+                      (size_t)local_L * E_ * (size_t)(2 * IM_) * sizeof(float),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2,
-                      (size_t)L * E_ * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2, w->b_mlp2,
-                      (size_t)L * E_ * H_ * sizeof(float),
+                      (size_t)local_L * E_ * H_ * sizeof(float)));
+  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2,
+                      w->b_mlp2 + (size_t)ctx.stage_start * E_ * (size_t)H_,
+                      (size_t)local_L * E_ * H_ * sizeof(float),
                       hipMemcpyHostToDevice));
 
   debug_print_gpu_memory("after expert biases", device_id);
@@ -192,26 +198,26 @@ static void init_device_context(DeviceContext &ctx, int device_id,
                            n_streams, chunk_bytes);
 
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_qkv_bf16,
-                      (size_t)L * QKV_D * H_ * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_qkv, (size_t)L * QKV_D * H_,
+                      (size_t)local_L * QKV_D * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_qkv + (size_t)ctx.stage_start * QKV_D * H_, (size_t)local_L * QKV_D * H_,
                            ctx.gpu_weights_bf16.d_w_qkv_bf16, n_streams,
                            chunk_bytes);
 
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_o_bf16,
-                      (size_t)L * H_ * O_N * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_o, (size_t)L * H_ * O_N,
+                      (size_t)local_L * H_ * O_N * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_o + (size_t)ctx.stage_start * H_ * O_N, (size_t)local_L * H_ * O_N,
                            ctx.gpu_weights_bf16.d_w_o_bf16, n_streams,
                            chunk_bytes);
 
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp1_bf16,
-                      (size_t)L * E_ * (2 * IM_) * H_ * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E_ * (2 * IM_) * H_,
+                      (size_t)local_L * E_ * (2 * IM_) * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_mlp1 + (size_t)ctx.stage_start * E_ * (2 * IM_) * H_, (size_t)local_L * E_ * (2 * IM_) * H_,
                            ctx.gpu_weights_bf16.d_w_mlp1_bf16, n_streams,
                            chunk_bytes);
 
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp2_bf16,
-                      (size_t)L * E_ * H_ * IM_ * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E_ * H_ * IM_,
+                      (size_t)local_L * E_ * H_ * IM_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_mlp2 + (size_t)ctx.stage_start * E_ * H_ * IM_, (size_t)local_L * E_ * H_ * IM_,
                            ctx.gpu_weights_bf16.d_w_mlp2_bf16, n_streams,
                            chunk_bytes);
 
@@ -302,10 +308,25 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   printf("Found %d HIP devices, initializing multi-GPU setup...\n",
          g_num_devices);
+
+  // Enable peer access between all device pairs if possible
+  for (int i = 0; i < g_num_devices; ++i) {
+    HIP_CHECK(hipSetDevice(i));
+    for (int j = 0; j < g_num_devices; ++j) {
+      if (i == j)
+        continue;
+      int canAccess = 0;
+      hipError_t e = hipDeviceCanAccessPeer(&canAccess, i, j);
+      if (e == hipSuccess && canAccess) {
+        // Ignore errors if already enabled
+        hipDeviceEnablePeerAccess(j, 0);
+      }
+    }
+  }
   g_devices.resize(g_num_devices);
 
-// init all devices in parallel
-#pragma omp parallel for num_threads(g_num_devices)
+  // init all devices in parallel
+  #pragma omp parallel for num_threads(g_num_devices)
   for (int i = 0; i < g_num_devices; ++i) {
     init_device_context(g_devices[i], i, transformer);
   }
@@ -340,6 +361,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   const int S = p->seq_len;
   const int IM = p->intermediate_dim;
   const int V = p->vocab_size;
+  const int local_L = ctx.stage_end - ctx.stage_start;
 
   // Free previous activations to re-alloc at batch size B
   if (need_realloc) {
@@ -398,11 +420,11 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v,
                         (size_t)B * Hk * D * sizeof(float)));
 
-    // Per-batch KV caches
+    // Per-batch KV caches (stage-local only)
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache,
-                        (size_t)B * L * S * KV * sizeof(float)));
+              (size_t)B * local_L * S * KV * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                        (size_t)B * L * S * KV * sizeof(float)));
+              (size_t)B * local_L * S * KV * sizeof(float)));
     // Auxiliary buffers
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att,
                         (size_t)B * Hq * S * sizeof(float)));
@@ -531,6 +553,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   const int L = p->n_layers;
   const int V = p->vocab_size;
   const int QKV_D = D * (Hq + 2 * Hk);
+  const int local_L = ctx.stage_end - ctx.stage_start;
 
   // Copy host tokens/positions into device buffers
   HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_tokens, tokens,
@@ -542,8 +565,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   dim3 gridH_warp((H + TM - 1) / TM, 1, 1);
   dim3 gridH_thread((H + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
 
-  // Launch batched embedding kernel
-  {
+  // Launch batched embedding kernel (only on first stage)
+  if (ctx.device_id == 0) {
     PROFILE_GPU_SCOPE("copy_embedding_bf16_batch_kernel", 0);
     dim3 gridH_batch(gridH_thread.x, batch_size, 1);
     copy_embedding_bf16_batch_kernel<<<gridH_batch, block, 0>>>(
@@ -552,7 +575,9 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         ctx.gpu_activations.d_tokens, batch_size, H);
   }
 
-  for (int l = 0; l < L; ++l) {
+  for (int l = ctx.stage_start; l < ctx.stage_end; ++l) {
+    const int l_local = l - ctx.stage_start;
+    const int QKV_D = D * (Hq + 2 * Hk);
     dim3 gridQKV((QKV_D + TM - 1) / TM, 1, 1);
     // Batched QKV projection (RMSNorm + MatMul + Bias) - separate kernels
     {
@@ -562,7 +587,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         dim3 gridH_batch(1, batch_size, 1);
         rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-            ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H,
+            ctx.gpu_weights_fp32.d_rms_attn_w + l_local * H, H,
             ctx.gpu_activations.d_pos);
       }
 
@@ -572,21 +597,21 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         dim3 gridQKV_gemm((QKV_D + TM - 1) / TM, (batch_size + B_TILE - 1) / B_TILE, 1);
         matmul_bias_gemm_kernel_bf16<<<gridQKV_gemm, block, 0>>>(
             ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_t,
-            ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-            ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D, H, QKV_D, batch_size,
+            ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l_local * QKV_D * H,
+            ctx.gpu_weights_fp32.d_b_qkv + l_local * QKV_D, H, QKV_D, batch_size,
             ctx.gpu_activations.d_pos);
       }
     }
 
     // Scatter QKV to q / caches (batched)
-    const int loff = l * S * KV;
+    const int loff = l_local * S * KV;
     {
       PROFILE_GPU_SCOPE("split_qkv_scatter_to_cache_batch_kernel", 0);
       dim3 gridQKV_batch(gridQKV.x, batch_size, 1);
       split_qkv_scatter_to_cache_batch_kernel<<<gridQKV_batch, block, 0>>>(
           ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
           ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk,
-          D, loff, ctx.gpu_activations.d_pos, batch_size, L * S * KV);
+          D, loff, ctx.gpu_activations.d_pos, batch_size, local_L * S * KV);
     }
 
     // Apply RoPE to q and cached k (batched)
@@ -596,7 +621,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       fused_inline_rope_qkv_batch_kernel<<<gridApply_batch, D / 2, 0>>>(
           ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
           ctx.gpu_activations.d_pos, p->rope_theta, Hq, Hk, D,
-          p->rope_scaling_factor, p->initial_context_length, loff, L * S * KV,
+          p->rope_scaling_factor, p->initial_context_length, loff, local_L * S * KV,
           batch_size);
     }
 
@@ -609,11 +634,11 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
           ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
           ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-          ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+          ctx.gpu_weights_fp32.d_attn_sinks, l_local, ctx.gpu_activations.d_pos, D,
           Hq, Hk, S,
           (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask
                                                   : nullptr,
-          L * S * KV, batch_size);
+          local_L * S * KV, batch_size);
     }
 
     // Output projection + residual (batched) - separate kernels
@@ -626,8 +651,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         dim3 gridO_gemm((H + TM - 1) / TM, (batch_size + B_TILE - 1) / B_TILE, 1);
         matmul_bias_gemm_kernel_bf16<<<gridO_gemm, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
-            ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
-            ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size,
+            ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l_local * H * O_N,
+            ctx.gpu_weights_fp32.d_b_o + l_local * H, O_N, H, batch_size,
             ctx.gpu_activations.d_pos);
       }
 
@@ -647,7 +672,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridH_batch(1, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
-          ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H,
+          ctx.gpu_weights_fp32.d_rms_ffn_w + l_local * H, H,
           ctx.gpu_activations.d_pos);
     }
 
@@ -656,8 +681,8 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       dim3 gridE_gemm((E + TM - 1) / TM, batch_size, 1);
       matmul_bias_gemm_kernel_float<<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
-          ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
-          ctx.gpu_weights_fp32.d_b_router + l * E, H, E, batch_size,
+          ctx.gpu_weights_fp32.d_w_router + (size_t)l_local * H * E,
+          ctx.gpu_weights_fp32.d_b_router + l_local * E, H, E, batch_size,
           ctx.gpu_activations.d_pos);
     }
 
@@ -701,7 +726,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*w*/ ctx.gpu_weights_bf16.d_w_mlp1_bf16,
           /*b*/ ctx.gpu_expert_bias.g_b_mlp1,
           /*topk_i*/ ctx.gpu_activations.d_topk_i,
-          /*layer*/ l,
+          /*layer*/ l_local,
           /*E,H,IM*/ E, H, IM,
           /*clip*/ p->swiglu_limit,
           /*B,K*/ batch_size, ctx.gpu_activations.d_pos);
@@ -720,7 +745,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*b*/ ctx.gpu_expert_bias.g_b_mlp2,
           /*topk_i, topk_v*/ ctx.gpu_activations.d_topk_i,
           ctx.gpu_activations.d_topk_v,
-          /*layer*/ l,
+          /*layer*/ l_local,
           /*E,IM,H,B,K*/ E, IM, H, batch_size, ctx.gpu_activations.d_pos);
     }
 
@@ -734,9 +759,29 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           H, batch_size, ctx.gpu_activations.d_pos);
     }
   }
+  if (ctx.device_id < g_num_devices - 1) {
+    DeviceContext &next = g_devices[ctx.device_id + 1];
+    HIP_CHECK(hipMemcpyPeerAsync(next.gpu_activations.d_x,
+                                 next.device_id,
+                                 ctx.gpu_activations.d_x,
+                                 ctx.device_id,
+                                 H * batch_size * sizeof(float),
+                                 0));
+    HIP_CHECK(hipDeviceSynchronize());
+  }
+  if (ctx.device_id < g_num_devices - 1) {
+    DeviceContext &next = g_devices[ctx.device_id + 1];
+    HIP_CHECK(hipMemcpyPeerAsync(next.gpu_activations.d_x,
+                                 next.device_id,
+                                 ctx.gpu_activations.d_x,
+                                 ctx.device_id,
+                                 H * batch_size * sizeof(float),
+                                 0));
+    HIP_CHECK(hipDeviceSynchronize());
+  }
 
   // Final head
-  {
+  if (ctx.device_id == g_num_devices - 1) {
     // 1) RMSNorm - separate kernel call
     {
       PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
@@ -756,16 +801,15 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V, batch_size,
           ctx.gpu_activations.d_pos);
     }
+    return ctx.gpu_activations.d_logits;
+  } else {
+    return nullptr;
   }
-
-  return ctx.gpu_activations.d_logits;
 }
 
-static long long run_requests_on_device(Transformer *transformer,
-                                        Tokenizer *tokenizer, PromptCtx *ctxs,
-                                        int num_ctxs, int device_id) {
-  HIP_CHECK(hipSetDevice(device_id));
-
+static long long run_requests_pipeline(Transformer *transformer,
+                                       Tokenizer *tokenizer, PromptCtx *ctxs,
+                                       int num_ctxs) {
   long long total_tokens = 0;
 
   // Allocate batch helpers on host
@@ -777,18 +821,13 @@ static long long run_requests_on_device(Transformer *transformer,
   std::transform(ctxs, ctxs + B, h_tokens.begin(),
                  [](const PromptCtx &ctx) { return ctx.token; });
 
-  // Ensure device buffers sized for B and clear KV caches
-  ensure_device_capacity(g_devices[device_id], B);
+  // Ensure device buffers sized for B on all stages
+  for (int dev = 0; dev < g_num_devices; ++dev) {
+    ensure_device_capacity(g_devices[dev], B);
+  }
   const Config *p = model_config;
-  const int D = p->head_dim;
-  const int Hk = p->n_kv_heads;
-  const int KV = D * Hk;
-  const int L = p->n_layers;
-  const int S = p->seq_len;
-  DeviceContext &dctx = g_devices[device_id];
-
-  // Temporary host buffer for batched logits
   const int V = p->vocab_size;
+  // Temporary host buffer for batched logits (from last stage)
   std::vector<float> h_logits_batch((size_t)B * V);
 
   int num_finished = 0;
@@ -805,10 +844,12 @@ static long long run_requests_on_device(Transformer *transformer,
       }
     }
 
-    float *d_log =
-        gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(), B,
-                                 device_id, max_pos_in_batch);
-
+    float *d_log = nullptr;
+    for (int dev = 0; dev < g_num_devices; ++dev) {
+      d_log = gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(), B,
+                                       dev, max_pos_in_batch);
+    }
+    // Last call sets current device to the last; copy logits from there
     HIP_CHECK(hipMemcpy(h_logits_batch.data(), d_log,
                         (size_t)B * V * sizeof(float), hipMemcpyDeviceToHost));
 
@@ -885,8 +926,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
          g_num_devices);
 
   long long num_token_out = 0;
-  std::mutex agg_mutex;
-
   PromptCtx *ctxs = new PromptCtx[num_requests];
 
 #pragma omp parallel for schedule(dynamic)
@@ -894,35 +933,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     setup_prompt_ctx(ctxs[i], requests, i, sampler, transformer, tokenizer);
   }
 
-  int ctxs_per_device = num_requests / g_num_devices;
-  int remainder = num_requests % g_num_devices;
-
-  std::vector<std::thread> workers;
-  workers.reserve(g_num_devices);
-
-  for (int dev = 0; dev < g_num_devices; ++dev) {
-    workers.emplace_back([&, dev]() {
-      int num_ctxs_for_device = ctxs_per_device;
-      if (dev < remainder) {
-        num_ctxs_for_device++;
-      }
-
-      if (num_ctxs_for_device == 0)
-        return;
-
-      int start_idx = dev * ctxs_per_device + std::min(dev, remainder);
-
-      long long local_tokens = run_requests_on_device(
-          transformer, tokenizer, &ctxs[start_idx], num_ctxs_for_device, dev);
-
-      // Aggregate tokens
-      std::lock_guard<std::mutex> lk(agg_mutex);
-      num_token_out += local_tokens;
-    });
-  }
-
-  for (auto &th : workers)
-    th.join();
+  // Single pipeline over all devices: run all requests together
+  num_token_out = run_requests_pipeline(transformer, tokenizer, ctxs, num_requests);
 
   // Sequential, ordered output & cleanup
   for (int idx = 0; idx < num_requests; ++idx) {
