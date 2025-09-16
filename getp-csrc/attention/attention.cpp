@@ -2,25 +2,22 @@
 #include "attention.h"
 #include <math.h>
 
-// attention kernel: processes grid.y = batch dimension
-// Uses dynamic shared memory sized for (max_pos_in_batch + 2) floats
+// attention kernel: processes single sample
+// Uses dynamic shared memory sized for (max_pos + 2) floats
 // Optimized to read Q directly from QKV buffer
 __launch_bounds__(64, 8) __global__ void attention_kernel(
-    float *__restrict__ out_tb,  // [B, Hq*D]
-    const float *__restrict__ qkv, // [B, (Hq+2*Hk)*D], FP32 (already rotary-applied)
-    const float *__restrict__ k_cache,    // [B, L*S*KV], FP32
-    const float *__restrict__ v_cache,    // [B, L*S*KV], FP32
+    float *__restrict__ out_tb,  // [Hq*D]
+    const float *__restrict__ qkv, // [(Hq+2*Hk)*D], FP32 (already rotary-applied)
+    const float *__restrict__ k_cache,    // [L*S*KV], FP32
+    const float *__restrict__ v_cache,    // [L*S*KV], FP32
     const float *__restrict__ attn_sinks, // [L*Hq]
     int layer_idx, const int *__restrict__ pos, int D, int Hq, int Hk, int S,
-    const float *__restrict__ mask, int kv_stride, int batch_size) {
-  const int b = blockIdx.y;
-  if (b >= batch_size)
-    return;
+    const float *__restrict__ mask, int kv_stride) {
   const int head = blockIdx.x;
   const int lane = threadIdx.x;
 
-  const int pos_b = pos[b];
-  if (pos_b < 0 || head >= Hq)
+  const int pos_current = pos[0];
+  if (pos_current < 0 || head >= Hq)
     return;
 
   const int kv_dim = Hk * D;
@@ -28,21 +25,21 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
   const int kv_head = head / kv_mul;
   const float rsqrt_D = rsqrtf((float)D);
 
-  // Base pointers for batch b and layer layer_idx
+  // Base pointers for single sample and layer layer_idx
   const int q_size = Hq * D;
   const int kv_size = Hk * D;
   const int total = q_size + 2 * kv_size;
-  const float *__restrict__ qkv_b = qkv + (size_t)b * total;
+  const float *__restrict__ qkv_b = qkv;
   const float *__restrict__ k_layer =
-      k_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
+      k_cache + (size_t)layer_idx * S * kv_dim;
   const float *__restrict__ v_layer =
-      v_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
-  float *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
+      v_cache + (size_t)layer_idx * S * kv_dim;
+  float *__restrict__ out_b = out_tb;
 
   extern __shared__ float s_att[];
 
   // Compute attention scores with enhanced vectorization
-  for (int t = lane; t <= pos_b; t += WF_SIZE) {
+  for (int t = lane; t <= pos_current; t += WF_SIZE) {
     const float *k_ptr = k_layer + t * kv_dim + kv_head * D;
     const float *q_ptr = qkv_b + head * D; // Read Q directly from QKV buffer
 
@@ -70,20 +67,20 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
     // Scale and apply mask
     score *= rsqrt_D;
     if (mask)
-      score += mask[pos_b * S + t];
+      score += mask[pos_current * S + t];
     s_att[t] = score;
   }
   __syncthreads();
 
-  // Sink score at position pos_b + 1
+  // Sink score at position pos_current + 1
   if (lane == 0) {
     float sink_score = attn_sinks[layer_idx * Hq + head];
-    s_att[pos_b + 1] = sink_score;
+    s_att[pos_current + 1] = sink_score;
   }
   __syncthreads();
 
-  // Softmax over 0..pos_b+1 with optimizations from Python reference
-  const int att_size = pos_b + 2;
+  // Softmax over 0..pos_current+1 with optimizations from Python reference
+  const int att_size = pos_current + 2;
   float maxv = -INFINITY;
   
   // Find max in warp-parallel fashion
@@ -130,7 +127,7 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
       int t = 0;
       
       // Process in tiles
-      for (; t <= pos_b - TILE + 1; t += TILE) {
+      for (; t <= pos_current - TILE + 1; t += TILE) {
         #pragma unroll
         for (int ti = 0; ti < TILE; ++ti) {
           const float *v_ptr = v_layer + (t + ti) * kv_dim + kv_head * D;
@@ -139,7 +136,7 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
       }
       
       // Handle remainder
-      for (; t <= pos_b; ++t) {
+      for (; t <= pos_current; ++t) {
         const float *v_ptr = v_layer + t * kv_dim + kv_head * D;
         result = fmaf(s_att[t], v_ptr[d], result);
       }

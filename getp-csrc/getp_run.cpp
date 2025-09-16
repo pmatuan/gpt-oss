@@ -502,22 +502,22 @@ static float *gpu_forward_device(Transformer *transformer,
   // Launch embedding kernel
   {
     PROFILE_GPU_SCOPE("copy_embedding_bf16_kernel", 0);
-    dim3 gridH_batch(gridH_thread.x, 1, 1);
-    copy_embedding_bf16_kernel<<<gridH_batch, block, 0>>>(
+    dim3 gridH(gridH_thread.x, 1, 1);
+    copy_embedding_bf16_kernel<<<gridH, block, 0>>>(
         ctx.gpu_activations.d_x,
         ctx.gpu_weights_bf16.d_token_embedding_table_bf16,
-        ctx.gpu_activations.d_tokens, 1, H);
+        ctx.gpu_activations.d_tokens, H);
   }
 
   for (int l = 0; l < L; ++l) {
     dim3 gridQKV((QKV_D + TM - 1) / TM, 1, 1);
-    // Batched QKV projection (RMSNorm + MatMul + Bias) - separate kernels
+    // QKV projection (RMSNorm + MatMul + Bias) - separate kernels
     {
       // First apply RMSNorm
       {
         PROFILE_GPU_SCOPE("rmsnorm_kernel", 0);
-        dim3 gridH_batch(1, 1, 1);
-        rmsnorm_kernel<<<gridH_batch, block, 0>>>(
+        dim3 gridH(1, 1, 1);
+        rmsnorm_kernel<<<gridH, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
             ctx.gpu_weights_fp32.d_rms_attn_w + l * H, H,
             ctx.gpu_activations.d_pos);
@@ -530,7 +530,7 @@ static float *gpu_forward_device(Transformer *transformer,
         matmul_bias_gemm_kernel_bf16<<<gridQKV_gemm, block, 0>>>(
             ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-            ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D, H, QKV_D, 1,
+            ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D, H, QKV_D,
             ctx.gpu_activations.d_pos);
       }
     }
@@ -539,22 +539,20 @@ static float *gpu_forward_device(Transformer *transformer,
     const int loff = l * S * KV;
     {
       PROFILE_GPU_SCOPE("split_qkv_scatter_to_cache_kernel", 0);
-      dim3 gridQKV_batch(gridQKV.x, 1, 1);
-      split_qkv_scatter_to_cache_kernel<<<gridQKV_batch, block, 0>>>(
+      split_qkv_scatter_to_cache_kernel<<<gridQKV, block, 0>>>(
           nullptr, ctx.gpu_activations.d_key_cache,
           ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk,
-          D, loff, ctx.gpu_activations.d_pos, 1, L * S * KV);
+          D, loff, ctx.gpu_activations.d_pos, L * S * KV);
     }
 
     // Apply RoPE to q (in QKV buffer) and cached k
     {
       PROFILE_GPU_SCOPE("fused_inline_rope_qkv_kernel", 0);
-      dim3 gridApply_batch(max(Hq, Hk), 1, 1);
-      fused_inline_rope_qkv_kernel<<<gridApply_batch, D / 2, 0>>>(
+      dim3 gridApply(max(Hq, Hk), 1, 1);
+      fused_inline_rope_qkv_kernel<<<gridApply, D / 2, 0>>>(
           ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_key_cache,
           ctx.gpu_activations.d_pos, p->rope_theta, Hq, Hk, D,
-          p->rope_scaling_factor, p->initial_context_length, loff, L * S * KV,
-          1);
+          p->rope_scaling_factor, p->initial_context_length, loff, L * S * KV);
     }
 
     // Attention (reads Q directly from QKV buffer)
@@ -570,7 +568,7 @@ static float *gpu_forward_device(Transformer *transformer,
           Hq, Hk, S,
           (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask
                                                   : nullptr,
-          L * S * KV, 1);
+          L * S * KV);
     }
 
     // Output projection + residual - separate kernels
@@ -584,25 +582,25 @@ static float *gpu_forward_device(Transformer *transformer,
         matmul_bias_gemm_kernel_bf16<<<gridO_gemm, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
-            ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, 1,
+            ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H,
             ctx.gpu_activations.d_pos);
       }
 
       // Then do residual add: x = x + temp
       {
         PROFILE_GPU_SCOPE("residual_add_kernel", 0);
-        dim3 gridH_batch(gridH_thread.x, 1, 1);
-        residual_add_kernel<<<gridH_batch, block, 0>>>(
+        dim3 gridH(gridH_thread.x, 1, 1);
+        residual_add_kernel<<<gridH, block, 0>>>(
             ctx.gpu_activations.d_x, ctx.gpu_activations.d_t,
-            H, 1, ctx.gpu_activations.d_pos);
+            H, ctx.gpu_activations.d_pos);
       }
     }
 
     // FFN
     {
       PROFILE_GPU_SCOPE("rmsnorm_kernel", 0);
-      dim3 gridH_batch(1, 1, 1);
-      rmsnorm_kernel<<<gridH_batch, block, 0>>>(
+      dim3 gridH(1, 1, 1);
+      rmsnorm_kernel<<<gridH, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
           ctx.gpu_weights_fp32.d_rms_ffn_w + l * H, H,
           ctx.gpu_activations.d_pos);
@@ -614,19 +612,19 @@ static float *gpu_forward_device(Transformer *transformer,
       matmul_bias_gemm_kernel_float<<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
           ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
-          ctx.gpu_weights_fp32.d_b_router + l * E, H, E, 1,
+          ctx.gpu_weights_fp32.d_b_router + l * E, H, E,
           ctx.gpu_activations.d_pos);
     }
 
     {
       PROFILE_GPU_SCOPE("fused_topk_softmax_kernel", 0);
-      dim3 gridTopK_batch(1, 1, 1);
+      dim3 gridTopK(1, 1, 1);
       size_t shared_mem_size = (size_t)E * sizeof(float);
-      fused_topk_softmax_kernel<<<gridTopK_batch, BLOCK_SIZE,
+      fused_topk_softmax_kernel<<<gridTopK, BLOCK_SIZE,
                                   shared_mem_size>>>(
           ctx.gpu_activations.d_topk_v, ctx.gpu_activations.d_topk_i,
           ctx.gpu_activations.d_router_score, E,
-          p->experts_per_token, 1, ctx.gpu_activations.d_pos);
+          p->experts_per_token, ctx.gpu_activations.d_pos);
     }
 
     HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0,
@@ -658,7 +656,7 @@ static float *gpu_forward_device(Transformer *transformer,
           /*layer*/ l,
           /*E,H,IM*/ E, H, IM,
           /*clip*/ p->swiglu_limit,
-          /*B,K*/ 1, ctx.gpu_activations.d_pos);
+          /*pos*/ ctx.gpu_activations.d_pos);
     }
 
     // --- MLP2: per-expert
@@ -674,17 +672,17 @@ static float *gpu_forward_device(Transformer *transformer,
           /*topk_i, topk_v*/ ctx.gpu_activations.d_topk_i,
           ctx.gpu_activations.d_topk_v,
           /*layer*/ l,
-          /*E,IM,H,B,K*/ E, IM, H, 1, ctx.gpu_activations.d_pos);
+          /*E,IM,H*/ E, IM, H, ctx.gpu_activations.d_pos);
     }
 
     // Keep workspace allocated in DeviceContext for reuse
 
     {
       PROFILE_GPU_SCOPE("residual_add_kernel", 0);
-      dim3 gridH_batch(gridH_thread.x, 1, 1);
-      residual_add_kernel<<<gridH_batch, block, 0>>>(
+      dim3 gridH(gridH_thread.x, 1, 1);
+      residual_add_kernel<<<gridH, block, 0>>>(
           ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg,
-          H, 1, ctx.gpu_activations.d_pos);
+          H, ctx.gpu_activations.d_pos);
     }
   }
 
@@ -693,8 +691,8 @@ static float *gpu_forward_device(Transformer *transformer,
     // 1) RMSNorm - separate kernel call
     {
       PROFILE_GPU_SCOPE("rmsnorm_kernel", 0);
-      dim3 gridH_batch(1, 1, 1);
-      rmsnorm_kernel<<<gridH_batch, block, 0>>>(
+      dim3 gridH(1, 1, 1);
+      rmsnorm_kernel<<<gridH, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
           ctx.gpu_weights_fp32.d_rms_out_w, H,
           ctx.gpu_activations.d_pos);
@@ -706,7 +704,7 @@ static float *gpu_forward_device(Transformer *transformer,
       dim3 gridV_gemm((V + TM - 1) / TM, 1, 1);
       matmul_bias_gemm_kernel_bf16<<<gridV_gemm, block, 0>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
-          ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V, 1,
+          ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V,
           ctx.gpu_activations.d_pos);
     }
   }
