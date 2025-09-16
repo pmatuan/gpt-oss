@@ -16,6 +16,11 @@ typedef hip_bfloat16 bf16_t;
 #define LDS_PAD 16
 #define B_TILE 4
 #define EXPERT_PER_TOKEN 4
+#define MFMA_M 16
+#define MFMA_N 16
+#define MFMA_K 4
+
+using mfma_float4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 
 // HIP Error Checking Macro
 #define HIP_CHECK(call)                                                        \
