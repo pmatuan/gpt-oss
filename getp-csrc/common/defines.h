@@ -72,6 +72,9 @@ struct GPUWeightBuffersBF16 {
 struct DeviceContext {
   int device_id;
 
+  int stage_start;
+  int stage_end;
+
   GPUActivationBuffers gpu_activations;
   GPUWeightBuffersFP32 gpu_weights_fp32;
   GPUExpertBiasBuffers gpu_expert_bias;
