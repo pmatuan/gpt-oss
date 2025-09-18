@@ -47,11 +47,14 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 __global__ void copy_embedding_bf16_kernel(float *dst, const bf16_t *src,
                                            const int *tokens,
                                            int hidden_dim) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = blockIdx.y;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (i < hidden_dim && tokens[0] >= 0) {
-    int token = tokens[0];
-    dst[i] = static_cast<float>(src[(size_t)token * hidden_dim + i]);
+  if (i < hidden_dim) {
+    const int token = tokens[b];
+    if (token >= 0) {
+      dst[(size_t)b * hidden_dim + i] = static_cast<float>(src[(size_t)token * hidden_dim + i]);
+    }
   }
 }
 
@@ -60,7 +63,8 @@ __global__ void split_qkv_scatter_to_cache_kernel(
     float *q_temp, float *key_cache, float *value_cache, const float *qkv,
     int n_attn_heads, int n_kv_heads, int head_dim, int layer_offset,
     const int *pos, int kv_total_size) {
-  const int pos_current = pos[0];
+  const int b = blockIdx.y;
+  const int pos_current = pos[b];
   if (pos_current < 0)
     return;
 
@@ -71,9 +75,9 @@ __global__ void split_qkv_scatter_to_cache_kernel(
   if (idx >= total)
     return;
 
-  float *kcache = key_cache;
-  float *vcache = value_cache;
-  const float *qkv_data = qkv;
+  float *kcache = key_cache + (size_t)b * kv_total_size;
+  float *vcache = value_cache + (size_t)b * kv_total_size;
+  const float *qkv_data = qkv + (size_t)b * (n_attn_heads * head_dim + 2 * n_kv_heads * head_dim);
 
   const int pos_offset = pos_current * kv_size;
   if (idx < q_size) {
@@ -93,6 +97,7 @@ __global__ void fused_inline_rope_qkv_kernel(
     float *qkv, float *k_cache, const int *pos, float theta, int Hq, int Hk,
     int D, float rope_scaling_factor, int initial_context_length, int loff,
     int kv_total_size) {
+  const int b = blockIdx.y;
   const int h = blockIdx.x;
   const int i = threadIdx.x;
 
@@ -100,7 +105,7 @@ __global__ void fused_inline_rope_qkv_kernel(
   if (i >= half)
     return;
 
-  const int pos_current = pos[0];
+  const int pos_current = pos[b];
   if (pos_current < 0)
     return;
 
@@ -135,7 +140,7 @@ __global__ void fused_inline_rope_qkv_kernel(
     const int q_size = Hq * D;
     const int kv_size = Hk * D;
     const int total = q_size + 2 * kv_size;
-    float *qkv_data = qkv;
+    float *qkv_data = qkv + (size_t)b * total;
     float x1 = qkv_data[h * D + i];
     float x2 = qkv_data[h * D + half + i];
     qkv_data[h * D + i] = x1 * c - x2 * s;
@@ -144,7 +149,8 @@ __global__ void fused_inline_rope_qkv_kernel(
 
   if (h < Hk) {
     const int KV = Hk * D;
-    const int cache_idx = loff + pos_current * KV + h * D;
+    const size_t base = (size_t)b * kv_total_size;
+    const size_t cache_idx = base + (size_t)loff + (size_t)pos_current * KV + (size_t)h * D;
     float x1 = k_cache[cache_idx + i];
     float x2 = k_cache[cache_idx + half + i];
     k_cache[cache_idx + i] = x1 * c - x2 * s;
@@ -154,11 +160,12 @@ __global__ void fused_inline_rope_qkv_kernel(
 
 __global__ void residual_add_kernel(float *x, const float *residual,
                                     int size, const int *pos) {
+  const int b = blockIdx.y;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pos && pos[0] < 0)
+  if (pos && pos[b] < 0)
     return;
   if (i < size) {
-    x[i] += residual[i];
+    x[(size_t)b * size + i] += residual[(size_t)b * size + i];
   }
 }
 
@@ -169,11 +176,13 @@ __global__ void rmsnorm_kernel(float *o, const float *x,
   const int lane = tid & (WF_SIZE - 1);
   const int wid = tid >> 6;
 
-  if (pos && pos[0] < 0)
+  const int b = blockIdx.y;
+
+  if (pos && pos[b] < 0)
     return;
 
-  const float *x_data = x;
-  float *o_data = o;
+  const float *x_data = x + (size_t)b * size;
+  float *o_data = o + (size_t)b * size;
 
   // Vectorized sum of squares using float4
   float sum = 0.0f;
@@ -298,7 +307,8 @@ __global__ void fused_topk_softmax_kernel(
     float *topk_values, int *topk_indices, float *router_score,
     int E, int K, const int *pos) {
   extern __shared__ float smem[];
-  if (pos && pos[0] < 0)
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0)
     return;
 
   float *scores = smem;
@@ -306,9 +316,9 @@ __global__ void fused_topk_softmax_kernel(
   const int lane = tid & (WF_SIZE - 1);
   const int wid = tid >> 6;
 
-  float *router_score_data = router_score;
-  float *topk_values_data = topk_values;
-  int *topk_indices_data = topk_indices;
+  float *router_score_data = router_score + (size_t)b * E;
+  float *topk_values_data = topk_values + (size_t)b * K;
+  int *topk_indices_data = topk_indices + (size_t)b * K;
 
   for (int i = tid; i < E; i += blockDim.x) {
     scores[i] = router_score_data[i];

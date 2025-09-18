@@ -3,6 +3,210 @@
 #include "matmul.h"
 #include <math.h>
 
+// Fused RMSNorm + GEMM + Bias (bf16 weights)
+// y[b,d] = (W[d,n] @ (x[b,n] * inv_rms(x) * weight[n])) + bias[d]
+__global__ void fused_rmsnorm_matmul_bias_bf16(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const float* __restrict__ weight, // rms weights [n]
+    const bf16_t* __restrict__ w,     // weight matrix [d,n]
+    const float* __restrict__ bias,   // bias [d] (nullable)
+    int n, int d, const int* __restrict__ pos)
+{
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0) return;
+
+  extern __shared__ float s_shared[]; // first element used for inv_rms broadcast
+  float* lds_x = (float*)(s_shared + 1); // tile buffer TK + LDS_PAD floats
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  // Compute inv_rms for this sample (single pass over x)
+  const float* __restrict__ xb_full = x + (size_t)b * n;
+  float sum = 0.f;
+  int i = tid;
+  const int n4 = n >> 2;
+  const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xb_full);
+  for (int v = i; v < n4; v += blockDim.x) {
+    float4 xv = x4[v];
+    sum = fmaf(xv.x, xv.x, sum);
+    sum = fmaf(xv.y, xv.y, sum);
+    sum = fmaf(xv.z, xv.z, sum);
+    sum = fmaf(xv.w, xv.w, sum);
+  }
+  for (int k = (n4 << 2) + i; k < n; k += blockDim.x) {
+    float v = xb_full[k];
+    sum = fmaf(v, v, sum);
+  }
+  // Warp reduce
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) sum += __shfl_down(sum, off, WF_SIZE);
+  __shared__ float warp_sums[BLOCK_SIZE / WF_SIZE];
+  if (lane == 0) warp_sums[wid] = sum;
+  __syncthreads();
+  float total = 0.f;
+  if (tid < BLOCK_SIZE / WF_SIZE) total = warp_sums[tid];
+  if (wid == 0) {
+    float t = (tid < BLOCK_SIZE / WF_SIZE) ? total : 0.0f;
+#pragma unroll
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) t += __shfl_down(t, off, WF_SIZE);
+    if (lane == 0) s_shared[0] = rsqrtf(t / (float)n + 1e-5f);
+  }
+  __syncthreads();
+  const float inv_rms = s_shared[0];
+
+  float acc = 0.f;
+  // GEMM with normalized-weighted x, tiled by TK
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+    // Load normalized x into shared with fused weight multiply
+    const float* __restrict__ xb = xb_full + k_base;
+    const float* __restrict__ wb = weight + k_base;
+    const int vec4 = (k_size >> 2);
+    float4* s4 = reinterpret_cast<float4*>(lds_x);
+    const float4* x4b = reinterpret_cast<const float4*>(xb);
+    const float4* w4b = reinterpret_cast<const float4*>(wb);
+    for (int v = tid; v < vec4; v += BLOCK_SIZE) {
+      float4 xv = x4b[v];
+      float4 ww = w4b[v];
+      float4 nv;
+      nv.x = (xv.x * inv_rms) * ww.x;
+      nv.y = (xv.y * inv_rms) * ww.y;
+      nv.z = (xv.z * inv_rms) * ww.z;
+      nv.w = (xv.w * inv_rms) * ww.w;
+      s4[v] = nv;
+    }
+    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = (xb[k] * inv_rms) * wb[k];
+    }
+    __syncthreads();
+
+    // Weight row BF16
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+    const int vec4k = (k_size >> 2);
+    const uint2* wq = reinterpret_cast<const uint2*>(w_row);
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 wv = bf16quad_to_float4(wq[v]);
+      const float4 xv = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
+      acc = fmaf(wv.x, xv.x, acc);
+      acc = fmaf(wv.y, xv.y, acc);
+      acc = fmaf(wv.z, xv.z, acc);
+      acc = fmaf(wv.w, xv.w, acc);
+    }
+    for (int k = (vec4k << 2) + lane; k < k_size; k += WF_SIZE) {
+      const float wv = (float)w_row[k];
+      acc = fmaf(wv, lds_x[k], acc);
+    }
+    __syncthreads();
+  }
+
+  float v = warp_reduce_sum(acc);
+  if (lane == 0) {
+    y[(size_t)b * d + row] = v + (bias ? bias[row] : 0.0f);
+  }
+}
+
+// Fused RMSNorm + GEMM + Bias (float weights)
+__global__ void fused_rmsnorm_matmul_bias_float(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const float* __restrict__ weight, // rms weights [n]
+    const float* __restrict__ w,      // weight matrix [d,n]
+    const float* __restrict__ bias,   // bias [d] (nullable)
+    int n, int d, const int* __restrict__ pos)
+{
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0) return;
+
+  extern __shared__ float s_shared[];
+  float* lds_x = (float*)(s_shared + 1);
+
+  const int tid  = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid  = tid >> 6;
+  const int row  = blockIdx.x * TM + wid;
+  if (wid >= TM || row >= d) return;
+
+  const float* __restrict__ xb_full = x + (size_t)b * n;
+  float sum = 0.f;
+  const int n4 = n >> 2;
+  const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xb_full);
+  for (int v = tid; v < n4; v += blockDim.x) {
+    float4 xv = x4[v];
+    sum = fmaf(xv.x, xv.x, sum);
+    sum = fmaf(xv.y, xv.y, sum);
+    sum = fmaf(xv.z, xv.z, sum);
+    sum = fmaf(xv.w, xv.w, sum);
+  }
+  for (int k = (n4 << 2) + tid; k < n; k += blockDim.x) {
+    float v = xb_full[k];
+    sum = fmaf(v, v, sum);
+  }
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1) sum += __shfl_down(sum, off, WF_SIZE);
+  __shared__ float warp_sums2[BLOCK_SIZE / WF_SIZE];
+  if (lane == 0) warp_sums2[wid] = sum;
+  __syncthreads();
+  float total = 0.f;
+  if (tid < BLOCK_SIZE / WF_SIZE) total = warp_sums2[tid];
+  if (wid == 0) {
+    float t = (tid < BLOCK_SIZE / WF_SIZE) ? total : 0.0f;
+#pragma unroll
+    for (int off = WF_SIZE >> 1; off > 0; off >>= 1) t += __shfl_down(t, off, WF_SIZE);
+    if (lane == 0) s_shared[0] = rsqrtf(t / (float)n + 1e-5f);
+  }
+  __syncthreads();
+  const float inv_rms = s_shared[0];
+
+  float acc = 0.f;
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+    const float* __restrict__ xb = xb_full + k_base;
+    const float* __restrict__ wb = weight + k_base;
+    const int vec4 = (k_size >> 2);
+    float4* s4 = reinterpret_cast<float4*>(lds_x);
+    const float4* x4b = reinterpret_cast<const float4*>(xb);
+    const float4* w4b = reinterpret_cast<const float4*>(wb);
+    for (int v = tid; v < vec4; v += BLOCK_SIZE) {
+      float4 xv = x4b[v];
+      float4 ww = w4b[v];
+      float4 nv;
+      nv.x = (xv.x * inv_rms) * ww.x;
+      nv.y = (xv.y * inv_rms) * ww.y;
+      nv.z = (xv.z * inv_rms) * ww.z;
+      nv.w = (xv.w * inv_rms) * ww.w;
+      s4[v] = nv;
+    }
+    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = (xb[k] * inv_rms) * wb[k];
+    }
+    __syncthreads();
+
+    const float* __restrict__ w_row = w + (size_t)row * n + k_base;
+    const int vec4k = (k_size >> 2);
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 wv = *reinterpret_cast<const float4*>(&w_row[v << 2]);
+      const float4 xv = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
+      acc = fmaf(wv.x, xv.x, acc);
+      acc = fmaf(wv.y, xv.y, acc);
+      acc = fmaf(wv.z, xv.z, acc);
+      acc = fmaf(wv.w, xv.w, acc);
+    }
+    for (int k = (vec4k << 2) + lane; k < k_size; k += WF_SIZE) {
+      acc = fmaf(w_row[k], lds_x[k], acc);
+    }
+    __syncthreads();
+  }
+
+  float v = warp_reduce_sum(acc);
+  if (lane == 0) {
+    y[(size_t)b * d + row] = v + (bias ? bias[row] : 0.0f);
+  }
+}
 
 // x:[n], w:[d,n], y:[d]
 // Grid: (ceil(d/TM), 1)
@@ -13,7 +217,8 @@ __global__ void matmul_bias_gemm_kernel_bf16(
     const float* __restrict__ bias,
     int n, int d, const int *pos)
 {
-  if (pos && pos[0] < 0) return;
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -30,7 +235,7 @@ __global__ void matmul_bias_gemm_kernel_bf16(
     const int k_size = min(TK, n - k_base);
 
     // Load X for single sample
-    const float* __restrict__ xb = x + k_base;
+  const float* __restrict__ xb = x + (size_t)b * n + k_base;
     // vec4 load
     const int vec4 = (k_size >> 2);
     float4* s4 = reinterpret_cast<float4*>(lds_x);
@@ -41,7 +246,7 @@ __global__ void matmul_bias_gemm_kernel_bf16(
     __syncthreads();
 
     // Weight computation for single sample
-    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+  const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
 
     const int vec4k = (k_size >> 2);
     const uint2* wq = reinterpret_cast<const uint2*>(w_row);
@@ -63,7 +268,7 @@ __global__ void matmul_bias_gemm_kernel_bf16(
   // Reduce and write for single sample
   float v = warp_reduce_sum(acc);
   if (lane == 0) {
-    y[row] = v + (bias ? bias[row] : 0.0f);
+    y[(size_t)b * d + row] = v + (bias ? bias[row] : 0.0f);
   }
 }
 
@@ -73,13 +278,14 @@ __global__ void matmul_bias_gemm_kernel_bf16(
  * Grid: (ceil(d/TM), 1)
  */
 __global__ void matmul_bias_gemm_kernel_float(
-    float* __restrict__ y,          // [d]
-    const float* __restrict__ x,    // [n]
+    float* __restrict__ y,          // [B,d]
+    const float* __restrict__ x,    // [B,n]
     const float* __restrict__ w,    // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
     int n, int d, const int *pos)
 {
-  if (pos && pos[0] < 0) return;
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -98,7 +304,7 @@ __global__ void matmul_bias_gemm_kernel_float(
     const int k_size = min(TK, n - k_base);
 
     // 1) Optimized vectorized load of X columns for single sample
-    const float* __restrict__ xb = x + k_base;
+    const float* __restrict__ xb = x + (size_t)b * n + k_base;
     
     // Load using vectorized operations
     const int vec4_k = (k_size >> 2);
@@ -143,22 +349,23 @@ __global__ void matmul_bias_gemm_kernel_float(
   // Optimized warp reduction and write output for single sample
   float result = warp_reduce_sum(acc);
   if (lane == 0) {
-    y[row] = result + (bias ? bias[row] : 0.0f);
+    y[(size_t)b * d + row] = result + (bias ? bias[row] : 0.0f);
   }
 }
 
 // ================= MLP1 (Gate & Up) : single sample, no CB =================
 __global__ void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up_topk, // [K, IM] (K = EXPERT_PER_TOKEN)
-    const float* __restrict__ x,      // [H]
+    float* __restrict__ gate_up_topk, // [B,K, IM]
+    const float* __restrict__ x,      // [B,H]
     const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
     const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
-    const int* __restrict__ topk_i,   // [K]
+    const int* __restrict__ topk_i,   // [B,K]
     int l_layer, int E, int H, int IM,
     float swiglu_limit,
     const int *pos)
 {
-  if (pos && pos[0] < 0) return;
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
   int expert_id;
@@ -174,7 +381,7 @@ __global__ void mlp1_fused_gemm_kernel(
     return;
 
   // Load expert ID for single sample
-  expert_id = topk_i[kidx];
+  expert_id = topk_i[(size_t)b * EXPERT_PER_TOKEN + kidx];
   if (expert_id < 0) return;
 
   float acc_gate = 0.f, acc_up = 0.f;
@@ -184,7 +391,7 @@ __global__ void mlp1_fused_gemm_kernel(
     const int k_size = min(TK, H - k_base);
 
     // Load X for single sample
-    const float* __restrict__ xb = x + k_base;
+  const float* __restrict__ xb = x + (size_t)b * H + k_base;
     // vec4 part
     const int vec4 = (k_size >> 2);
     float4* __restrict__ s4 = reinterpret_cast<float4*>(lds_x);
@@ -253,7 +460,7 @@ __global__ void mlp1_fused_gemm_kernel(
     gate = gate * __saturatef(0.5f + 0.5f * tanhf(alpha * gate * 0.5f));
     gate = gate * (up + 1.0f);
 
-    float* __restrict__ gu = gate_up_topk + ((size_t)kidx * (size_t)IM);
+  float* __restrict__ gu = gate_up_topk + (size_t)b * (size_t)(EXPERT_PER_TOKEN * IM) + ((size_t)kidx * (size_t)IM);
     gu[i] = gate;
   }
 }
@@ -261,16 +468,17 @@ __global__ void mlp1_fused_gemm_kernel(
 
 // ============ MLP2 (weighted accum) : single sample, no CB ==============
 __global__ void mlp2_bias_weighted_accum_gemm_kernel(
-    float* __restrict__ e_agg,              // [H] (accumulator)
-    const float* __restrict__ gate_up_topk, // [K, IM]
+    float* __restrict__ e_agg,              // [B,H] (accumulator)
+    const float* __restrict__ gate_up_topk, // [B,K, IM]
     const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
     const float* __restrict__ b_mlp2_all,   // [L, E, H]
-    const int* __restrict__ topk_i,         // [K]
-    const float* __restrict__ topk_v,       // [K]
+    const int* __restrict__ topk_i,         // [B,K]
+    const float* __restrict__ topk_v,       // [B,K]
     int l_layer, int E, int IM, int H,
     const int *pos)
 {
-  if (pos && pos[0] < 0) return;
+  const int b = blockIdx.y;
+  if (pos && pos[b] < 0) return;
 
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
   int expert_id;
@@ -287,8 +495,8 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     return;
 
   // Load expert ID and weight for single sample
-  expert_id = topk_i[kidx];
-  expert_w = topk_v[kidx];
+  expert_id = topk_i[(size_t)b * EXPERT_PER_TOKEN + kidx];
+  expert_w = topk_v[(size_t)b * EXPERT_PER_TOKEN + kidx];
   if (expert_id < 0 || expert_w == 0.f) return;
 
   float acc = 0.f;
@@ -298,8 +506,8 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     const int k_size = min(TK, IM - k_base);
 
     // Load data for single sample
-    const float* __restrict__ xb =
-        gate_up_topk + ((size_t)kidx * (size_t)IM + (size_t)k_base);
+  const float* __restrict__ xb =
+    gate_up_topk + (size_t)b * (size_t)(EXPERT_PER_TOKEN * IM) + ((size_t)kidx * (size_t)IM + (size_t)k_base);
 
     // vectorized load to shared
     const int vec4 = (k_size >> 2);
@@ -342,6 +550,6 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     const size_t b_mlp2_base = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)H;
     float out = acc_sum + b_mlp2_all[b_mlp2_base + (size_t)row];
     float contrib = out * expert_w;
-    atomicAdd(e_agg + (size_t)row, contrib);
+    atomicAdd(e_agg + (size_t)b * H + (size_t)row, contrib);
   }
 }

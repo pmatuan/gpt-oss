@@ -6,17 +6,18 @@
 // Uses dynamic shared memory sized for (max_pos + 2) floats
 // Optimized to read Q directly from QKV buffer
 __launch_bounds__(64, 8) __global__ void attention_kernel(
-    float *__restrict__ out_tb,  // [Hq*D]
-    const float *__restrict__ qkv, // [(Hq+2*Hk)*D], FP32 (already rotary-applied)
-    const float *__restrict__ k_cache,    // [L*S*KV], FP32
-    const float *__restrict__ v_cache,    // [L*S*KV], FP32
+    float *__restrict__ out_tb,  // [B,Hq*D]
+    const float *__restrict__ qkv, // [B,(Hq+2*Hk)*D], FP32 (already rotary-applied)
+    const float *__restrict__ k_cache,    // [B,L*S*KV], FP32
+    const float *__restrict__ v_cache,    // [B,L*S*KV], FP32
     const float *__restrict__ attn_sinks, // [L*Hq]
     int layer_idx, const int *__restrict__ pos, int D, int Hq, int Hk, int S,
     const float *__restrict__ mask, int kv_stride) {
+  const int b = blockIdx.y;
   const int head = blockIdx.x;
   const int lane = threadIdx.x;
 
-  const int pos_current = pos[0];
+  const int pos_current = pos[b];
   if (pos_current < 0 || head >= Hq)
     return;
 
@@ -29,12 +30,12 @@ __launch_bounds__(64, 8) __global__ void attention_kernel(
   const int q_size = Hq * D;
   const int kv_size = Hk * D;
   const int total = q_size + 2 * kv_size;
-  const float *__restrict__ qkv_b = qkv;
+  const float *__restrict__ qkv_b = qkv + (size_t)b * total;
   const float *__restrict__ k_layer =
-      k_cache + (size_t)layer_idx * S * kv_dim;
+    k_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
   const float *__restrict__ v_layer =
-      v_cache + (size_t)layer_idx * S * kv_dim;
-  float *__restrict__ out_b = out_tb;
+    v_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
+  float *__restrict__ out_b = out_tb + (size_t)b * (Hq * D);
 
   extern __shared__ float s_att[];
 

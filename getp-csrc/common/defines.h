@@ -48,6 +48,8 @@ struct GPUActivationBuffers {
   int *d_tokens;
   int *d_pos;
   float *d_inv_rms;
+  // Device-side buffer to store next token per batch slot (for GPU sampling)
+  int *d_next_tokens;
 };
 
 struct GPUWeightBuffersFP32 {
@@ -79,6 +81,13 @@ struct DeviceContext {
   int capacity_B = 1;
   hipStream_t *streams = nullptr;
   int n_streams = 0;
+  // Optional separate lightweight IO streams per slot (for D2H/H2D small copies)
+  hipStream_t *io_streams = nullptr; // size B
+  // Per-slot event to signal compute completion to IO stream
+  hipEvent_t *compute_done_events = nullptr; // size B
+  // Pinned host staging for graph-friendly H2D updates
+  int *h_tokens_pinned = nullptr; // [B]
+  int *h_pos_pinned = nullptr;    // [B]
 };
 
 // Prompt Context Structure
