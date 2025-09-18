@@ -40,8 +40,15 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   const int S = model_config->seq_len;
   const int IM = model_config->intermediate_dim;
 
-  ctx.stage_start = (L / g_num_devices) * device_id;
-  ctx.stage_end = (device_id == g_num_devices - 1) ? L : (L / g_num_devices) * (device_id + 1);
+  // Balanced layer partitioning across devices:
+  // Distribute remainder layers to the first `rem` devices so that
+  // the difference between any two devices is at most 1 layer.
+  const int base = L / g_num_devices;
+  const int rem = L % g_num_devices;
+  const int extra = (device_id < rem) ? 1 : 0;
+  const int offset = device_id * base + (device_id < rem ? device_id : rem);
+  ctx.stage_start = offset;
+  ctx.stage_end = offset + base + extra;
   const int local_L = ctx.stage_end - ctx.stage_start;
 
   printf("Initializing device %d (layers [%d, %d))...\n", device_id, ctx.stage_start, ctx.stage_end);
@@ -319,7 +326,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
       hipError_t e = hipDeviceCanAccessPeer(&canAccess, i, j);
       if (e == hipSuccess && canAccess) {
         // Ignore errors if already enabled
-        HIPCHECK(hipDeviceEnablePeerAccess(j, 0));
+        HIP_CHECK(hipDeviceEnablePeerAccess(j, 0));
       }
     }
   }
@@ -781,26 +788,6 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           H, batch_size, ctx.gpu_activations.d_pos);
     }
   }
-  if (ctx.device_id < g_num_devices - 1) {
-    DeviceContext &next = g_devices[ctx.device_id + 1];
-    HIP_CHECK(hipMemcpyPeerAsync(next.gpu_activations.d_x,
-                                 next.device_id,
-                                 ctx.gpu_activations.d_x,
-                                 ctx.device_id,
-                                 H * batch_size * sizeof(float),
-                                 0));
-    HIP_CHECK(hipDeviceSynchronize());
-  }
-  if (ctx.device_id < g_num_devices - 1) {
-    DeviceContext &next = g_devices[ctx.device_id + 1];
-    HIP_CHECK(hipMemcpyPeerAsync(next.gpu_activations.d_x,
-                                 next.device_id,
-                                 ctx.gpu_activations.d_x,
-                                 ctx.device_id,
-                                 H * batch_size * sizeof(float),
-                                 0));
-    HIP_CHECK(hipDeviceSynchronize());
-  }
 
   // Final head
   if (ctx.device_id == g_num_devices - 1) {
@@ -969,11 +956,12 @@ static long long run_requests_pipeline(Transformer *transformer,
         HIP_CHECK(hipEventRecord(ev_compute_done[s][m], compute_streams[s]));
 
         if (s < g_num_devices - 1) {
-          // Launch P2P to next stage after compute done, using source device stream/event
+          // Launch P2P to next stage after compute done, enqueue on SOURCE device stream
           DeviceContext &src = g_devices[s];
           DeviceContext &dst = g_devices[s + 1];
           HIP_CHECK(hipSetDevice(src.device_id));
           HIP_CHECK(hipStreamWaitEvent(p2p_streams[src.device_id], ev_compute_done[s][m], 0));
+
           HIP_CHECK(hipMemcpyPeerAsync(dst.gpu_activations.d_x + (size_t)base * p->hidden_dim,
                                        dst.device_id,
                                        src.gpu_activations.d_x + (size_t)base * p->hidden_dim,
@@ -1095,7 +1083,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   long long num_token_out = 0;
   PromptCtx *ctxs = new PromptCtx[num_requests];
 
-#pragma omp parallel for schedule(dynamic)
+  #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < num_requests; ++i) {
     setup_prompt_ctx(ctxs[i], requests, i, sampler, transformer, tokenizer);
   }
