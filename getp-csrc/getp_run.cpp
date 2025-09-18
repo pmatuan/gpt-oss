@@ -584,23 +584,19 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     // Scatter QKV to q / caches (batched)
     const int loff = l * S * KV;
     {
-      PROFILE_GPU_SCOPE("split_qkv_scatter_to_cache_batch_kernel", 0);
-      dim3 gridQKV_batch(gridQKV.x, batch_size, 1);
-      split_qkv_scatter_to_cache_batch_kernel<<<gridQKV_batch, block, 0>>>(
-          ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
-          ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk,
-          D, loff, ctx.gpu_activations.d_pos, batch_size, L * S * KV);
-    }
-
-    // Apply RoPE to q and cached k (batched)
-    {
-      PROFILE_GPU_SCOPE("fused_inline_rope_qkv_batch_kernel", 0);
-      dim3 gridApply_batch(max(Hq, Hk), batch_size, 1);
-      fused_inline_rope_qkv_batch_kernel<<<gridApply_batch, D / 2, 0>>>(
-          ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
-          ctx.gpu_activations.d_pos, p->rope_theta, Hq, Hk, D,
-          p->rope_scaling_factor, p->initial_context_length, loff, L * S * KV,
-          batch_size);
+      PROFILE_GPU_SCOPE("fused_split_rope_scatter_qkv_batch_kernel", 0);
+      dim3 grid_fused(max(Hq, Hk), batch_size, 1);
+      dim3 block_fused(D / 2, 1, 1);
+      fused_split_rope_scatter_qkv_batch_kernel<<<grid_fused, block_fused, 0>>>(
+          /*q_out*/        ctx.gpu_activations.d_q,
+          /*key_cache*/    ctx.gpu_activations.d_key_cache,
+          /*value_cache*/  ctx.gpu_activations.d_value_cache,
+          /*qkv*/          ctx.gpu_activations.d_qkv,
+          /*pos*/          ctx.gpu_activations.d_pos,
+          /*Hq,Hk,D*/      Hq, Hk, D,
+          /*RoPE*/         p->rope_theta, p->rope_scaling_factor, p->initial_context_length,
+          /*cache*/        loff, L * S * (D * Hk),
+          /*B*/            batch_size);
     }
 
     // Attention (batched)
