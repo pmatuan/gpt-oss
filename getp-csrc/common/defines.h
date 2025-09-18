@@ -41,13 +41,14 @@ struct GPUActivationBuffers {
   float *d_gate_up, *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
   float *d_qkv;
-  float *d_key_cache, *d_value_cache;
+  bf16_t *d_key_cache, *d_value_cache;
   float *d_att, *d_logits, *d_mask;
   float *d_cos_vals, *d_sin_vals;
   int *d_token2row;
   int *d_tokens;
   int *d_pos;
   float *d_inv_rms;
+  int *d_next_tokens; // sampled next tokens per batch sample
 };
 
 struct GPUWeightBuffersFP32 {
