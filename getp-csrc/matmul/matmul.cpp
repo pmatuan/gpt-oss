@@ -6,92 +6,85 @@
 
 // x:[B,n], w:[d,n], y:[B,d]
 // Grid: (ceil(d/TM), ceil(B/B_TILE))
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void matmul_bias_gemm_kernel_bf16(
-    float* __restrict__ y,
-    const float* __restrict__ x,
-    const bf16_t* __restrict__ w,
-    const float* __restrict__ bias,
-    int n, int d, int batch_size, const int *pos)
+__launch_bounds__(64, 2) __global__
+void matmul_bias_gemm_kernel_bf16_mfma(
+    float* __restrict__ y,          // [B x d]
+    const float* __restrict__ x,    // [B x n] (fp32)
+    const bf16_t* __restrict__ w,   // [d x n] (bf16)
+    const float* __restrict__ bias, // [d] or nullptr
+    int n, int d, int B,
+    const int* __restrict__ pos)    // nullable; pos[b] < 0 -> skip row
 {
-  const int btile = blockIdx.y;
-  const int b0    = btile * B_TILE;
+  // One wave64 per block: 16 x-threads, 4 y-threads
+  const int tx = threadIdx.x; // 0..15
+  const int ty = threadIdx.y; // 0..3
 
-  __shared__ __align__(16) float lds_x[B_TILE][TK + LDS_PAD];
+  // 32x32 tile origin on (M=B, N=d)
+  const int M0 = blockIdx.y * 32;
+  const int N0 = blockIdx.x * 32;
 
-  const int tid  = threadIdx.x;
-  const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;
-  const int row  = blockIdx.x * TM + wid;
+  // Per-lane columns (two 16-wide halves)
+  const int c0 = N0 + tx;
+  const int c1 = N0 + tx + 16;
+  const bool c0_ok = (c0 < d);
+  const bool c1_ok = (c1 < d);
 
-  if (wid >= TM || row >= d) return;
+  // Per-lane rows (two 16-high halves)
+  const int r0 = M0 + tx;
+  const int r1 = M0 + tx + 16;
+  const bool r0_ok = (r0 < B) && (!(pos) || pos[r0] >= 0);
+  const bool r1_ok = (r1 < B) && (!(pos) || pos[r1] >= 0);
 
-  // Per-sample accumulators inside the warp
-  float acc[B_TILE] = {0.f};
+  // Accumulators for 4 MFMA fragments (32x32 tile = 2x2 of 16x16)
+  f32x4 acc00 = {0.f,0.f,0.f,0.f};
+  f32x4 acc01 = {0.f,0.f,0.f,0.f};
+  f32x4 acc10 = {0.f,0.f,0.f,0.f};
+  f32x4 acc11 = {0.f,0.f,0.f,0.f};
 
-  for (int k_base = 0; k_base < n; k_base += TK) {
-    const int k_size = min(TK, n - k_base);
+  // K-loop in steps of 16 (bf16 depth)
+  for (int k0 = 0; k0 < n; k0 += 16) {
+    // Each ty takes a 4-wide slice in this k-tile
+    const int k_base = k0 + ty * 4;
+    const int k_rem  = max(0, min(4, n - k_base)); // 0..4 remaining in this slice
 
-    // Load X tiles for up to B_TILE samples
-    #pragma unroll
-    for (int bi = 0; bi < B_TILE; ++bi) {
-      const int b = b0 + bi;
-      if (b < batch_size && !(pos && pos[b] < 0)) {
-        const float* __restrict__ xb = x + (size_t)b * n + k_base;
-        // vec4 load
-        const int vec4 = (k_size >> 2);
-        float4* s4 = reinterpret_cast<float4*>(lds_x[bi]);
-        const float4* x4 = reinterpret_cast<const float4*>(xb);
-        for (int v = tid; v < vec4; v += BLOCK_SIZE) s4[v] = x4[v];
-        for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE)
-          lds_x[bi][k] = xb[k];
-      }
-    }
-    __syncthreads();
+    // A (X): row-major [B x n] -> take 4 fp32, convert to bf16 with guards
+    const float* x_r0 = x + (size_t)r0 * n + k_base;
+    const float* x_r1 = x + (size_t)r1 * n + k_base;
+    s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_r0, 0, k_rem, r0_ok);
+    s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_r1, 0, k_rem, r1_ok);
 
-    // All warps reuse the same W[row,:] for the 4 samples
-    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+    // B (W): row-major [d x n], but we need (k, col) -> &w[col*n + k_base]
+    const bf16_t* w_c0 = w + (size_t)c0 * n + k_base;
+    const bf16_t* w_c1 = w + (size_t)c1 * n + k_base;
+    s16x4 Bvec_c0 = pack4_bf16_from_bf16_guard(w_c0, 0, k_rem, c0_ok);
+    s16x4 Bvec_c1 = pack4_bf16_from_bf16_guard(w_c1, 0, k_rem, c1_ok);
 
-    const int vec4k = (k_size >> 2);
-    const uint2* wq = reinterpret_cast<const uint2*>(w_row);
-    for (int v = lane; v < vec4k; v += WF_SIZE) {
-      const float4 wv = bf16quad_to_float4(wq[v]);
-      #pragma unroll
-      for (int bi = 0; bi < B_TILE; ++bi) {
-        const int b = b0 + bi;
-        if (b < batch_size && !(pos && pos[b] < 0)) {
-          const float4 xv = *reinterpret_cast<const float4*>(&lds_x[bi][v << 2]);
-          acc[bi] = fmaf(wv.x, xv.x, acc[bi]);
-          acc[bi] = fmaf(wv.y, xv.y, acc[bi]);
-          acc[bi] = fmaf(wv.z, xv.z, acc[bi]);
-          acc[bi] = fmaf(wv.w, xv.w, acc[bi]);
-        }
-      }
-    }
-    for (int k = vec4k * 4 + lane; k < k_size; k += WF_SIZE) {
-      const float wv = (float)w_row[k];
-      #pragma unroll
-      for (int bi = 0; bi < B_TILE; ++bi) {
-        const int b = b0 + bi;
-        if (b < batch_size && !(pos && pos[b] < 0)) {
-          acc[bi] = fmaf(wv, lds_x[bi][k], acc[bi]);
-        }
-      }
-    }
-    __syncthreads();
+    // 4 MFMA ops (2x2 fragments)
+    acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0, acc00, 0,0,0);
+    acc01 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c1, acc01, 0,0,0);
+    acc10 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c0, acc10, 0,0,0);
+    acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1, acc11, 0,0,0);
   }
 
-  // Reduce and write
+  // Runtime bias: only read when col is valid and bias != nullptr
+  const float b0 = (bias && c0_ok) ? bias[c0] : 0.f;
+  const float b1 = (bias && c1_ok) ? bias[c1] : 0.f;
+
+  // Scatter back (each ty handles 4 row offsets within the 16x16 fragment)
   #pragma unroll
-  for (int bi = 0; bi < B_TILE; ++bi) {
-    float v = acc[bi];
-    v = warp_reduce_sum(v);
-    if (lane == 0) {
-      const int b = b0 + bi;
-      if (b < batch_size && !(pos && pos[b] < 0)) {
-        float* yb = y + (size_t)b * d;
-        yb[row] = v + (bias ? bias[row] : 0.0f);
-      }
+  for (int i=0;i<4;i++) {
+    const int row_lo = M0 + (i + 4 * ty);
+    const int row_hi = row_lo + 16;
+
+    if (row_lo < B && (!(pos) || pos[row_lo] >= 0)) {
+      float* y0 = y + (size_t)row_lo * d;
+      if (c0_ok) y0[c0]   = acc00[i] + b0;
+      if (c1_ok) y0[c1]   = acc01[i] + b1;
+    }
+    if (row_hi < B && (!(pos) || pos[row_hi] >= 0)) {
+      float* y1 = y + (size_t)row_hi * d;
+      if (c0_ok) y1[c0]   = acc10[i] + b0;
+      if (c1_ok) y1[c1]   = acc11[i] + b1;
     }
   }
 }

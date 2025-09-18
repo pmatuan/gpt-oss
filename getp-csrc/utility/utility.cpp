@@ -21,6 +21,32 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id) {
   fflush(stdout);
 }
 
+__device__ __forceinline__ short f32_to_bf16_bits_short(float f) {
+  union { uint32_t u; float f; } v; v.f = f;
+  return (short)(v.u >> 16);
+}
+
+__device__ __forceinline__ s16x4 pack4_bf16_from_f32_guard(
+    const float* base_f32, int k_off, int k_rem, bool row_valid) {
+  s16x4 v = {0,0,0,0};
+  if (!row_valid) return v;
+  #pragma unroll
+  for (int i=0;i<4;i++) {
+    if (i < k_rem) v[i] = f32_to_bf16_bits_short(base_f32[k_off + i]);
+  }
+  return v;
+}
+
+__device__ __forceinline__ s16x4 pack4_bf16_from_bf16_guard(
+    const bf16_t* base_bf16, int k_off, int k_rem, bool col_valid) {
+  s16x4 v = {0,0,0,0};
+  if (!col_valid) return v;
+  #pragma unroll
+  for (int i=0;i<4;i++) {
+    if (i < k_rem) v[i] = base_bf16[k_off + i].data;
+  }
+  return v;
+}
 
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
   union { uint32_t u; float f; } a, b;

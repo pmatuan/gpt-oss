@@ -7,7 +7,11 @@
 static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
 
 // Grid Dimension Utilities (removed - using direct dim3 initialization)
-
+__device__ __forceinline__ short f32_to_bf16_bits_short(float f);
+__device__ __forceinline__ s16x4 pack4_bf16_from_f32_guard(
+    const float* base_f32, int k_off, int k_rem, bool row_valid);
+__device__ __forceinline__ s16x4 pack4_bf16_from_bf16_guard(
+    const bf16_t* base_bf16, int k_off, int k_rem, bool col_valid);
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1);
 __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
 __device__ __forceinline__ float warp_reduce_sum(float v);

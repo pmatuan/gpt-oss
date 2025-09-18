@@ -20,7 +20,8 @@ typedef hip_bfloat16 bf16_t;
 #define B_TILE 4
 #define EXPERT_PER_TOKEN 4
 
-using mfloat4 = __attribute__((__vector_size__(MFMA_K * sizeof(float)))) float;
+using f32x4 = float __attribute__((ext_vector_type(4)));
+using s16x4 = short __attribute__((ext_vector_type(4)));
 
 // HIP Error Checking Macro
 #define HIP_CHECK(call)                                                        \
