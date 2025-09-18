@@ -568,36 +568,35 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
       // Then apply MatMul + Bias
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16", 0);
-        dim3 gridQKV_gemm((QKV_D + TM - 1) / TM, (batch_size + B_TILE - 1) / B_TILE, 1);
-        matmul_bias_gemm_kernel_bf16<<<gridQKV_gemm, block, 0>>>(
-            ctx.gpu_activations.d_qkv, ctx.gpu_activations.d_t,
-            ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * QKV_D * H,
-            ctx.gpu_weights_fp32.d_b_qkv + l * QKV_D, H, QKV_D, batch_size,
+        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
+        dim3 gridQKV_gemm((QKV_D + 31) / 32, (batch_size + 31) / 32, 1);
+        dim3 blockQKV(16, 4, 1);
+        matmul_bias_gemm_kernel_bf16_mfma<<<gridQKV_gemm, blockQKV>>>(
+            ctx.gpu_activations.d_qkv,
+            ctx.gpu_activations.d_t,
+            ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * (size_t)QKV_D * (size_t)H,
+            ctx.gpu_weights_fp32.d_b_qkv ? (ctx.gpu_weights_fp32.d_b_qkv + (size_t)l * QKV_D) : nullptr,
+            H, QKV_D, batch_size,
             ctx.gpu_activations.d_pos);
-      }
+      }      
     }
 
     // Scatter QKV to q / caches (batched)
     const int loff = l * S * KV;
     {
-      PROFILE_GPU_SCOPE("split_qkv_scatter_to_cache_batch_kernel", 0);
-      dim3 gridQKV_batch(gridQKV.x, batch_size, 1);
-      split_qkv_scatter_to_cache_batch_kernel<<<gridQKV_batch, block, 0>>>(
-          ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
-          ctx.gpu_activations.d_value_cache, ctx.gpu_activations.d_qkv, Hq, Hk,
-          D, loff, ctx.gpu_activations.d_pos, batch_size, L * S * KV);
-    }
-
-    // Apply RoPE to q and cached k (batched)
-    {
-      PROFILE_GPU_SCOPE("fused_inline_rope_qkv_batch_kernel", 0);
-      dim3 gridApply_batch(max(Hq, Hk), batch_size, 1);
-      fused_inline_rope_qkv_batch_kernel<<<gridApply_batch, D / 2, 0>>>(
-          ctx.gpu_activations.d_q, ctx.gpu_activations.d_key_cache,
-          ctx.gpu_activations.d_pos, p->rope_theta, Hq, Hk, D,
-          p->rope_scaling_factor, p->initial_context_length, loff, L * S * KV,
-          batch_size);
+      PROFILE_GPU_SCOPE("fused_split_rope_scatter_qkv_batch_kernel", 0);
+      dim3 grid_fused(max(Hq, Hk), batch_size, 1);
+      dim3 block_fused(D / 2, 1, 1);
+      fused_split_rope_scatter_qkv_batch_kernel<<<grid_fused, block_fused, 0>>>(
+          /*q_out*/        ctx.gpu_activations.d_q,
+          /*key_cache*/    ctx.gpu_activations.d_key_cache,
+          /*value_cache*/  ctx.gpu_activations.d_value_cache,
+          /*qkv*/          ctx.gpu_activations.d_qkv,
+          /*pos*/          ctx.gpu_activations.d_pos,
+          /*Hq,Hk,D*/      Hq, Hk, D,
+          /*RoPE*/         p->rope_theta, p->rope_scaling_factor, p->initial_context_length,
+          /*cache*/        loff, L * S * (D * Hk),
+          /*B*/            batch_size);
     }
 
     // Attention (batched)
@@ -622,9 +621,10 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16", 0);
-        dim3 gridO_gemm((H + TM - 1) / TM, (batch_size + B_TILE - 1) / B_TILE, 1);
-        matmul_bias_gemm_kernel_bf16<<<gridO_gemm, block, 0>>>(
+        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
+        dim3 gridO_gemm((H + 31) / 32, (batch_size + 31) / 32, 1);
+        dim3 blockO(16, 4, 1);
+        matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
             ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size,
@@ -749,9 +749,10 @@ static float *gpu_forward_device_batch(Transformer *transformer,
 
     // 2) MatMul for logits - separate GEMM version
     {
-      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16", 0);
-      dim3 gridV_gemm((V + TM - 1) / TM, (batch_size + B_TILE - 1) / B_TILE, 1);
-      matmul_bias_gemm_kernel_bf16<<<gridV_gemm, block, 0>>>(
+      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
+      dim3 gridV_gemm((V + 31) / 32, (batch_size + 31) / 32, 1);
+      dim3 blockV(16, 4, 1);
+      matmul_bias_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V, batch_size,
           ctx.gpu_activations.d_pos);
@@ -768,103 +769,108 @@ static long long run_requests_on_device(Transformer *transformer,
 
   long long total_tokens = 0;
 
-  // Allocate batch helpers on host
-  const int B = num_ctxs;
-  std::vector<int> h_tokens(B, 0);
-  std::vector<int> h_pos(B, 0);
-  std::vector<char> h_active(B, 1);
+  // Process requests in batches of MAX_BATCH_SIZE
+  for (int batch_start = 0; batch_start < num_ctxs; batch_start += MAX_BATCH_SIZE) {
+    const int B = std::min(MAX_BATCH_SIZE, num_ctxs - batch_start);
+    PromptCtx *batch_ctxs = ctxs + batch_start;
 
-  std::transform(ctxs, ctxs + B, h_tokens.begin(),
-                 [](const PromptCtx &ctx) { return ctx.token; });
+    // Allocate batch helpers on host
+    std::vector<int> h_tokens(B, 0);
+    std::vector<int> h_pos(B, 0);
+    std::vector<char> h_active(B, 1);
 
-  // Ensure device buffers sized for B and clear KV caches
-  ensure_device_capacity(g_devices[device_id], B);
-  const Config *p = model_config;
-  const int D = p->head_dim;
-  const int Hk = p->n_kv_heads;
-  const int KV = D * Hk;
-  const int L = p->n_layers;
-  const int S = p->seq_len;
-  DeviceContext &dctx = g_devices[device_id];
+    std::transform(batch_ctxs, batch_ctxs + B, h_tokens.begin(),
+                   [](const PromptCtx &ctx) { return ctx.token; });
 
-  // Temporary host buffer for batched logits
-  const int V = p->vocab_size;
-  std::vector<float> h_logits_batch((size_t)B * V);
+    // Ensure device buffers sized for B and clear KV caches
+    ensure_device_capacity(g_devices[device_id], B);
+    const Config *p = model_config;
+    const int D = p->head_dim;
+    const int Hk = p->n_kv_heads;
+    const int KV = D * Hk;
+    const int L = p->n_layers;
+    const int S = p->seq_len;
+    DeviceContext &dctx = g_devices[device_id];
 
-  int num_finished = 0;
-  while (num_finished < B) {
-    // Build positions and tokens for this step; mark inactive with pos=-1
-    int max_pos_in_batch = 0;
-    for (int i = 0; i < B; ++i) {
-      if (!h_active[i]) {
-        h_pos[i] = -1;
-        h_tokens[i] = -1;
-      } else {
-        if (h_pos[i] > max_pos_in_batch)
-          max_pos_in_batch = h_pos[i];
-      }
-    }
+    // Temporary host buffer for batched logits
+    const int V = p->vocab_size;
+    std::vector<float> h_logits_batch((size_t)B * V);
 
-    float *d_log =
-        gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(), B,
-                                 device_id, max_pos_in_batch);
-
-    HIP_CHECK(hipMemcpy(h_logits_batch.data(), d_log,
-                        (size_t)B * V * sizeof(float), hipMemcpyDeviceToHost));
-
-    // For each active context, advance one step
-    for (int i = 0; i < B; ++i) {
-      if (!h_active[i])
-        continue;
-      PromptCtx &ctx = ctxs[i];
-
-      // Copy logits for this sample into ctx.h_logits
-      memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V],
-             (size_t)V * sizeof(float));
-
-      ctx.pos++;
-      h_pos[i] = ctx.pos;
-      int next;
-      if (ctx.pos < ctx.num_prompt_tokens) {
-        next = ctx.prompt_tokens[ctx.pos];
-      } else {
-        ctx.is_context_phase = false;
-        next = sample(ctx.sampler, ctx.h_logits);
-        ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
-        ctx.num_generated++;
+    int num_finished = 0;
+    while (num_finished < B) {
+      // Build positions and tokens for this step; mark inactive with pos=-1
+      int max_pos_in_batch = 0;
+      for (int i = 0; i < B; ++i) {
+        if (!h_active[i]) {
+          h_pos[i] = -1;
+          h_tokens[i] = -1;
+        } else {
+          if (h_pos[i] > max_pos_in_batch)
+            max_pos_in_batch = h_pos[i];
+        }
       }
 
-      if (next == 199999 || next == 200002) {
-        ctx.finished = true;
-        h_active[i] = 0;
-        num_finished++;
+      float *d_log =
+          gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(), B,
+                                   device_id, max_pos_in_batch);
+
+      HIP_CHECK(hipMemcpy(h_logits_batch.data(), d_log,
+                          (size_t)B * V * sizeof(float), hipMemcpyDeviceToHost));
+
+      // For each active context, advance one step
+      for (int i = 0; i < B; ++i) {
+        if (!h_active[i])
+          continue;
+        PromptCtx &ctx = batch_ctxs[i];
+
+        // Copy logits for this sample into ctx.h_logits
+        memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V],
+               (size_t)V * sizeof(float));
+
+        ctx.pos++;
+        h_pos[i] = ctx.pos;
+        int next;
+        if (ctx.pos < ctx.num_prompt_tokens) {
+          next = ctx.prompt_tokens[ctx.pos];
+        } else {
+          ctx.is_context_phase = false;
+          next = sample(ctx.sampler, ctx.h_logits);
+          ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
+          ctx.num_generated++;
+        }
+
+        if (next == 199999 || next == 200002) {
+          ctx.finished = true;
+          h_active[i] = 0;
+          num_finished++;
+          const char *piece = decode_piece(tokenizer, ctx.token, next);
+          if (piece)
+            ctx.output_str += piece;
+          ctx.token = next;
+          continue;
+        }
+
         const char *piece = decode_piece(tokenizer, ctx.token, next);
         if (piece)
           ctx.output_str += piece;
+
         ctx.token = next;
-        continue;
-      }
+        h_tokens[i] = next;
 
-      const char *piece = decode_piece(tokenizer, ctx.token, next);
-      if (piece)
-        ctx.output_str += piece;
-
-      ctx.token = next;
-      h_tokens[i] = next;
-
-      // Respect max steps constraint
-      if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
-        ctx.finished = true;
-        h_active[i] = 0;
-        num_finished++;
+        // Respect max steps constraint
+        if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
+          ctx.finished = true;
+          h_active[i] = 0;
+          num_finished++;
+        }
       }
     }
-  }
 
-  for (int i = 0; i < B; ++i) {
-    PromptCtx &ctx = ctxs[i];
-    ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
-    total_tokens += (long long)(ctx.pos - ctx.num_prompt_tokens + 1);
+    for (int i = 0; i < B; ++i) {
+      PromptCtx &ctx = batch_ctxs[i];
+      ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens + 1] = -1;
+      total_tokens += (long long)(ctx.pos - ctx.num_prompt_tokens + 1);
+    }
   }
 
   return total_tokens;

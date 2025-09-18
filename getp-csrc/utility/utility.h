@@ -7,7 +7,11 @@
 static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
 
 // Grid Dimension Utilities (removed - using direct dim3 initialization)
-
+__device__ __forceinline__ short f32_to_bf16_bits_short(float f);
+__device__ __forceinline__ s16x4 pack4_bf16_from_f32_guard(
+    const float* base_f32, int k_off, int k_rem, bool row_valid);
+__device__ __forceinline__ s16x4 pack4_bf16_from_bf16_guard(
+    const bf16_t* base_bf16, int k_off, int k_rem, bool col_valid);
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1);
 __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
 __device__ __forceinline__ float warp_reduce_sum(float v);
@@ -31,16 +35,20 @@ __global__ void residual_add_batch_kernel(float *x, const float *residual,
                                           int dim, int batch_size,
                                           const int *pos);
 
-// QKV Processing Kernels
-__global__ void split_qkv_scatter_to_cache_batch_kernel(
-    float *q, float *k_cache, float *v_cache, const float *qkv, int Hq, int Hk,
-    int D, int loff, const int *pos, int batch_size, int kv_total_size);
-
-// RoPE (Rotary Position Embedding) Kernels
-__global__ void fused_inline_rope_qkv_batch_kernel(
-    float *q, float *k_cache, const int *pos, float theta, int Hq, int Hk,
-    int D, float rope_scaling_factor, int initial_context_length, int loff,
-    int kv_total_size, int batch_size);
+__global__ void fused_split_rope_scatter_qkv_batch_kernel(
+    float* __restrict__ q_out,
+    float* __restrict__ key_cache,
+    float* __restrict__ value_cache,
+    const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
+    const int* __restrict__ pos,       // [B]
+    // model params
+    int Hq, int Hk, int D,
+    // RoPE params
+    float theta, float rope_scaling_factor, int initial_context_length,
+    // cache params
+    int layer_offset,   // = l * S * (Hk*D)
+    int kv_total_size,  // = L * S * (Hk*D)
+    int batch_size);
 
 // Expert/MoE Utility Kernels
 __global__ void fused_topk_softmax_batch_kernel(

@@ -21,6 +21,32 @@ static inline void debug_print_gpu_memory(const char *tag, int device_id) {
   fflush(stdout);
 }
 
+__device__ __forceinline__ short f32_to_bf16_bits_short(float f) {
+  union { uint32_t u; float f; } v; v.f = f;
+  return (short)(v.u >> 16);
+}
+
+__device__ __forceinline__ s16x4 pack4_bf16_from_f32_guard(
+    const float* base_f32, int k_off, int k_rem, bool row_valid) {
+  s16x4 v = {0,0,0,0};
+  if (!row_valid) return v;
+  #pragma unroll
+  for (int i=0;i<4;i++) {
+    if (i < k_rem) v[i] = f32_to_bf16_bits_short(base_f32[k_off + i]);
+  }
+  return v;
+}
+
+__device__ __forceinline__ s16x4 pack4_bf16_from_bf16_guard(
+    const bf16_t* base_bf16, int k_off, int k_rem, bool col_valid) {
+  s16x4 v = {0,0,0,0};
+  if (!col_valid) return v;
+  #pragma unroll
+  for (int i=0;i<4;i++) {
+    if (i < k_rem) v[i] = base_bf16[k_off + i].data;
+  }
+  return v;
+}
 
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
   union { uint32_t u; float f; } a, b;
@@ -59,106 +85,99 @@ __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
   }
 }
 
-// Batched: grid.y is batch, uses d_pos to compute offset per sample
-__global__ void split_qkv_scatter_to_cache_batch_kernel(
-    float *q, float *key_cache, float *value_cache, const float *qkv,
-    int n_attn_heads, int n_kv_heads, int head_dim, int layer_offset,
-    const int *pos, int batch_size, int kv_stride) {
-  const int b = blockIdx.y;
-  if (b >= batch_size)
-    return;
+__global__ void fused_split_rope_scatter_qkv_batch_kernel(
+    float* __restrict__ q_out,
+    float* __restrict__ key_cache,
+    float* __restrict__ value_cache,
+    const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
+    const int* __restrict__ pos,       // [B]
+    // model params
+    int Hq, int Hk, int D,
+    // RoPE params
+    float theta, float rope_scaling_factor, int initial_context_length,
+    // cache params
+    int layer_offset,   // = l * S * (Hk*D)
+    int kv_total_size,  // = L * S * (Hk*D)
+    int batch_size)
+{
+    const int h = blockIdx.x;           // head idx
+    const int b = blockIdx.y;           // batch idx
+    const int i = threadIdx.x;          // [0..D/2)
+    const int half = D >> 1;
 
-  const int pos_b = pos[b];
-  if (pos_b < 0)
-    return;
+    if (b >= batch_size || i >= half) return;
 
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int q_size = n_attn_heads * head_dim;
-  const int kv_size = n_kv_heads * head_dim;
-  const int total = q_size + 2 * kv_size;
-  if (idx >= total)
-    return;
+    const int pos_b = pos[b];
+    if (pos_b < 0) return;
 
-  float *q_b = q + (size_t)b * q_size;
-  float *kcache_b = key_cache + (size_t)b * kv_stride;
-  float *vcache_b = value_cache + (size_t)b * kv_stride;
-  const float *qkv_b = qkv + (size_t)b * total;
+    // sizes
+    const int q_size  = Hq * D;
+    const int kv_size = Hk * D;
+    const int KV      = kv_size;
 
-  const int pos_offset = pos_b * kv_size;
-  if (idx < q_size) {
-    q_b[idx] = qkv_b[idx];
-  } else if (idx < q_size + kv_size) {
-    int k_idx = idx - q_size;
-    kcache_b[layer_offset + pos_offset + k_idx] = qkv_b[idx];
-  } else {
-    int v_idx = idx - q_size - kv_size;
-    vcache_b[layer_offset + pos_offset + v_idx] = qkv_b[idx];
-  }
-}
+    // base pointers per batch
+    float* __restrict__ q_b      = q_out       + (size_t)b * q_size;
+    float* __restrict__ kcache_b = key_cache   + (size_t)b * kv_total_size;
+    float* __restrict__ vcache_b = value_cache + (size_t)b * kv_total_size;
+    const float* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
-// Batched variant reading pos[b] and scattering per batch
-__global__ void fused_inline_rope_qkv_batch_kernel(
-    float *q, float *k_cache, const int *pos, float theta, int Hq, int Hk,
-    int D, float rope_scaling_factor, int initial_context_length, int loff,
-    int kv_total_size, int batch_size) {
-  const int h = blockIdx.x;
-  const int i = threadIdx.x;
-  const int b = blockIdx.y;
-  if (b >= batch_size)
-    return;
+    // ---- compute RoPE angles for this (i, b)
+    // inv_freq with scaling (khớp logic hiện tại)
+    float freq = powf(theta, (float)(2 * i) / (float)D);
+    float inv_freq;
+    float concentration = 1.0f;
+    if (rope_scaling_factor > 1.0f) {
+        concentration = 0.1f * logf(rope_scaling_factor) + 1.0f;
+        const float ntk_beta = 32.0f, ntk_alpha = 1.0f;
+        const float low  = half * logf((float)initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(theta);
+        const float high = half * logf((float)initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(theta);
+        const float interpolation = 1.0f / (rope_scaling_factor * freq);
+        const float extrapolation = 1.0f / freq;
+        float ramp = ((float)i - low) / (high - low);
+        ramp = fmaxf(0.0f, fminf(1.0f, ramp));
+        const float mask = 1.0f - ramp;
+        inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+    } else {
+        inv_freq = 1.0f / freq;
+    }
+    const float ang = pos_b * inv_freq;
+    const float c = cosf(ang) * concentration;
+    const float s = sinf(ang) * concentration;
 
-  const int half = D >> 1;
-  if (i >= half)
-    return;
+    // ---- Q: read from qkv, apply RoPE, write to q_out
+    if (h < Hq) {
+        const int q_off = h * D;
+        float x1 = qkv_b[q_off + i];
+        float x2 = qkv_b[q_off + half + i];
+        // rotate
+        float y1 = x1 * c - x2 * s;
+        float y2 = x2 * c + x1 * s;
+        q_b[q_off + i]        = y1;
+        q_b[q_off + half + i] = y2;
+    }
 
-  const int pos_b = pos[b];
-  if (pos_b < 0)
-    return;
+    // ---- K: read from qkv, apply RoPE, scatter to key_cache
+    if (h < Hk) {
+        const int k_off_qkv = q_size + h * D;           // K starts after Q
+        const int pos_off   = pos_b * KV + h * D;       // per-token head offset in cache
+        const size_t kc_idx = (size_t)layer_offset + (size_t)pos_off;
 
-  float freq = powf(theta, (float)(2 * i) / (float)D);
-  float inv_freq;
-  float concentration = 1.0f;
+        float k1 = qkv_b[k_off_qkv + i];
+        float k2 = qkv_b[k_off_qkv + half + i];
+        float rk1 = k1 * c - k2 * s;
+        float rk2 = k2 * c + k1 * s;
 
-  if (rope_scaling_factor > 1.0f) {
-    concentration = 0.1f * logf(rope_scaling_factor) + 1.0f;
-    float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-    float low = half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) /
-                logf(theta);
-    float high = half *
-                 logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) /
-                 logf(theta);
-    float interpolation = 1.0f / (rope_scaling_factor * freq);
-    float extrapolation = 1.0f / freq;
-    float ramp = ((float)i - low) / (high - low);
-    ramp = fmaxf(0.0f, fminf(1.0f, ramp));
-    float mask = 1.0f - ramp;
-    inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
-  } else {
-    inv_freq = 1.0f / freq;
-  }
+        kcache_b[kc_idx + i]        = rk1;
+        kcache_b[kc_idx + half + i] = rk2;
 
-  float val = pos_b * inv_freq;
-  float c = cosf(val) * concentration;
-  float s = sinf(val) * concentration;
-
-  // Apply to Q for this batch
-  if (h < Hq) {
-    float *q_b = q + (size_t)b * Hq * D;
-    float x1 = q_b[h * D + i];
-    float x2 = q_b[h * D + half + i];
-    q_b[h * D + i] = x1 * c - x2 * s;
-    q_b[h * D + half + i] = x2 * c + x1 * s;
-  }
-
-  if (h < Hk) {
-    const int KV = Hk * D;
-    const int cache_idx =
-        (size_t)b * kv_total_size + loff + pos_b * KV + h * D;
-    float x1 = k_cache[cache_idx + i];
-    float x2 = k_cache[cache_idx + half + i];
-    k_cache[cache_idx + i] = x1 * c - x2 * s;
-    k_cache[cache_idx + half + i] = x2 * c + x1 * s;
-  }
+        // ---- V: read from qkv, direct scatter (no RoPE)
+        const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
+        const size_t vc_idx = (size_t)layer_offset + (size_t)pos_off;
+        float v1 = qkv_b[v_off_qkv + i];
+        float v2 = qkv_b[v_off_qkv + half + i];
+        vcache_b[vc_idx + i]        = v1;
+        vcache_b[vc_idx + half + i] = v2;
+    }
 }
 
 __global__ void residual_add_batch_kernel(float *x, const float *residual,
