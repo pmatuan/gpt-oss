@@ -17,6 +17,8 @@ typedef hip_bfloat16 bf16_t;
 #define K_STEP_MATMUL_FLOAT 4
 #define EXPERT_PER_TOKEN 4
 #define MAX_BATCH_SIZE 64
+#define TM_MM 32
+#define TN_MM 32
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));

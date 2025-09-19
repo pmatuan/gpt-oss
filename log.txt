@@ -1,5 +1,5 @@
-srun: job 53830 queued and waiting for resources
-srun: job 53830 has been allocated resources
+srun: job 53852 queued and waiting for resources
+srun: job 53852 has been allocated resources
 vocab_size: 201088
 hidden_dim: 2880
 n_experts: 32
@@ -26,7 +26,7 @@ Initializing device 0...
 [DEVICE] 0 [HIP] after large BF16 weights (model loaded): HBM free 24.56 GiB / total 63.98 GiB (used 39.42 GiB)
 Multi-GPU initialization complete!
 
-warm up elapsed time(s): 4.575000
+warm up elapsed time(s): 67.246000
 Processing 64 requests across 1 GPUs...
 Hello, World!".
 
@@ -5702,26 +5702,26 @@ Write a scene where two strangers accidentally swap phones. The scene should be 
 We need to write a scene where two strangers accidentally swap phones. The scene should be in a coffee shop, and the protagonist is the iPhone 5s. The iPhone 5s is the only iPhone that the iPhone iPhone... etc. The ... etc. The ... etc. The ... The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc. The ... etc.
 Multi-GPU inference completed. Total tokens generated: 62092
 
-elapsed time(s): 364.017000, achieved throughput TPS (tok/s): 170.574451
+elapsed time(s): 368.685000, achieved throughput TPS (tok/s): 168.414771
 
-finish elapsed time(s): 0.014000
+finish elapsed time(s): 0.007000
 
 ┌──────────────────────────────────────────────────────────────────────────────────────┐
 │                                  PROFILER SUMMARY                                    │
 ├──────────────────────────────────────────────────────────────────────────────────────┤
 │ Function/Kernel Name                          │   Total (ms) │    Calls │   Avg (ms) │
 ├──────────────────────────────────────────────────────────────────────────────────────┤
-│ CPU:inference                                 │   364017.083 │        1 │ 364017.083 │
-│ CPU:gpu_forward_device_batch                  │   352658.870 │     1024 │    344.393 │
-│ GPU:mlp1_fused_gemm_kernel                    │   156508.911 │    24576 │      6.368 │
-│ GPU:mlp2_bias_weighted_accum_gemm_kernel      │    84333.968 │    24576 │      3.432 │
-│ GPU:matmul_bias_gemm_kernel_bf16_mfma         │    82383.723 │    50176 │      1.642 │
-│ GPU:attention_batch_kernel                    │    22436.641 │    24576 │      0.913 │
-│ GPU:rmsnorm_batch_kernel                      │      814.709 │    50176 │      0.016 │
-│ GPU:residual_add_batch_kernel                 │      715.817 │    49152 │      0.015 │
-│ GPU:fused_split_rope_scatter_qkv_batch_kernel │      625.928 │    24576 │      0.025 │
-│ GPU:matmul_bias_gemm_kernel_float             │      614.239 │    24576 │      0.025 │
-│ GPU:fused_topk_softmax_batch_kernel           │      460.778 │    24576 │      0.019 │
-│ GPU:copy_embedding_bf16_batch_kernel          │       23.521 │     1024 │      0.023 │
+│ CPU:inference                                 │   368684.681 │        1 │ 368684.681 │
+│ CPU:gpu_forward_device_batch                  │   351686.819 │     1024 │    343.444 │
+│ GPU:mlp1_fused_gemm_kernel                    │   156589.349 │    24576 │      6.372 │
+│ GPU:mlp2_bias_weighted_accum_gemm_kernel      │    83937.904 │    24576 │      3.415 │
+│ GPU:matmul_bias_gemm_kernel_bf16_mfma         │    82418.454 │    50176 │      1.643 │
+│ GPU:attention_batch_kernel                    │    22341.533 │    24576 │      0.909 │
+│ GPU:rmsnorm_batch_kernel                      │      794.609 │    50176 │      0.016 │
+│ GPU:residual_add_batch_kernel                 │      705.826 │    49152 │      0.014 │
+│ GPU:fused_split_rope_scatter_qkv_batch_kernel │      616.364 │    24576 │      0.025 │
+│ GPU:matmul_bias_gemm_kernel_float             │      600.965 │    24576 │      0.024 │
+│ GPU:fused_topk_softmax_batch_kernel           │      459.605 │    24576 │      0.019 │
+│ GPU:copy_embedding_bf16_batch_kernel          │       23.300 │     1024 │      0.023 │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 
