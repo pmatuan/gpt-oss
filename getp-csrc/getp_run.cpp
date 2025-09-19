@@ -64,13 +64,11 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (D * (Hq + 2 * Hk)) * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k, Hk * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v, Hk * D * sizeof(float)));
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(float)));
+      hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                      L * S * KV * sizeof(float)));
+                      L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att, Hq * S * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
 
@@ -242,8 +240,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
     HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_qkv));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_q));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_k));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_v));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_key_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_value_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_att));
@@ -358,8 +354,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_e_agg);
     FREE_IF(ctx.gpu_activations.d_qkv);
     FREE_IF(ctx.gpu_activations.d_q);
-    FREE_IF(ctx.gpu_activations.d_k);
-    FREE_IF(ctx.gpu_activations.d_v);
     FREE_IF(ctx.gpu_activations.d_key_cache);
     FREE_IF(ctx.gpu_activations.d_value_cache);
     FREE_IF(ctx.gpu_activations.d_att);
@@ -393,16 +387,12 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
                         (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
                         (size_t)B * Hq * D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k,
-                        (size_t)B * Hk * D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v,
-                        (size_t)B * Hk * D * sizeof(float)));
 
     // Per-batch KV caches
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache,
-                        (size_t)B * L * S * KV * sizeof(float)));
+                        (size_t)B * L * S * KV * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                        (size_t)B * L * S * KV * sizeof(float)));
+                        (size_t)B * L * S * KV * sizeof(bf16_t)));
     // Auxiliary buffers
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att,
                         (size_t)B * Hq * S * sizeof(float)));

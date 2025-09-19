@@ -34,8 +34,8 @@ __global__ void residual_add_batch_kernel(float *x, const float *residual,
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     float* __restrict__ q_out,
-    float* __restrict__ key_cache,
-    float* __restrict__ value_cache,
+    bf16_t* __restrict__ key_cache,
+    bf16_t* __restrict__ value_cache,
     const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
     const int* __restrict__ pos,       // [B]
     // model params

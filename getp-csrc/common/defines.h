@@ -41,8 +41,8 @@ struct GPUActivationBuffers {
   int *d_topk_i;
   float *d_gate_up, *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
-  float *d_qkv, *d_q, *d_k, *d_v;
-  float *d_key_cache, *d_value_cache;
+  float *d_qkv, *d_q;
+  bf16_t *d_key_cache, *d_value_cache;
   float *d_att, *d_logits, *d_mask;
   float *d_cos_vals, *d_sin_vals;
   int *d_token2row;

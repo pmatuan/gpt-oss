@@ -87,8 +87,8 @@ __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     float* __restrict__ q_out,
-    float* __restrict__ key_cache,
-    float* __restrict__ value_cache,
+    bf16_t* __restrict__ key_cache,
+    bf16_t* __restrict__ value_cache,
     const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
     const int* __restrict__ pos,       // [B]
     // model params
@@ -117,8 +117,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
 
     // base pointers per batch
     float* __restrict__ q_b      = q_out       + (size_t)b * q_size;
-    float* __restrict__ kcache_b = key_cache   + (size_t)b * kv_total_size;
-    float* __restrict__ vcache_b = value_cache + (size_t)b * kv_total_size;
+    bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_total_size;
+    bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_total_size;
     const float* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
     // ---- compute RoPE angles for this (i, b)
@@ -167,16 +167,16 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
         float rk1 = k1 * c - k2 * s;
         float rk2 = k2 * c + k1 * s;
 
-        kcache_b[kc_idx + i]        = rk1;
-        kcache_b[kc_idx + half + i] = rk2;
+        kcache_b[kc_idx + i]        = hip_bfloat16(rk1);
+        kcache_b[kc_idx + half + i] = hip_bfloat16(rk2);
 
         // ---- V: read from qkv, direct scatter (no RoPE)
         const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
         const size_t vc_idx = (size_t)layer_offset + (size_t)pos_off;
         float v1 = qkv_b[v_off_qkv + i];
         float v2 = qkv_b[v_off_qkv + half + i];
-        vcache_b[vc_idx + i]        = v1;
-        vcache_b[vc_idx + half + i] = v2;
+        vcache_b[vc_idx + i]        = hip_bfloat16(v1);
+        vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
     }
 }
 
