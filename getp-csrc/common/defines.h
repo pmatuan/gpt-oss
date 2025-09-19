@@ -14,12 +14,11 @@ typedef hip_bfloat16 bf16_t;
 #define BLOCK_SIZE (WF_SIZE * TM)
 #define TK 512
 #define LDS_PAD 16
-#define MFMA_M 16
-#define MFMA_N 16
-#define MFMA_K 4
-#define B_TILE 4
+#define K_STEP_MATMUL_FLOAT 4
 #define EXPERT_PER_TOKEN 4
 #define MAX_BATCH_SIZE 64
+#define TM_MM 32
+#define TN_MM 32
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
@@ -42,8 +41,8 @@ struct GPUActivationBuffers {
   int *d_topk_i;
   float *d_gate_up, *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
-  float *d_qkv, *d_q, *d_k, *d_v;
-  float *d_key_cache, *d_value_cache;
+  float *d_qkv, *d_q;
+  bf16_t *d_key_cache, *d_value_cache;
   float *d_att, *d_logits, *d_mask;
   float *d_cos_vals, *d_sin_vals;
   int *d_token2row;

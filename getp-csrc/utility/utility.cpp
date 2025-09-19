@@ -87,8 +87,8 @@ __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     float* __restrict__ q_out,
-    float* __restrict__ key_cache,
-    float* __restrict__ value_cache,
+    bf16_t* __restrict__ key_cache,
+    bf16_t* __restrict__ value_cache,
     const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
     const int* __restrict__ pos,       // [B]
     // model params
@@ -117,8 +117,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
 
     // base pointers per batch
     float* __restrict__ q_b      = q_out       + (size_t)b * q_size;
-    float* __restrict__ kcache_b = key_cache   + (size_t)b * kv_total_size;
-    float* __restrict__ vcache_b = value_cache + (size_t)b * kv_total_size;
+    bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_total_size;
+    bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_total_size;
     const float* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
     // ---- compute RoPE angles for this (i, b)
@@ -167,16 +167,16 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
         float rk1 = k1 * c - k2 * s;
         float rk2 = k2 * c + k1 * s;
 
-        kcache_b[kc_idx + i]        = rk1;
-        kcache_b[kc_idx + half + i] = rk2;
+        kcache_b[kc_idx + i]        = hip_bfloat16(rk1);
+        kcache_b[kc_idx + half + i] = hip_bfloat16(rk2);
 
         // ---- V: read from qkv, direct scatter (no RoPE)
         const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
         const size_t vc_idx = (size_t)layer_offset + (size_t)pos_off;
         float v1 = qkv_b[v_off_qkv + i];
         float v2 = qkv_b[v_off_qkv + half + i];
-        vcache_b[vc_idx + i]        = v1;
-        vcache_b[vc_idx + half + i] = v2;
+        vcache_b[vc_idx + i]        = hip_bfloat16(v1);
+        vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
     }
 }
 
@@ -276,59 +276,6 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   for (int i = (size4 << 2) + tid; i < size; i += blockDim.x) {
     o_b[i] = weight[i] * (x_b[i] * inv_rms);
   }
-}
-
-/**
- * Compute inv RMS per sample: inv_rms = rsqrt(mean(x^2)+eps)
- * Optimized with vectorization
- */
- __global__ void compute_inv_rms_batch_kernel(
-  float* __restrict__ out_inv,
-  const float* __restrict__ x,
-  int H, int batch_size) {
-
-const int b = blockIdx.y;
-if (b >= batch_size) return;
-
-if (threadIdx.x == 0) out_inv[b] = 0.0f; return;
-
-const float* xb = x + (size_t)b * H;
-const int H4 = H >> 2;
-
-// Vectorized sum of squares
-float sum = 0.0f;
-for (int i = threadIdx.x; i < H4; i += blockDim.x) {
-  float4 v = reinterpret_cast<const float4*>(xb)[i];
-  sum = fmaf(v.x, v.x, sum);
-  sum = fmaf(v.y, v.y, sum);
-  sum = fmaf(v.z, v.z, sum);
-  sum = fmaf(v.w, v.w, sum);
-}
-// Handle remainder
-for (int i = (H4 << 2) + threadIdx.x; i < H; i += blockDim.x) {
-  float v = xb[i];
-  sum = fmaf(v, v, sum);
-}
-
-sum = warp_reduce_sum(sum);
-
-__shared__ float warp_sums[1024 / WF_SIZE];
-const int lane = threadIdx.x & (WF_SIZE - 1);
-const int wid  = threadIdx.x >> 6;
-
-if (lane == 0) warp_sums[wid] = sum;
-__syncthreads();
-
-float total = 0.0f;
-if (wid == 0) {
-  const int num_warps = blockDim.x / WF_SIZE;
-  total = (threadIdx.x < num_warps) ? warp_sums[threadIdx.x] : 0.0f;
-  total = warp_reduce_sum(total);
-  if (lane == 0) {
-    float mean_sq = total / (float)H;
-    out_inv[b] = rsqrtf(mean_sq + 1e-5f);
-  }
-}
 }
 
 // Batched Top-K + Softmax kernel

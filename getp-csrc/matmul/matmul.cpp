@@ -5,9 +5,7 @@
 
 
 // x:[B,n], w:[d,n], y:[B,d]
-// Grid: (ceil(d/TM), ceil(B/B_TILE))
-__launch_bounds__(64, 2) __global__
-void matmul_bias_gemm_kernel_bf16_mfma(
+__global__ void matmul_bias_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
     const float* __restrict__ x,    // [B x n] (fp32)
     const bf16_t* __restrict__ w,   // [d x n] (bf16)
@@ -94,8 +92,7 @@ void matmul_bias_gemm_kernel_bf16_mfma(
  * x: [B, n], w: [d, n], y: [B, d]
  * Grid: (ceil(d/TM), B)
  */
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void matmul_bias_gemm_kernel_float(
+__global__ void matmul_bias_gemm_kernel_float(
     float* __restrict__ y,          // [B, d]
     const float* __restrict__ x,    // [B, n]
     const float* __restrict__ w,    // [d, n] (row-major theo n)
@@ -144,10 +141,10 @@ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ w_row = w + (size_t)row * n + k_base;
     
     // Vectorized computation - process 4 elements at a time
-    const int vec_k = (k_size / MFMA_K) * MFMA_K;
+    const int vec_k = (k_size / K_STEP_MATMUL_FLOAT) * K_STEP_MATMUL_FLOAT;
 
-    for (int k = lane * MFMA_K; k < vec_k; k += WF_SIZE * MFMA_K) {
-      if (k + MFMA_K <= vec_k) {
+    for (int k = lane * K_STEP_MATMUL_FLOAT; k < vec_k; k += WF_SIZE * K_STEP_MATMUL_FLOAT) {
+      if (k + K_STEP_MATMUL_FLOAT <= vec_k) {
         // Load 4 consecutive elements as vectors
         const float4 w_vec = *reinterpret_cast<const float4*>(&w_row[k]);
         const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);
@@ -176,8 +173,7 @@ void matmul_bias_gemm_kernel_float(
 }
 
 // ================= MLP1 (Gate & Up) : per-batch, no CB =================
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void mlp1_fused_gemm_kernel(
+__global__ void mlp1_fused_gemm_kernel(
     float* __restrict__ gate_up_topk, // [K, B, IM] (K = EXPERT_PER_TOKEN)
     const float* __restrict__ x,      // [B, H]
     const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
@@ -291,8 +287,7 @@ void mlp1_fused_gemm_kernel(
 
 
 // ============ MLP2 (weighted accum) : per-batch, no CB ==============
-__launch_bounds__(BLOCK_SIZE, 8) __global__
-void mlp2_bias_weighted_accum_gemm_kernel(
+__global__ void mlp2_bias_weighted_accum_gemm_kernel(
     float* __restrict__ e_agg,              // [B, H] (accumulator)
     const float* __restrict__ gate_up_topk, // [K, B, IM]
     const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]

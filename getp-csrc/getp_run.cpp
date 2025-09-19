@@ -64,13 +64,11 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (D * (Hq + 2 * Hk)) * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k, Hk * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v, Hk * D * sizeof(float)));
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(float)));
+      hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                      L * S * KV * sizeof(float)));
+                      L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att, Hq * S * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
 
@@ -242,8 +240,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
     HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_qkv));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_q));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_k));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_v));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_key_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_value_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_att));
@@ -358,8 +354,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_e_agg);
     FREE_IF(ctx.gpu_activations.d_qkv);
     FREE_IF(ctx.gpu_activations.d_q);
-    FREE_IF(ctx.gpu_activations.d_k);
-    FREE_IF(ctx.gpu_activations.d_v);
     FREE_IF(ctx.gpu_activations.d_key_cache);
     FREE_IF(ctx.gpu_activations.d_value_cache);
     FREE_IF(ctx.gpu_activations.d_att);
@@ -393,16 +387,12 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
                         (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
                         (size_t)B * Hq * D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_k,
-                        (size_t)B * Hk * D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_v,
-                        (size_t)B * Hk * D * sizeof(float)));
 
     // Per-batch KV caches
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_key_cache,
-                        (size_t)B * L * S * KV * sizeof(float)));
+                        (size_t)B * L * S * KV * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-                        (size_t)B * L * S * KV * sizeof(float)));
+                        (size_t)B * L * S * KV * sizeof(bf16_t)));
     // Auxiliary buffers
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att,
                         (size_t)B * Hq * S * sizeof(float)));
@@ -467,7 +457,7 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
   ctx.idx = idx;
   ctx.input_seq = get_str_req_ptr(requests, idx);
   ctx.output_tokens = get_tok_gen_ptr(requests, idx);
-  ctx.max_steps = requests->max_seq_len;
+  ctx.max_steps = 1024;
   ctx.sampler = sampler;
 
   const Config &cfg = transformer->config;
@@ -569,7 +559,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       // Then apply MatMul + Bias
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
-        dim3 gridQKV_gemm((QKV_D + 31) / 32, (batch_size + 31) / 32, 1);
+        dim3 gridQKV_gemm((QKV_D + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
         dim3 blockQKV(16, 4, 1);
         matmul_bias_gemm_kernel_bf16_mfma<<<gridQKV_gemm, blockQKV>>>(
             ctx.gpu_activations.d_qkv,
@@ -622,7 +612,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
-        dim3 gridO_gemm((H + 31) / 32, (batch_size + 31) / 32, 1);
+        dim3 gridO_gemm((H + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
         dim3 blockO(16, 4, 1);
         matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
@@ -750,7 +740,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     // 2) MatMul for logits - separate GEMM version
     {
       PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
-      dim3 gridV_gemm((V + 31) / 32, (batch_size + 31) / 32, 1);
+      dim3 gridV_gemm((V + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
       dim3 blockV(16, 4, 1);
       matmul_bias_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
