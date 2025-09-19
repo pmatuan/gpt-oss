@@ -14,10 +14,7 @@ typedef hip_bfloat16 bf16_t;
 #define BLOCK_SIZE (WF_SIZE * TM)
 #define TK 512
 #define LDS_PAD 16
-#define MFMA_M 16
-#define MFMA_N 16
-#define MFMA_K 4
-#define B_TILE 4
+#define K_STEP_MATMUL_FLOAT 4
 #define EXPERT_PER_TOKEN 4
 #define MAX_BATCH_SIZE 64
 
