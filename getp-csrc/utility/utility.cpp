@@ -278,59 +278,6 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   }
 }
 
-/**
- * Compute inv RMS per sample: inv_rms = rsqrt(mean(x^2)+eps)
- * Optimized with vectorization
- */
- __global__ void compute_inv_rms_batch_kernel(
-  float* __restrict__ out_inv,
-  const float* __restrict__ x,
-  int H, int batch_size) {
-
-const int b = blockIdx.y;
-if (b >= batch_size) return;
-
-if (threadIdx.x == 0) out_inv[b] = 0.0f; return;
-
-const float* xb = x + (size_t)b * H;
-const int H4 = H >> 2;
-
-// Vectorized sum of squares
-float sum = 0.0f;
-for (int i = threadIdx.x; i < H4; i += blockDim.x) {
-  float4 v = reinterpret_cast<const float4*>(xb)[i];
-  sum = fmaf(v.x, v.x, sum);
-  sum = fmaf(v.y, v.y, sum);
-  sum = fmaf(v.z, v.z, sum);
-  sum = fmaf(v.w, v.w, sum);
-}
-// Handle remainder
-for (int i = (H4 << 2) + threadIdx.x; i < H; i += blockDim.x) {
-  float v = xb[i];
-  sum = fmaf(v, v, sum);
-}
-
-sum = warp_reduce_sum(sum);
-
-__shared__ float warp_sums[1024 / WF_SIZE];
-const int lane = threadIdx.x & (WF_SIZE - 1);
-const int wid  = threadIdx.x >> 6;
-
-if (lane == 0) warp_sums[wid] = sum;
-__syncthreads();
-
-float total = 0.0f;
-if (wid == 0) {
-  const int num_warps = blockDim.x / WF_SIZE;
-  total = (threadIdx.x < num_warps) ? warp_sums[threadIdx.x] : 0.0f;
-  total = warp_reduce_sum(total);
-  if (lane == 0) {
-    float mean_sq = total / (float)H;
-    out_inv[b] = rsqrtf(mean_sq + 1e-5f);
-  }
-}
-}
-
 // Batched Top-K + Softmax kernel
 __global__ void fused_topk_softmax_batch_kernel(
     float *topk_values, int *topk_indices, float *router_score,

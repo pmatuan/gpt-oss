@@ -27,9 +27,6 @@ __global__ void rmsnorm_batch_kernel(float *out, const float *x,
                                      const float *weight, int dim,
                                      const int *pos);
 
-__global__ void compute_inv_rms_batch_kernel(float *inv_rms, const float *x,
-                                             int dim, int batch_size);
-
 // Utility Operations
 __global__ void residual_add_batch_kernel(float *x, const float *residual,
                                           int dim, int batch_size,
