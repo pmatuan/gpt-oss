@@ -467,7 +467,7 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
   ctx.idx = idx;
   ctx.input_seq = get_str_req_ptr(requests, idx);
   ctx.output_tokens = get_tok_gen_ptr(requests, idx);
-  ctx.max_steps = requests->max_seq_len;
+  ctx.max_steps = 1024;
   ctx.sampler = sampler;
 
   const Config &cfg = transformer->config;
