@@ -679,40 +679,81 @@ static float *gpu_forward_device_batch(Transformer *transformer,
                                  (size_t)IM * sizeof(float),
                              0));
 
-    // --- MLP1: per-batch per-expert, no CB
+    // Allocate intermediate buffers for split kernels
+    float *d_mlp1_raw;  // [K,B,2*IM] - raw matmul output before activation
+    HIP_CHECK(hipMalloc(&d_mlp1_raw, (size_t)p->experts_per_token * (size_t)batch_size * (size_t)(2*IM) * sizeof(float)));
+
+    // === SPLIT MLP1 INTO 2 KERNELS ===
+
+    // 1. MLP1 MatMul + Bias: t @ w_mlp1 + b_mlp1
     {
-      PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
+      PROFILE_GPU_SCOPE("mlp1_matmul_bias_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridIM((IM + TM - 1) / TM, batch_size, 1);
-      gridIM.z = p->experts_per_token;
-      mlp1_fused_gemm_kernel<<<gridIM, block, 0>>>(
-          /*gate_up_topk[K,B,IM]*/ d_gate_up_topk,
+      dim3 gridMLP1((2*IM + TM - 1) / TM, batch_size, 1);
+      gridMLP1.z = p->experts_per_token;
+      mlp1_matmul_bias_kernel<<<gridMLP1, block, 0>>>(
+          /*out[K,B,2*IM]*/ d_mlp1_raw,
           /*x[B,H]*/ ctx.gpu_activations.d_t,
           /*w*/ ctx.gpu_weights_bf16.d_w_mlp1_bf16,
           /*b*/ ctx.gpu_expert_bias.g_b_mlp1,
           /*topk_i*/ ctx.gpu_activations.d_topk_i,
           /*layer*/ l,
           /*E,H,IM*/ E, H, IM,
-          /*clip*/ p->swiglu_limit,
           /*B,K*/ batch_size, ctx.gpu_activations.d_pos);
     }
 
-    // --- MLP2: per-batch per-expert, no CB
+    // 2. Split gate/up and apply SwiGLU activation
     {
-      PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
+      PROFILE_GPU_SCOPE("mlp1_split_swiglu_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridH((H + TM - 1) / TM, batch_size, 1);
-      gridH.z = p->experts_per_token;
-      mlp2_bias_weighted_accum_gemm_kernel<<<gridH, block, 0>>>(
-          /*e_agg[B,H]*/ ctx.gpu_activations.d_e_agg,
+      dim3 gridSplit((IM + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, 1);
+      gridSplit.z = p->experts_per_token;
+      mlp1_split_swiglu_kernel<<<gridSplit, block, 0>>>(
+          /*gate_up_out[K,B,IM]*/ d_gate_up_topk,
+          /*gate_up_raw[K,B,2*IM]*/ d_mlp1_raw,
+          /*clip*/ p->swiglu_limit,
+          /*IM,B,K*/ IM, batch_size, p->experts_per_token,
+          ctx.gpu_activations.d_pos);
+    }
+
+    // === SPLIT MLP2 INTO 2 KERNELS ===
+
+    // 3. MLP2 MatMul + Bias: gate_up @ w_mlp2 + b_mlp2
+    float *d_mlp2_raw;  // [K,B,H] - raw matmul output before weighting
+    HIP_CHECK(hipMalloc(&d_mlp2_raw, (size_t)p->experts_per_token * (size_t)batch_size * (size_t)H * sizeof(float)));
+
+    {
+      PROFILE_GPU_SCOPE("mlp2_matmul_bias_kernel", 0);
+      dim3 block(BLOCK_SIZE, 1, 1);
+      dim3 gridMLP2((H + TM - 1) / TM, batch_size, 1);
+      gridMLP2.z = p->experts_per_token;
+      mlp2_matmul_bias_kernel<<<gridMLP2, block, 0>>>(
+          /*out[K,B,H]*/ d_mlp2_raw,
           /*gate_up[K,B,IM]*/ d_gate_up_topk,
           /*w*/ ctx.gpu_weights_bf16.d_w_mlp2_bf16,
           /*b*/ ctx.gpu_expert_bias.g_b_mlp2,
-          /*topk_i, topk_v*/ ctx.gpu_activations.d_topk_i,
-          ctx.gpu_activations.d_topk_v,
+          /*topk_i*/ ctx.gpu_activations.d_topk_i,
           /*layer*/ l,
-          /*E,IM,H,B,K*/ E, IM, H, batch_size, ctx.gpu_activations.d_pos);
+          /*E,IM,H,B,K*/ E, IM, H, batch_size,
+          ctx.gpu_activations.d_pos);
     }
+
+    // 4. Expert weight accumulation: sum(topk_v[k] * mlp2_out[k])
+    {
+      PROFILE_GPU_SCOPE("mlp2_weighted_accum_kernel", 0);
+      dim3 block(BLOCK_SIZE, 1, 1);
+      dim3 gridAccum((H + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, 1);
+      mlp2_weighted_accum_kernel<<<gridAccum, block, 0>>>(
+          /*e_agg[B,H]*/ ctx.gpu_activations.d_e_agg,
+          /*mlp2_out[K,B,H]*/ d_mlp2_raw,
+          /*topk_v*/ ctx.gpu_activations.d_topk_v,
+          /*H,B,K*/ H, batch_size, p->experts_per_token,
+          ctx.gpu_activations.d_pos);
+    }
+
+    // Cleanup intermediate buffers
+    HIP_CHECK(hipFree(d_mlp1_raw));
+    HIP_CHECK(hipFree(d_mlp2_raw));
 
     // Keep workspace allocated in DeviceContext for reuse
 
