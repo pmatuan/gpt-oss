@@ -452,25 +452,118 @@ __global__ void moe_scatter_assignments_kernel(int *assignments,
 }
 
 __global__ void moe_gather_tokens_kernel(float *dst, const float *src,
-                                         const int *assignments, int start,
-                                         int count, int H)
+                                         const int *assignments,
+                                         const int *expert_offsets,
+                                         const int *active_experts,
+                                         const int *active_counts,
+                                         int num_active, int H)
 {
+  const int expert_slot = blockIdx.z;
+  if (expert_slot >= num_active)
+    return;
+
   const int row = blockIdx.y;
-  if (row >= count)
+  const int row_count = active_counts[expert_slot];
+  if (row >= row_count)
     return;
 
   const int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
   if (col >= H)
     return;
 
-  const int assignment = assignments[start + row];
+  const int expert = active_experts[expert_slot];
+  const int assignment_idx = expert_offsets[expert] + row;
+  const int assignment = assignments[assignment_idx];
   if (assignment < 0)
     return;
 
-  const int batch_idx = assignment / EXPERT_PER_TOKEN;
+  const int batch_idx = assignment >> EXPERT_PER_TOKEN_SHIFT;
   const float *src_row = src + (size_t)batch_idx * H;
-  float *dst_row = dst + (size_t)row * H;
+  float *dst_row = dst + (size_t)assignment_idx * H;
   dst_row[col] = src_row[col];
+}
+
+__global__ void moe_mlp1_matmul_bias_kernel(
+    float *out, const float *x_grouped, const bf16_t *w_mlp1_all,
+    const float *b_mlp1_all, const int *assignments,
+    const int *expert_offsets, const int *active_experts,
+    const int *active_counts, int layer, int E, int H, int IM,
+    int num_active)
+{
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int output_dim = blockIdx.x * TM + wid;
+
+  if (wid >= TM || output_dim >= 2 * IM)
+    return;
+
+  const int expert_slot = blockIdx.z;
+  if (expert_slot >= num_active)
+    return;
+
+  const int row = blockIdx.y;
+  const int row_count = active_counts[expert_slot];
+  if (row >= row_count)
+    return;
+
+  const int expert = active_experts[expert_slot];
+  const int assignment_idx = expert_offsets[expert] + row;
+  const float *xb = x_grouped + (size_t)assignment_idx * H;
+
+  float acc = 0.0f;
+
+  for (int k_base = 0; k_base < H; k_base += TK) {
+    const int k_size = min(TK, H - k_base);
+
+    const float *xb_tile = xb + k_base;
+    const int vec4 = k_size >> 2;
+    float4 *s4 = reinterpret_cast<float4 *>(lds_x);
+    const float4 *x4 = reinterpret_cast<const float4 *>(xb_tile);
+    for (int v = tid; v < vec4; v += BLOCK_SIZE)
+      s4[v] = x4[v];
+    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE)
+      lds_x[k] = xb_tile[k];
+    __syncthreads();
+
+    const size_t weight_row_offset =
+        (((size_t)layer * (size_t)E + (size_t)expert) * (size_t)(2 * IM) +
+         (size_t)output_dim) * (size_t)H + (size_t)k_base;
+    const bf16_t *w_row = w_mlp1_all + weight_row_offset;
+
+    const uint2 *wq = reinterpret_cast<const uint2 *>(w_row);
+    const int vec4k = k_size >> 2;
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 wv = bf16quad_to_float4(wq[v]);
+      const float4 xv = *reinterpret_cast<const float4 *>(&lds_x[v << 2]);
+      acc = fmaf(wv.x, xv.x, acc);
+      acc = fmaf(wv.y, xv.y, acc);
+      acc = fmaf(wv.z, xv.z, acc);
+      acc = fmaf(wv.w, xv.w, acc);
+    }
+    for (int k = (vec4k << 2) + lane; k < k_size; k += WF_SIZE) {
+      uint32_t u =
+          ((uint32_t)(*reinterpret_cast<const uint16_t *>(&w_row[k]))) << 16;
+      union {
+        uint32_t u;
+        float f;
+      } cvt;
+      cvt.u = u;
+      acc = fmaf(cvt.f, lds_x[k], acc);
+    }
+    __syncthreads();
+  }
+
+  float acc_sum = warp_reduce_sum(acc);
+  if (lane == 0) {
+    const size_t bias_base =
+        ((size_t)layer * (size_t)E + (size_t)expert) * (size_t)(2 * IM) +
+        (size_t)output_dim;
+    float result = acc_sum + b_mlp1_all[bias_base];
+    out[(size_t)assignment_idx * (size_t)(2 * IM) + (size_t)output_dim] = result;
+  }
 }
 
 __global__ void moe_swiglu_activation_kernel(float *dst, const float *src,
@@ -502,29 +595,122 @@ __global__ void moe_swiglu_activation_kernel(float *dst, const float *src,
   dst[(size_t)row * (size_t)IM + (size_t)dim] = gate * (up_val + 1.0f);
 }
 
+__global__ void moe_mlp2_matmul_bias_kernel(
+    float *out, const float *gate_up_grouped, const bf16_t *w_mlp2_all,
+    const float *b_mlp2_all, const int *assignments,
+    const int *expert_offsets, const int *active_experts,
+    const int *active_counts, int layer, int E, int IM, int H,
+    int num_active)
+{
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;
+  const int output_dim = blockIdx.x * TM + wid;
+
+  if (wid >= TM || output_dim >= H)
+    return;
+
+  const int expert_slot = blockIdx.z;
+  if (expert_slot >= num_active)
+    return;
+
+  const int row = blockIdx.y;
+  const int row_count = active_counts[expert_slot];
+  if (row >= row_count)
+    return;
+
+  const int expert = active_experts[expert_slot];
+  const int assignment_idx = expert_offsets[expert] + row;
+  const float *xb = gate_up_grouped + (size_t)assignment_idx * IM;
+
+  float acc = 0.0f;
+
+  for (int k_base = 0; k_base < IM; k_base += TK) {
+    const int k_size = min(TK, IM - k_base);
+
+    const float *xb_tile = xb + k_base;
+    const int vec4 = k_size >> 2;
+    float4 *s4 = reinterpret_cast<float4 *>(lds_x);
+    const float4 *x4 = reinterpret_cast<const float4 *>(xb_tile);
+    for (int v = tid; v < vec4; v += BLOCK_SIZE)
+      s4[v] = x4[v];
+    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE)
+      lds_x[k] = xb_tile[k];
+    __syncthreads();
+
+    const size_t weight_row_offset =
+        (((size_t)layer * (size_t)E + (size_t)expert) * (size_t)H +
+         (size_t)output_dim) * (size_t)IM + (size_t)k_base;
+    const bf16_t *w_row = w_mlp2_all + weight_row_offset;
+
+    const uint2 *wq = reinterpret_cast<const uint2 *>(w_row);
+    const int vec4k = k_size >> 2;
+    for (int v = lane; v < vec4k; v += WF_SIZE) {
+      const float4 wv = bf16quad_to_float4(wq[v]);
+      const float4 xv = *reinterpret_cast<const float4 *>(&lds_x[v << 2]);
+      acc = fmaf(wv.x, xv.x, acc);
+      acc = fmaf(wv.y, xv.y, acc);
+      acc = fmaf(wv.z, xv.z, acc);
+      acc = fmaf(wv.w, xv.w, acc);
+    }
+    for (int k = (vec4k << 2) + lane; k < k_size; k += WF_SIZE) {
+      uint32_t u =
+          ((uint32_t)(*reinterpret_cast<const uint16_t *>(&w_row[k]))) << 16;
+      union {
+        uint32_t u;
+        float f;
+      } cvt;
+      cvt.u = u;
+      acc = fmaf(cvt.f, lds_x[k], acc);
+    }
+    __syncthreads();
+  }
+
+  float acc_sum = warp_reduce_sum(acc);
+  if (lane == 0) {
+    const size_t bias_base =
+        ((size_t)layer * (size_t)E + (size_t)expert) * (size_t)H +
+        (size_t)output_dim;
+    float result = acc_sum + b_mlp2_all[bias_base];
+    out[(size_t)assignment_idx * (size_t)H + (size_t)output_dim] = result;
+  }
+}
+
 __global__ void moe_weighted_accum_kernel(float *e_agg, const float *mlp2_out,
                                           const float *topk_v,
-                                          const int *assignments, int start,
-                                          int count, int H)
+                                          const int *assignments,
+                                          const int *active_experts,
+                                          const int *active_counts,
+                                          const int *expert_offsets,
+                                          int num_active, int H)
 {
+  const int expert_slot = blockIdx.z;
+  if (expert_slot >= num_active)
+    return;
+
   const int row = blockIdx.y;
-  if (row >= count)
+  const int row_count = active_counts[expert_slot];
+  if (row >= row_count)
     return;
 
   const int dim = blockIdx.x * BLOCK_SIZE + threadIdx.x;
   if (dim >= H)
     return;
 
-  const int assignment = assignments[start + row];
+  const int expert = active_experts[expert_slot];
+  const int assignment_idx = expert_offsets[expert] + row;
+  const int assignment = assignments[assignment_idx];
   if (assignment < 0)
     return;
 
-  const int batch_idx = assignment / EXPERT_PER_TOKEN;
   const float weight = topk_v[assignment];
   if (weight == 0.0f)
     return;
 
-  const float *row_src = mlp2_out + (size_t)row * H;
+  const int batch_idx = assignment >> EXPERT_PER_TOKEN_SHIFT;
+  const float *row_src = mlp2_out + (size_t)assignment_idx * H;
   float *row_dst = e_agg + (size_t)batch_idx * H;
   const float contrib = row_src[dim] * weight;
   atomicAdd(row_dst + dim, contrib);

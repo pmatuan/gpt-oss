@@ -63,10 +63,13 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.gpu_activations.d_expert_counts = nullptr;
   ctx.gpu_activations.d_expert_offsets = nullptr;
   ctx.gpu_activations.d_expert_assignments = nullptr;
+  ctx.gpu_activations.d_active_experts = nullptr;
+  ctx.gpu_activations.d_active_counts = nullptr;
   ctx.gpu_activations.d_moe_x_workspace = nullptr;
   ctx.gpu_activations.d_mlp1_workspace = nullptr;
   ctx.gpu_activations.d_mlp2_workspace = nullptr;
   ctx.gpu_activations.expert_assign_capacity = 0;
+  ctx.gpu_activations.active_expert_capacity = 0;
   ctx.gpu_activations.gate_up_workspace_bytes = 0;
   ctx.gpu_activations.moe_x_workspace_bytes = 0;
   ctx.gpu_activations.mlp1_workspace_bytes = 0;
@@ -255,6 +258,10 @@ static void cleanup_device_context(DeviceContext &ctx) {
     HIP_CHECK(hipFree(ctx.gpu_activations.d_expert_offsets));
   if (ctx.gpu_activations.d_expert_assignments)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_expert_assignments));
+  if (ctx.gpu_activations.d_active_experts)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_active_experts));
+  if (ctx.gpu_activations.d_active_counts)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_active_counts));
   if (ctx.gpu_activations.d_moe_x_workspace)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_moe_x_workspace));
   if (ctx.gpu_activations.d_mlp1_workspace)
@@ -429,6 +436,12 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
                         max_assignments * sizeof(int)));
     ctx.gpu_activations.expert_assign_capacity = max_assignments;
 
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_active_experts,
+                        (size_t)p->n_experts * sizeof(int)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_active_counts,
+                        (size_t)p->n_experts * sizeof(int)));
+    ctx.gpu_activations.active_expert_capacity = p->n_experts;
+
     size_t gate_up_bytes = max_assignments * (size_t)IM * sizeof(float);
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up_workspace, gate_up_bytes));
     ctx.gpu_activations.gate_up_workspace_bytes = gate_up_bytes;
@@ -470,6 +483,17 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     if (!ctx.gpu_activations.d_expert_offsets) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_expert_offsets,
                           ((size_t)p->n_experts + 1) * sizeof(int)));
+    }
+
+    if (!ctx.gpu_activations.d_active_experts) {
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_active_experts,
+                          (size_t)p->n_experts * sizeof(int)));
+      ctx.gpu_activations.active_expert_capacity = p->n_experts;
+    }
+    if (!ctx.gpu_activations.d_active_counts) {
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_active_counts,
+                          (size_t)p->n_experts * sizeof(int)));
+      ctx.gpu_activations.active_expert_capacity = p->n_experts;
     }
 
     size_t max_assignments = (size_t)ctx.capacity_B * p->experts_per_token;
@@ -521,6 +545,20 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_mlp2_workspace,
                           required_mlp2_bytes));
       ctx.gpu_activations.mlp2_workspace_bytes = required_mlp2_bytes;
+    }
+
+    if (ctx.gpu_activations.active_expert_capacity < p->n_experts) {
+      if (ctx.gpu_activations.d_active_experts) {
+        HIP_CHECK(hipFree(ctx.gpu_activations.d_active_experts));
+      }
+      if (ctx.gpu_activations.d_active_counts) {
+        HIP_CHECK(hipFree(ctx.gpu_activations.d_active_counts));
+      }
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_active_experts,
+                          (size_t)p->n_experts * sizeof(int)));
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_active_counts,
+                          (size_t)p->n_experts * sizeof(int)));
+      ctx.gpu_activations.active_expert_capacity = p->n_experts;
     }
   }
   // Allocate per-sample inv_rms buffer
@@ -806,16 +844,29 @@ static float *gpu_forward_device_batch(Transformer *transformer,
             total_assignments, n_experts);
       }
 
-      std::vector<int> h_expert_offsets(n_experts + 1, 0);
-      HIP_CHECK(hipMemcpy(h_expert_offsets.data(),
+      std::vector<int> h_expert_counts(n_experts, 0);
+      HIP_CHECK(hipMemcpy(h_expert_counts.data(),
                           ctx.gpu_activations.d_expert_counts,
                           (size_t)n_experts * sizeof(int),
                           hipMemcpyDeviceToHost));
 
+      std::vector<int> h_expert_offsets(n_experts + 1, 0);
+      std::vector<int> h_active_experts;
+      std::vector<int> h_active_counts;
+      h_active_experts.reserve(n_experts);
+      h_active_counts.reserve(n_experts);
+
       int total_valid_assignments = 0;
+      int max_active_count = 0;
       for (int e_idx = 0; e_idx < n_experts; ++e_idx) {
-        const int count = h_expert_offsets[e_idx];
         h_expert_offsets[e_idx] = total_valid_assignments;
+        const int count = h_expert_counts[e_idx];
+        if (count > 0) {
+          h_active_experts.push_back(e_idx);
+          h_active_counts.push_back(count);
+          if (count > max_active_count)
+            max_active_count = count;
+        }
         total_valid_assignments += count;
       }
       h_expert_offsets[n_experts] = total_valid_assignments;
@@ -838,82 +889,88 @@ static float *gpu_forward_device_batch(Transformer *transformer,
             total_assignments, n_experts);
       }
 
-      if (total_valid_assignments > 0) {
+      const int num_active_experts = (int)h_active_experts.size();
+
+      if (total_valid_assignments > 0 && num_active_experts > 0) {
+        HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_active_experts,
+                            h_active_experts.data(),
+                            (size_t)num_active_experts * sizeof(int),
+                            hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_active_counts,
+                            h_active_counts.data(),
+                            (size_t)num_active_experts * sizeof(int),
+                            hipMemcpyHostToDevice));
+
         float *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
         float *d_mlp1_raw = ctx.gpu_activations.d_mlp1_workspace;
         float *d_mlp2_raw = ctx.gpu_activations.d_mlp2_workspace;
         float *d_group_in = ctx.gpu_activations.d_moe_x_workspace;
 
-        const dim3 block_mm(16, 4, 1);
+        {
+          PROFILE_GPU_SCOPE("moe_gather_tokens", 0);
+          dim3 grid_gather((H + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                           max_active_count, num_active_experts);
+          moe_gather_tokens_kernel<<<grid_gather, BLOCK_SIZE, 0>>>(
+              d_group_in, ctx.gpu_activations.d_t,
+              ctx.gpu_activations.d_expert_assignments,
+              ctx.gpu_activations.d_expert_offsets,
+              ctx.gpu_activations.d_active_experts,
+              ctx.gpu_activations.d_active_counts,
+              num_active_experts, H);
+        }
 
-        for (int expert_idx = 0; expert_idx < n_experts; ++expert_idx) {
-          const int start = h_expert_offsets[expert_idx];
-          const int end = h_expert_offsets[expert_idx + 1];
-          const int count = end - start;
-          if (count == 0)
-            continue;
+        {
+          PROFILE_GPU_SCOPE("moe_mlp1_gemm", 0);
+          dim3 grid_mlp1((2 * IM + TM - 1) / TM,
+                         max_active_count, num_active_experts);
+          moe_mlp1_matmul_bias_kernel<<<grid_mlp1, block, 0>>>(
+              d_mlp1_raw, d_group_in,
+              ctx.gpu_weights_bf16.d_w_mlp1_bf16,
+              ctx.gpu_expert_bias.g_b_mlp1,
+              ctx.gpu_activations.d_expert_assignments,
+              ctx.gpu_activations.d_expert_offsets,
+              ctx.gpu_activations.d_active_experts,
+              ctx.gpu_activations.d_active_counts,
+              l, E, H, IM, num_active_experts);
+        }
 
-          {
-            PROFILE_GPU_SCOPE("moe_gather_tokens", 0);
-            dim3 grid_gather((H + BLOCK_SIZE - 1) / BLOCK_SIZE, count, 1);
-            moe_gather_tokens_kernel<<<grid_gather, BLOCK_SIZE, 0>>>(
-                d_group_in, ctx.gpu_activations.d_t,
-                ctx.gpu_activations.d_expert_assignments,
-                start, count, H);
-          }
+        {
+          PROFILE_GPU_SCOPE("moe_swiglu", 0);
+          dim3 grid_swiglu((IM + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                           total_valid_assignments, 1);
+          moe_swiglu_activation_kernel<<<grid_swiglu, BLOCK_SIZE, 0>>>(
+              d_gate_up_topk, d_mlp1_raw, p->swiglu_limit,
+              total_valid_assignments, IM);
+        }
 
-          const size_t expert_offset =
-              ((size_t)l * (size_t)E + (size_t)expert_idx);
+        {
+          PROFILE_GPU_SCOPE("moe_mlp2_gemm", 0);
+          dim3 grid_mlp2((H + TM - 1) / TM,
+                         max_active_count, num_active_experts);
+          moe_mlp2_matmul_bias_kernel<<<grid_mlp2, block, 0>>>(
+              d_mlp2_raw, d_gate_up_topk,
+              ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+              ctx.gpu_expert_bias.g_b_mlp2,
+              ctx.gpu_activations.d_expert_assignments,
+              ctx.gpu_activations.d_expert_offsets,
+              ctx.gpu_activations.d_active_experts,
+              ctx.gpu_activations.d_active_counts,
+              l, E, IM, H, num_active_experts);
+        }
 
-          const bf16_t *w_mlp1 =
-              ctx.gpu_weights_bf16.d_w_mlp1_bf16 +
-              expert_offset * (size_t)(2 * IM) * (size_t)H;
-          const float *b_mlp1 =
-              ctx.gpu_expert_bias.g_b_mlp1 +
-              expert_offset * (size_t)(2 * IM);
-
-          {
-            PROFILE_GPU_SCOPE("moe_mlp1_gemm", 0);
-            dim3 grid_mlp1((2 * IM + TM_MM - 1) / TM_MM,
-                           (count + TN_MM - 1) / TN_MM, 1);
-            matmul_bias_gemm_kernel_bf16_mfma<<<grid_mlp1, block_mm>>>(
-                d_mlp1_raw, d_group_in, w_mlp1, b_mlp1,
-                H, 2 * IM, count, nullptr);
-          }
-
-          {
-            PROFILE_GPU_SCOPE("moe_swiglu", 0);
-            dim3 grid_swiglu((IM + BLOCK_SIZE - 1) / BLOCK_SIZE, count, 1);
-            moe_swiglu_activation_kernel<<<grid_swiglu, BLOCK_SIZE, 0>>>(
-                d_gate_up_topk, d_mlp1_raw, p->swiglu_limit, count, IM);
-          }
-
-          const bf16_t *w_mlp2 =
-              ctx.gpu_weights_bf16.d_w_mlp2_bf16 +
-              expert_offset * (size_t)H * (size_t)IM;
-          const float *b_mlp2 =
-              ctx.gpu_expert_bias.g_b_mlp2 +
-              expert_offset * (size_t)H;
-
-          {
-            PROFILE_GPU_SCOPE("moe_mlp2_gemm", 0);
-            dim3 grid_mlp2((H + TM_MM - 1) / TM_MM,
-                           (count + TN_MM - 1) / TN_MM, 1);
-            matmul_bias_gemm_kernel_bf16_mfma<<<grid_mlp2, block_mm>>>(
-                d_mlp2_raw, d_gate_up_topk, w_mlp2, b_mlp2,
-                IM, H, count, nullptr);
-          }
-
-          {
-            PROFILE_GPU_SCOPE("moe_weighted_accum", 0);
-            dim3 grid_accum((H + BLOCK_SIZE - 1) / BLOCK_SIZE, count, 1);
-            moe_weighted_accum_kernel<<<grid_accum, BLOCK_SIZE, 0>>>(
-                ctx.gpu_activations.d_e_agg,
-                d_mlp2_raw,
-                ctx.gpu_activations.d_topk_v,
-                ctx.gpu_activations.d_expert_assignments,
-                start, count, H);
-          }
+        {
+          PROFILE_GPU_SCOPE("moe_weighted_accum", 0);
+          dim3 grid_accum((H + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                          max_active_count, num_active_experts);
+          moe_weighted_accum_kernel<<<grid_accum, BLOCK_SIZE, 0>>>(
+              ctx.gpu_activations.d_e_agg,
+              d_mlp2_raw,
+              ctx.gpu_activations.d_topk_v,
+              ctx.gpu_activations.d_expert_assignments,
+              ctx.gpu_activations.d_active_experts,
+              ctx.gpu_activations.d_active_counts,
+              ctx.gpu_activations.d_expert_offsets,
+              num_active_experts, H);
         }
       }
     }
