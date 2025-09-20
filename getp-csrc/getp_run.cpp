@@ -599,20 +599,31 @@ static float *gpu_forward_device_batch(Transformer *transformer,
           /*B*/            batch_size);
     }
 
-    // Attention (batched)
+    // Attention (batched) with optional online-softmax/flash-decoding variant
     {
-      PROFILE_GPU_SCOPE("attention_batch_kernel", 0);
+      const char *use_online_env = getenv("GETP_USE_ONLINE_ATTN");
+      const bool use_online = (use_online_env && use_online_env[0] == '1');
       dim3 gridAttn(Hq, batch_size, 1);
       dim3 blockA(WF_SIZE);
-      size_t shmem_size = (size_t)(max_pos_in_batch + 2) * sizeof(float);
-      attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
-          ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
-          ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-          ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-          Hq, Hk, S,
+      const float *mask_ptr =
           (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask
-                                                  : nullptr,
-          L * S * KV, batch_size);
+                                                  : nullptr;
+      if (use_online) {
+        PROFILE_GPU_SCOPE("attention_batch_online_kernel", 0);
+        attention_batch_online_kernel<<<gridAttn, blockA, 0>>>(
+            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+            ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
+            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+            Hq, Hk, S, mask_ptr, L * S * KV, batch_size);
+      } else {
+        PROFILE_GPU_SCOPE("attention_batch_kernel", 0);
+        size_t shmem_size = (size_t)(max_pos_in_batch + 2) * sizeof(float);
+        attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
+            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+            ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
+            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+            Hq, Hk, S, mask_ptr, L * S * KV, batch_size);
+      }
     }
 
     // Output projection + residual (batched) - separate kernels
