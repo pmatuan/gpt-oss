@@ -47,6 +47,8 @@ struct GPUActivationBuffers {
   int *d_expert_offsets;
   int *d_expert_assignments;
   size_t expert_assign_capacity;
+  int *d_assignment_active_slot;
+  size_t assignment_active_capacity;
   int *d_active_experts;
   int *d_active_counts;
   int active_expert_capacity;

@@ -208,26 +208,24 @@ __global__ void moe_scatter_assignments_kernel(int *assignments,
 
 __global__ void moe_gather_tokens_kernel(float *dst, const float *src,
                                          const int *assignments,
-                                         const int *expert_offsets,
+                                         const int *assignment_active_slot,
                                          const int *active_experts,
-                                         const int *active_counts,
-                                         int num_active, int H)
+                                         int num_active, int num_assignments,
+                                         int H)
 {
-  const int expert_slot = blockIdx.z;
-  if (expert_slot >= num_active)
-    return;
-
-  const int row = blockIdx.y;
-  const int row_count = active_counts[expert_slot];
-  if (row >= row_count)
+  const int assignment_idx = blockIdx.y;
+  if (assignment_idx >= num_assignments)
     return;
 
   const int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
   if (col >= H)
     return;
 
+  const int expert_slot = assignment_active_slot[assignment_idx];
+  if (expert_slot < 0 || expert_slot >= num_active)
+    return;
+
   const int expert = active_experts[expert_slot];
-  const int assignment_idx = expert_offsets[expert] + row;
   const int assignment = assignments[assignment_idx];
   if (assignment < 0)
     return;
@@ -240,10 +238,9 @@ __global__ void moe_gather_tokens_kernel(float *dst, const float *src,
 
 __global__ void moe_mlp1_matmul_bias_kernel(
     float *out, const float *x_grouped, const bf16_t *w_mlp1_all,
-    const float *b_mlp1_all, const int *assignments,
-    const int *expert_offsets, const int *active_experts,
-    const int *active_counts, int layer, int E, int H, int IM,
-    int num_active)
+    const float *b_mlp1_all, const int *assignment_active_slot,
+    const int *active_experts, int layer, int E, int H, int IM,
+    int num_active, int num_assignments)
 {
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -255,17 +252,15 @@ __global__ void moe_mlp1_matmul_bias_kernel(
   if (wid >= TM || output_dim >= 2 * IM)
     return;
 
-  const int expert_slot = blockIdx.z;
-  if (expert_slot >= num_active)
+  const int assignment_idx = blockIdx.y;
+  if (assignment_idx >= num_assignments)
     return;
 
-  const int row = blockIdx.y;
-  const int row_count = active_counts[expert_slot];
-  if (row >= row_count)
+  const int expert_slot = assignment_active_slot[assignment_idx];
+  if (expert_slot < 0 || expert_slot >= num_active)
     return;
 
   const int expert = active_experts[expert_slot];
-  const int assignment_idx = expert_offsets[expert] + row;
   const float *xb = x_grouped + (size_t)assignment_idx * H;
 
   float acc = 0.0f;
@@ -352,10 +347,9 @@ __global__ void moe_swiglu_activation_kernel(float *dst, const float *src,
 
 __global__ void moe_mlp2_matmul_bias_kernel(
     float *out, const float *gate_up_grouped, const bf16_t *w_mlp2_all,
-    const float *b_mlp2_all, const int *assignments,
-    const int *expert_offsets, const int *active_experts,
-    const int *active_counts, int layer, int E, int IM, int H,
-    int num_active)
+    const float *b_mlp2_all, const int *assignment_active_slot,
+    const int *active_experts, int layer, int E, int IM, int H,
+    int num_active, int num_assignments)
 {
   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
 
@@ -367,17 +361,15 @@ __global__ void moe_mlp2_matmul_bias_kernel(
   if (wid >= TM || output_dim >= H)
     return;
 
-  const int expert_slot = blockIdx.z;
-  if (expert_slot >= num_active)
+  const int assignment_idx = blockIdx.y;
+  if (assignment_idx >= num_assignments)
     return;
 
-  const int row = blockIdx.y;
-  const int row_count = active_counts[expert_slot];
-  if (row >= row_count)
+  const int expert_slot = assignment_active_slot[assignment_idx];
+  if (expert_slot < 0 || expert_slot >= num_active)
     return;
 
   const int expert = active_experts[expert_slot];
-  const int assignment_idx = expert_offsets[expert] + row;
   const float *xb = gate_up_grouped + (size_t)assignment_idx * IM;
 
   float acc = 0.0f;
@@ -436,26 +428,22 @@ __global__ void moe_mlp2_matmul_bias_kernel(
 __global__ void moe_weighted_accum_kernel(float *e_agg, const float *mlp2_out,
                                           const float *topk_v,
                                           const int *assignments,
-                                          const int *active_experts,
-                                          const int *active_counts,
-                                          const int *expert_offsets,
-                                          int num_active, int H)
+                                          const int *assignment_active_slot,
+                                          int num_active, int num_assignments,
+                                          int H)
 {
-  const int expert_slot = blockIdx.z;
-  if (expert_slot >= num_active)
-    return;
-
-  const int row = blockIdx.y;
-  const int row_count = active_counts[expert_slot];
-  if (row >= row_count)
-    return;
-
   const int dim = blockIdx.x * BLOCK_SIZE + threadIdx.x;
   if (dim >= H)
     return;
 
-  const int expert = active_experts[expert_slot];
-  const int assignment_idx = expert_offsets[expert] + row;
+  const int assignment_idx = blockIdx.y;
+  if (assignment_idx >= num_assignments)
+    return;
+
+  const int expert_slot = assignment_active_slot[assignment_idx];
+  if (expert_slot < 0 || expert_slot >= num_active)
+    return;
+
   const int assignment = assignments[assignment_idx];
   if (assignment < 0)
     return;
