@@ -36,14 +36,14 @@ using s16x4 = short __attribute__((ext_vector_type(4)));
 
 // GPU Buffer Structures
 struct GPUActivationBuffers {
-  float *d_x, *d_t, *d_tb, *d_tb2;
+  float *d_x, *d_t, *d_tb;
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
   float *d_gate_up, *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
   float *d_qkv, *d_q;
   bf16_t *d_key_cache, *d_value_cache;
-  float *d_att, *d_logits, *d_mask;
+  float *d_logits;
   float *d_cos_vals, *d_sin_vals;
   int *d_token2row;
   int *d_tokens;

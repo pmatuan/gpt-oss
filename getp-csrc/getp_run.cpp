@@ -38,7 +38,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, H * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, H * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb, D * Hq * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb2, H * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score, E * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
@@ -60,7 +59,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
       hipMalloc(&ctx.gpu_activations.d_key_cache, L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
                       L * S * KV * sizeof(bf16_t)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att, Hq * S * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
 
   HIP_CHECK(
@@ -79,22 +77,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
     free(h_token2row);
   }
 
-  if (model_config->sliding_window > 0) {
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_mask, S * S * sizeof(float)));
-    float *h_mask = (float *)malloc(S * S * sizeof(float));
-#pragma omp parallel for
-    for (int i = 0; i < S; ++i) {
-      for (int j = 0; j < S; ++j) {
-        h_mask[i * S + j] =
-            (i - j >= model_config->sliding_window) ? -INFINITY : 0.0f;
-      }
-    }
-    HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_mask, h_mask,
-                        S * S * sizeof(float), hipMemcpyHostToDevice));
-    free(h_mask);
-  } else {
-    ctx.gpu_activations.d_mask = nullptr;
-  }
 
   // Batched helpers (lazily grown as needed)
   ctx.capacity_B = 1;
@@ -221,7 +203,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_x));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_t));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_tb));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_tb2));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_router_score));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_topk_v));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_topk_i));
@@ -233,14 +214,11 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_q));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_key_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_value_cache));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_att));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_logits));
   if (ctx.gpu_activations.d_inv_rms)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_cos_vals));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_sin_vals));
-  if (ctx.gpu_activations.d_mask)
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_mask));
   if (ctx.gpu_activations.d_token2row)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_token2row));
   if (ctx.gpu_activations.d_tokens)
@@ -356,7 +334,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_x);
     FREE_IF(ctx.gpu_activations.d_t);
     FREE_IF(ctx.gpu_activations.d_tb);
-    FREE_IF(ctx.gpu_activations.d_tb2);
     FREE_IF(ctx.gpu_activations.d_router_score);
     FREE_IF(ctx.gpu_activations.d_topk_v);
     FREE_IF(ctx.gpu_activations.d_topk_i);
@@ -366,9 +343,8 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_q);
     FREE_IF(ctx.gpu_activations.d_key_cache);
     FREE_IF(ctx.gpu_activations.d_value_cache);
-    FREE_IF(ctx.gpu_activations.d_att);
     FREE_IF(ctx.gpu_activations.d_logits);
-// mask & token2row remain shared
+// token2row remains shared
 #undef FREE_IF
 
     // Re-allocate with batch dimension
@@ -378,8 +354,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
         hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb,
                         (size_t)B * D * Hq * sizeof(float)));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tb2, (size_t)B * H * sizeof(float)));
 
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
                         (size_t)B * p->n_experts * sizeof(float)));
@@ -404,8 +378,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
                         (size_t)B * L * S * KV * sizeof(bf16_t)));
     // Auxiliary buffers
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_att,
-                        (size_t)B * Hq * S * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
                         (size_t)B * V * sizeof(float)));
 
@@ -604,14 +576,17 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       PROFILE_GPU_SCOPE("attention_batch_kernel", 0);
       dim3 gridAttn(Hq, batch_size, 1);
       dim3 blockA(WF_SIZE);
-      size_t shmem_size = (size_t)(max_pos_in_batch + 2) * sizeof(float);
+      const bool layer_has_window = (p->sliding_window > 0) && ((l & 1) == 0);
+      const int att_tokens = layer_has_window
+                                 ? std::min(max_pos_in_batch + 1,
+                                            p->sliding_window)
+                                 : (max_pos_in_batch + 1);
+      size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
       attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
           ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
           ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
           ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-          Hq, Hk, S,
-          (p->sliding_window > 0 && (l % 2 == 0)) ? ctx.gpu_activations.d_mask
-                                                  : nullptr,
+          Hq, Hk, S, layer_has_window ? p->sliding_window : 0,
           L * S * KV, batch_size);
     }
 
@@ -906,7 +881,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   if (use_large_model) {
     printf("Using pipeline parallelism for MoE with %d experts\n",
            transformer->config.n_experts);
-    
+
     // Single pipeline over all devices: run all requests together
     num_token_out = run_requests_pipeline(transformer, tokenizer, ctxs, num_requests);
 
