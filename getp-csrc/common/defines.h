@@ -16,6 +16,8 @@ typedef hip_bfloat16 bf16_t;
 #define LDS_PAD 16
 #define K_STEP_MATMUL_FLOAT 4
 #define EXPERT_PER_TOKEN 4
+#define EXPERT_PER_TOKEN_SHIFT 2
+#define EXPERT_PER_TOKEN_MASK (EXPERT_PER_TOKEN - 1)
 #define MAX_BATCH_SIZE 64
 #define TM_MM 32
 #define TN_MM 32
@@ -41,6 +43,17 @@ struct GPUActivationBuffers {
   int *d_topk_i;
   float *d_gate_up, *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
+  int *d_expert_counts;
+  int *d_expert_offsets;
+  int *d_expert_assignments;
+  size_t expert_assign_capacity;
+  float *d_moe_x_workspace;
+  float *d_mlp1_workspace;
+  float *d_mlp2_workspace;
+  size_t gate_up_workspace_bytes;
+  size_t moe_x_workspace_bytes;
+  size_t mlp1_workspace_bytes;
+  size_t mlp2_workspace_bytes;
   float *d_qkv, *d_q;
   bf16_t *d_key_cache, *d_value_cache;
   float *d_att, *d_logits, *d_mask;

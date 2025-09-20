@@ -30,4 +30,28 @@ __global__ void mlp2_weighted_accum_kernel(
     float *e_agg, const float *mlp2_out, const float *topk_v,
     int H, int B, int K, const int *pos);
 
+__global__ void moe_count_assignments_kernel(int *counts,
+                                             const int *topk_i,
+                                             int total_assignments,
+                                             int n_experts);
+
+__global__ void moe_scatter_assignments_kernel(int *assignments,
+                                               int *counters,
+                                               const int *offsets,
+                                               const int *topk_i,
+                                               int total_assignments,
+                                               int n_experts);
+
+__global__ void moe_gather_tokens_kernel(float *dst, const float *src,
+                                         const int *assignments, int start,
+                                         int count, int H);
+
+__global__ void moe_swiglu_activation_kernel(float *dst, const float *src,
+                                             float clip, int count, int IM);
+
+__global__ void moe_weighted_accum_kernel(float *e_agg, const float *mlp2_out,
+                                          const float *topk_v,
+                                          const int *assignments, int start,
+                                          int count, int H);
+
 #endif // GETP_MATMUL_H

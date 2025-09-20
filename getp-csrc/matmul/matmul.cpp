@@ -416,3 +416,116 @@ __global__ void mlp2_weighted_accum_kernel(
   // Store accumulated result
   e_agg[(size_t)batch_idx * (size_t)H + (size_t)dim_idx] = sum;
 }
+
+__global__ void moe_count_assignments_kernel(int *counts,
+                                             const int *topk_i,
+                                             int total_assignments,
+                                             int n_experts)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_assignments)
+    return;
+
+  const int expert = topk_i[idx];
+  if (expert >= 0 && expert < n_experts) {
+    atomicAdd(counts + expert, 1);
+  }
+}
+
+__global__ void moe_scatter_assignments_kernel(int *assignments,
+                                               int *counters,
+                                               const int *offsets,
+                                               const int *topk_i,
+                                               int total_assignments,
+                                               int n_experts)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_assignments)
+    return;
+
+  const int expert = topk_i[idx];
+  if (expert < 0 || expert >= n_experts)
+    return;
+
+  const int slot = atomicAdd(counters + expert, 1);
+  assignments[offsets[expert] + slot] = idx;
+}
+
+__global__ void moe_gather_tokens_kernel(float *dst, const float *src,
+                                         const int *assignments, int start,
+                                         int count, int H)
+{
+  const int row = blockIdx.y;
+  if (row >= count)
+    return;
+
+  const int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+  if (col >= H)
+    return;
+
+  const int assignment = assignments[start + row];
+  if (assignment < 0)
+    return;
+
+  const int batch_idx = assignment / EXPERT_PER_TOKEN;
+  const float *src_row = src + (size_t)batch_idx * H;
+  float *dst_row = dst + (size_t)row * H;
+  dst_row[col] = src_row[col];
+}
+
+__global__ void moe_swiglu_activation_kernel(float *dst, const float *src,
+                                             float clip, int count, int IM)
+{
+  const int row = blockIdx.y;
+  if (row >= count)
+    return;
+
+  const int dim = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+  if (dim >= IM)
+    return;
+
+  const size_t base = (size_t)row * (size_t)(2 * IM) + (size_t)(2 * dim);
+  float gate_val = src[base + 0];
+  float up_val = src[base + 1];
+
+  if (clip > 0.0f) {
+    const float inv_span = 0.5f / clip;
+    float norm_gate = __saturatef(gate_val * inv_span + 0.5f);
+    float norm_up = __saturatef(up_val * inv_span + 0.5f);
+    gate_val = norm_gate * (2.0f * clip) - clip;
+    up_val = norm_up * (2.0f * clip) - clip;
+  }
+
+  const float alpha = 1.702f;
+  float activation = __saturatef(0.5f + 0.5f * tanhf(alpha * gate_val * 0.5f));
+  float gate = gate_val * activation;
+  dst[(size_t)row * (size_t)IM + (size_t)dim] = gate * (up_val + 1.0f);
+}
+
+__global__ void moe_weighted_accum_kernel(float *e_agg, const float *mlp2_out,
+                                          const float *topk_v,
+                                          const int *assignments, int start,
+                                          int count, int H)
+{
+  const int row = blockIdx.y;
+  if (row >= count)
+    return;
+
+  const int dim = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+  if (dim >= H)
+    return;
+
+  const int assignment = assignments[start + row];
+  if (assignment < 0)
+    return;
+
+  const int batch_idx = assignment / EXPERT_PER_TOKEN;
+  const float weight = topk_v[assignment];
+  if (weight == 0.0f)
+    return;
+
+  const float *row_src = mlp2_out + (size_t)row * H;
+  float *row_dst = e_agg + (size_t)batch_idx * H;
+  const float contrib = row_src[dim] * weight;
+  atomicAdd(row_dst + dim, contrib);
+}
