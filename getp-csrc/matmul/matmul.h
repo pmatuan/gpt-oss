@@ -12,14 +12,45 @@ __global__ void matmul_bias_gemm_kernel_float(
     float *out, const float *x, const float *w, const float *b,
     int H, int D, int batch_size, const int *pos);
 
-__global__ void mlp1_fused_gemm_kernel(
-    float *gate_up_topk, const float *x, const bf16_t *w, const float *b,
-    const int *topk_i, int layer, int E, int H, int IM,
-    float clip, int B, const int *pos);
+__global__ void moe_count_assignments_kernel(int *counts,
+                                             const int *topk_i,
+                                             int total_assignments,
+                                             int n_experts);
 
-__global__ void mlp2_bias_weighted_accum_gemm_kernel(
-    float *e_agg, const float *gate_up, const bf16_t *w, const float *b,
-    const int *topk_i, const float *topk_v, int layer,
-    int E, int IM, int H, int B, const int *pos);
+__global__ void moe_scatter_assignments_kernel(int *assignments,
+                                               int *counters,
+                                               const int *offsets,
+                                               const int *topk_i,
+                                               int total_assignments,
+                                               int n_experts);
+
+__global__ void moe_gather_tokens_kernel(float *dst, const float *src,
+                                         const int *assignments,
+                                         const int *assignment_active_slot,
+                                         const int *active_experts,
+                                         int num_active, int num_assignments,
+                                         int H);
+
+__global__ void moe_mlp1_matmul_bias_kernel(
+    float *out, const float *x_grouped, const bf16_t *w_mlp1_all,
+    const float *b_mlp1_all, const int *assignment_active_slot,
+    const int *active_experts, int layer, int E, int H, int IM,
+    int num_active, int num_assignments);
+
+__global__ void moe_swiglu_activation_kernel(float *dst, const float *src,
+                                             float clip, int count, int IM);
+
+__global__ void moe_mlp2_matmul_bias_kernel(
+    float *out, const float *gate_up_grouped, const bf16_t *w_mlp2_all,
+    const float *b_mlp2_all, const int *assignment_active_slot,
+    const int *active_experts, int layer, int E, int IM, int H,
+    int num_active, int num_assignments);
+
+__global__ void moe_weighted_accum_kernel(float *e_agg, const float *mlp2_out,
+                                          const float *topk_v,
+                                          const int *assignments,
+                                          const int *assignment_active_slot,
+                                          int num_active, int num_assignments,
+                                          int H);
 
 #endif // GETP_MATMUL_H
