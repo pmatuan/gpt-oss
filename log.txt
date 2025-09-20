@@ -1,3 +1,5 @@
+srun: job 55852 queued and waiting for resources
+srun: job 55852 has been allocated resources
 vocab_size: 201088
 hidden_dim: 2880
 n_experts: 32
@@ -24,7 +26,7 @@ Initializing device 0...
 [DEVICE] 0 [HIP] after large BF16 weights (model loaded): HBM free 24.65 GiB / total 63.98 GiB (used 39.33 GiB)
 Multi-GPU initialization complete!
 
-warm up elapsed time(s): 4.621000
+warm up elapsed time(s): 48.777000
 Processing 64 requests across 1 GPUs...
 What is the biggest misconception about Life purpose & meaning?
 
@@ -6079,28 +6081,28 @@ Great! Let's dive deeper into how you can explore and understand these concepts 
 
 Multi-GPU inference completed. Total tokens generated: 62257
 
-elapsed time(s): 367.586000, achieved throughput TPS (tok/s): 169.367168
+elapsed time(s): 368.392000, achieved throughput TPS (tok/s): 168.996612
 
-finish elapsed time(s): 0.007000
+finish elapsed time(s): 0.008000
 
 ┌──────────────────────────────────────────────────────────────────────────────────────┐
 │                                  PROFILER SUMMARY                                    │
 ├──────────────────────────────────────────────────────────────────────────────────────┤
 │ Function/Kernel Name                          │   Total (ms) │    Calls │   Avg (ms) │
 ├──────────────────────────────────────────────────────────────────────────────────────┤
-│ CPU:inference                                 │   367585.932 │        1 │ 367585.932 │
-│ CPU:gpu_forward_device_batch                  │   356487.697 │     1024 │    348.133 │
-│ GPU:mlp1_matmul_bias_kernel                   │   168076.046 │    24576 │      6.839 │
-│ GPU:mlp2_matmul_bias_kernel                   │    83269.484 │    24576 │      3.388 │
-│ GPU:matmul_bias_gemm_kernel_bf16_mfma         │    83205.699 │    50176 │      1.658 │
-│ GPU:attention_batch_kernel                    │    11842.949 │    24576 │      0.482 │
-│ GPU:rmsnorm_batch_kernel                      │      788.657 │    50176 │      0.016 │
-│ GPU:residual_add_batch_kernel                 │      775.058 │    49152 │      0.016 │
-│ GPU:fused_split_rope_scatter_qkv_batch_kernel │      664.600 │    24576 │      0.027 │
-│ GPU:matmul_bias_gemm_kernel_float             │      606.936 │    24576 │      0.025 │
-│ GPU:mlp1_split_swiglu_kernel                  │      570.960 │    24576 │      0.023 │
-│ GPU:fused_topk_softmax_batch_kernel           │      450.988 │    24576 │      0.018 │
-│ GPU:mlp2_weighted_accum_kernel                │      396.593 │    24576 │      0.016 │
-│ GPU:copy_embedding_bf16_batch_kernel          │       30.017 │     1024 │      0.029 │
+│ CPU:inference                                 │   368392.946 │        1 │ 368392.946 │
+│ CPU:gpu_forward_device_batch                  │   357033.417 │     1024 │    348.665 │
+│ GPU:mlp1_matmul_bias_kernel                   │   168009.911 │    24576 │      6.836 │
+│ GPU:mlp2_matmul_bias_kernel                   │    83279.854 │    24576 │      3.389 │
+│ GPU:matmul_bias_gemm_kernel_bf16_mfma         │    82958.265 │    50176 │      1.653 │
+│ GPU:attention_batch_kernel                    │    11820.948 │    24576 │      0.481 │
+│ GPU:rmsnorm_batch_kernel                      │      782.388 │    50176 │      0.016 │
+│ GPU:residual_add_batch_kernel                 │      773.340 │    49152 │      0.016 │
+│ GPU:fused_split_rope_scatter_qkv_batch_kernel │      663.986 │    24576 │      0.027 │
+│ GPU:matmul_bias_gemm_kernel_float             │      605.720 │    24576 │      0.025 │
+│ GPU:mlp1_split_swiglu_kernel                  │      567.523 │    24576 │      0.023 │
+│ GPU:fused_topk_softmax_batch_kernel           │      450.046 │    24576 │      0.018 │
+│ GPU:mlp2_weighted_accum_kernel                │      395.216 │    24576 │      0.016 │
+│ GPU:copy_embedding_bf16_batch_kernel          │       30.200 │     1024 │      0.029 │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 

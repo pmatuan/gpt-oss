@@ -689,8 +689,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp1_matmul_bias_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridMLP1((2*IM + TM - 1) / TM, batch_size, 1);
-      gridMLP1.z = p->experts_per_token;
+      dim3 gridMLP1((2*IM + TM - 1) / TM, batch_size, p->experts_per_token);
       mlp1_matmul_bias_kernel<<<gridMLP1, block, 0>>>(
           /*out[K,B,2*IM]*/ d_mlp1_raw,
           /*x[B,H]*/ ctx.gpu_activations.d_t,
@@ -706,8 +705,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp1_split_swiglu_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridSplit((IM + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, 1);
-      gridSplit.z = p->experts_per_token;
+      dim3 gridSplit((IM + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, p->experts_per_token);
       mlp1_split_swiglu_kernel<<<gridSplit, block, 0>>>(
           /*gate_up_out[K,B,IM]*/ d_gate_up_topk,
           /*gate_up_raw[K,B,2*IM]*/ d_mlp1_raw,
@@ -725,8 +723,7 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("mlp2_matmul_bias_kernel", 0);
       dim3 block(BLOCK_SIZE, 1, 1);
-      dim3 gridMLP2((H + TM - 1) / TM, batch_size, 1);
-      gridMLP2.z = p->experts_per_token;
+      dim3 gridMLP2((H + TM - 1) / TM, batch_size, p->experts_per_token);
       mlp2_matmul_bias_kernel<<<gridMLP2, block, 0>>>(
           /*out[K,B,H]*/ d_mlp2_raw,
           /*gate_up[K,B,IM]*/ d_gate_up_topk,
