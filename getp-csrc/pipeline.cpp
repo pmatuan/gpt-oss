@@ -446,12 +446,15 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
                                             p->sliding_window)
                                  : (max_pos_in_batch + 1);
       size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
-      attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
-          ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
-          ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-          ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+      attention_batch_kernel<<<gridAttn, blockA, shmem_size, stream>>>(
+          ctx.gpu_activations.d_tb + (size_t)b_base * Hq * D,
+          ctx.gpu_activations.d_q + (size_t)b_base * Hq * D,
+          ctx.gpu_activations.d_key_cache + (size_t)b_base * local_L * S * KV,
+          ctx.gpu_activations.d_value_cache + (size_t)b_base * local_L * S * KV,
+          ctx.gpu_weights_fp32.d_attn_sinks, l_local,
+          ctx.gpu_activations.d_pos + b_base, D,
           Hq, Hk, S, layer_has_window ? p->sliding_window : 0,
-          L * S * KV, batch_size);
+          local_L * S * KV, batch_size);
     }
 
     // Output projection + residual (batched) - separate kernels
