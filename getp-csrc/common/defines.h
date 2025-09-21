@@ -18,7 +18,7 @@ typedef hip_bfloat16 bf16_t;
 #define EXPERT_PER_TOKEN 4
 #define EXPERT_PER_TOKEN_SHIFT 2
 #define EXPERT_PER_TOKEN_MASK (EXPERT_PER_TOKEN - 1)
-#define MAX_BATCH_SIZE 64
+#define MAX_BATCH_SIZE 256
 #define TM_MM 32
 #define TN_MM 32
 
