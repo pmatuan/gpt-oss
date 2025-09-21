@@ -40,22 +40,22 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma(
   f32x4 acc10 = {0.f,0.f,0.f,0.f};
   f32x4 acc11 = {0.f,0.f,0.f,0.f};
 
-  // K-loop unrolled for N template parameter (steps of 16)
+  // K-loop unrolled for N template parameter (steps of 1, but actual k uses *16)
   #pragma unroll
-  for (int k0 = 0; k0 < N; k0 += 16) {
+  for (int k0 = 0; k0 < N; k0++) {
     // Each ty takes a 4-wide slice in this k-tile
-    const int k_base = k0 + ty * 4;
-    const int k_rem  = max(0, min(4, N - k_base)); // 0..4 remaining in this slice
+    const int k_base = k0 * 16 + ty * 4;
+    const int k_rem  = max(0, min(4, N * 16 - k_base)); // 0..4 remaining in this slice
 
     // A (X): row-major [B x n] -> take 4 fp32, convert to bf16 with guards
-    const float* x_r0 = x + (size_t)r0 * N + k_base;
-    const float* x_r1 = x + (size_t)r1 * N + k_base;
+    const float* x_r0 = x + (size_t)r0 * N * 16 + k_base;
+    const float* x_r1 = x + (size_t)r1 * N * 16 + k_base;
     s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_r0, 0, k_rem, r0_ok);
     s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_r1, 0, k_rem, r1_ok);
 
     // B (W): row-major [d x n], but we need (k, col) -> &w[col*n + k_base]
-    const bf16_t* w_c0 = w + (size_t)c0 * N + k_base;
-    const bf16_t* w_c1 = w + (size_t)c1 * N + k_base;
+    const bf16_t* w_c0 = w + (size_t)c0 * N * 16 + k_base;
+    const bf16_t* w_c1 = w + (size_t)c1 * N * 16 + k_base;
     s16x4 Bvec_c0 = pack4_bf16_from_bf16_guard(w_c0, 0, k_rem, c0_ok);
     s16x4 Bvec_c1 = pack4_bf16_from_bf16_guard(w_c1, 0, k_rem, c1_ok);
 
@@ -89,7 +89,7 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma(
   }
 }
 
-template __global__ void matmul_bias_gemm_kernel_bf16_mfma<2880>(
+template __global__ void matmul_bias_gemm_kernel_bf16_mfma<180>(
     float* __restrict__ y,
     const float* __restrict__ x,
     const bf16_t* __restrict__ w,
@@ -97,7 +97,7 @@ template __global__ void matmul_bias_gemm_kernel_bf16_mfma<2880>(
     int d, int B,
     const int* __restrict__ pos);
 
-template __global__ void matmul_bias_gemm_kernel_bf16_mfma<4096>(
+template __global__ void matmul_bias_gemm_kernel_bf16_mfma<256>(
     float* __restrict__ y,
     const float* __restrict__ x,
     const bf16_t* __restrict__ w,
