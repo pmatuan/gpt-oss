@@ -360,10 +360,12 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
   const int QKV_D = D * (Hq + 2 * Hk);
   const int local_L = ctx.stage_end - ctx.stage_start;
 
-  // Copy host tokens/positions into device buffers (slice)
-  HIP_CHECK(hipMemcpyAsync(ctx.gpu_activations.d_tokens + b_base, tokens,
-                           (size_t)batch_size * sizeof(int),
-                           hipMemcpyHostToDevice, stream));
+  // Copy host positions into device buffers (slice). Only stage 0 needs tokens.
+  if (ctx.device_id == 0) {
+    HIP_CHECK(hipMemcpyAsync(ctx.gpu_activations.d_tokens + b_base, tokens,
+                             (size_t)batch_size * sizeof(int),
+                             hipMemcpyHostToDevice, stream));
+  }
   HIP_CHECK(hipMemcpyAsync(ctx.gpu_activations.d_pos + b_base, pos,
                            (size_t)batch_size * sizeof(int),
                            hipMemcpyHostToDevice, stream));
@@ -394,27 +396,27 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
             ctx.gpu_activations.d_t + (size_t)b_base * H,
             ctx.gpu_activations.d_x + (size_t)b_base * H,
             ctx.gpu_weights_fp32.d_rms_attn_w + l_local * H, H,
-      ctx.gpu_activations.d_pos + b_base);
+            ctx.gpu_activations.d_pos + b_base);
       }
 
       // Then apply MatMul + Bias
       {
-    // Use kernel launch configuration matching matmul.cpp (32x32 tiles, 16x4 threads)
-    dim3 gridQKV_gemm((QKV_D + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
-    dim3 blockQKV(16, 4, 1);
-    matmul_bias_gemm_kernel_bf16_mfma<<<gridQKV_gemm, blockQKV, 0, stream>>>(
+        // Use kernel launch configuration matching matmul.cpp (32x32 tiles, 16x4 threads)
+        dim3 gridQKV_gemm((QKV_D + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
+        dim3 blockQKV(16, 4, 1);
+        matmul_bias_gemm_kernel_bf16_mfma<<<gridQKV_gemm, blockQKV, 0, stream>>>(
             ctx.gpu_activations.d_qkv + (size_t)b_base * QKV_D,
             ctx.gpu_activations.d_t + (size_t)b_base * H,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l_local * QKV_D * H,
             ctx.gpu_weights_fp32.d_b_qkv + l_local * QKV_D, H, QKV_D, batch_size,
-      ctx.gpu_activations.d_pos + b_base);
+            ctx.gpu_activations.d_pos + b_base);
       }
     }
 
     // Scatter QKV to q / caches (batched)
-  const int loff_local = (l - ctx.stage_start) * S * KV;
-  // Total KV size per batch for this stage (constant across layer loop)
-  const int kv_total_stage = (ctx.stage_end - ctx.stage_start) * S * KV;
+    const int loff_local = (l - ctx.stage_start) * S * KV;
+    // Total KV size per batch for this stage (constant across layer loop)
+    const int kv_total_stage = (ctx.stage_end - ctx.stage_start) * S * KV;
     {
       dim3 grid_fused(max(Hq, Hk), batch_size, 1);
       dim3 block_fused(D / 2, 1, 1);
@@ -423,10 +425,10 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
           /*key_cache*/    ctx.gpu_activations.d_key_cache + (size_t)b_base * local_L * S * KV,
           /*value_cache*/  ctx.gpu_activations.d_value_cache + (size_t)b_base * local_L * S * KV,
           /*qkv*/          ctx.gpu_activations.d_qkv + (size_t)b_base * (Hq + 2 * Hk) * D,
-      /*pos*/          ctx.gpu_activations.d_pos + b_base,
+          /*pos*/          ctx.gpu_activations.d_pos + b_base,
           /*Hq,Hk,D*/      Hq, Hk, D,
           /*RoPE*/         p->rope_theta, p->rope_scaling_factor, p->initial_context_length,
-      /*cache*/        loff_local, kv_total_stage,
+          /*cache*/        loff_local, kv_total_stage,
           /*B*/            batch_size);
     }
 
@@ -455,16 +457,16 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
       const int O_N = D * Hq;
 
       // First do MatMul + Bias: temp = tb @ W^T + b
-  {
-    dim3 gridO_gemm((H + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
-    dim3 blockO(16, 4, 1);
-    matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO, 0, stream>>>(
-    ctx.gpu_activations.d_t + (size_t)b_base * H,
-    ctx.gpu_activations.d_tb + (size_t)b_base * Hq * D,
-    ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l_local * H * O_N,
-    ctx.gpu_weights_fp32.d_b_o + l_local * H, O_N, H, batch_size,
-    ctx.gpu_activations.d_pos + b_base);
-  }
+      {
+        dim3 gridO_gemm((H + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
+        dim3 blockO(16, 4, 1);
+        matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO, 0, stream>>>(
+        ctx.gpu_activations.d_t + (size_t)b_base * H,
+        ctx.gpu_activations.d_tb + (size_t)b_base * Hq * D,
+        ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l_local * H * O_N,
+        ctx.gpu_weights_fp32.d_b_o + l_local * H, O_N, H, batch_size,
+        ctx.gpu_activations.d_pos + b_base);
+      }
 
       // Then do residual add: x = x + temp
       {
@@ -514,7 +516,7 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
     // malloc/free
     size_t gate_up_topk_bytes = (size_t)p->experts_per_token *
                                 (size_t)batch_size * (size_t)IM * sizeof(float);
-  if (!ctx.gpu_activations.d_gate_up_workspace) {
+    if (!ctx.gpu_activations.d_gate_up_workspace) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up_workspace,
                           gate_up_topk_bytes));
     }
@@ -577,7 +579,7 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
           ctx.gpu_activations.d_t + (size_t)b_base * H,
           ctx.gpu_activations.d_x + (size_t)b_base * H,
           ctx.gpu_weights_fp32.d_rms_out_w, H,
-      ctx.gpu_activations.d_pos + b_base);
+          ctx.gpu_activations.d_pos + b_base);
     }
 
     // 2) MatMul for logits - separate GEMM version
@@ -588,7 +590,7 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
           ctx.gpu_activations.d_logits + (size_t)b_base * V,
           ctx.gpu_activations.d_t + (size_t)b_base * H,
           ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V, batch_size,
-      ctx.gpu_activations.d_pos + b_base);
+          ctx.gpu_activations.d_pos + b_base);
     }
     return ctx.gpu_activations.d_logits + (size_t)b_base * V;
   } else {
@@ -620,32 +622,20 @@ static long long run_requests_pipeline(Transformer *transformer,
   float *h_logits_batch = nullptr;
   HIP_CHECK(hipHostMalloc((void **)&h_logits_batch, (size_t)B * V * sizeof(float)));
 
-  // Micro-batching configuration
-  int M_env = 8; // default
-  const char *mb_env = getenv("GETP_MB");
-  if (mb_env) {
-    M_env = atoi(mb_env);
-  }
-  // Heuristic: if M_env < 0, auto-select M so that micro_bs >= 4 and M <= devices
-  int M = 1;
-  if (M_env > 0) {
-    M = std::min(M_env, B);
-  } else if (M_env < 0) {
-    int maxM = std::min(g_num_devices, B);
-    int target_bs = 4;
-    M = std::min(maxM, std::max(1, B / target_bs));
-  }
+  int maxM = std::min(g_num_devices, B);
+  int target_bs = 16;
+  int M = std::min(maxM, std::max(1, B / target_bs));
   int micro_bs = (M > 0) ? (B + M - 1) / M : B;
   if (micro_bs <= 0)
     micro_bs = 1;
   // Recompute M to match micro_bs packing
   M = (B + micro_bs - 1) / micro_bs;
   if (M <= 1) {
-    printf("[MB] Micro-batching disabled (GETP_MB=%d). Using M=1, micro_bs=%d, B=%d, devices=%d\n",
-           M_env, micro_bs, B, g_num_devices);
+    printf("[MB] Micro-batching disable. Using M=1, micro_bs=%d, B=%d, devices=%d\n",
+           micro_bs, B, g_num_devices);
   } else {
-    printf("[MB] Micro-batching enabled: M=%d, micro_bs=%d, B=%d, devices=%d (GETP_MB=%d)\n",
-           M, micro_bs, B, g_num_devices, M_env);
+    printf("[MB] Micro-batching enabled: M=%d, micro_bs=%d, B=%d, devices=%d\n",
+           M, micro_bs, B, g_num_devices);
   }
   std::vector<int> mb_start(M, 0), mb_size(M, 0);
   for (int m = 0; m < M; ++m) {
@@ -763,63 +753,52 @@ static long long run_requests_pipeline(Transformer *transformer,
       }
     }
 
-    // Wait per micro-batch for logits and advance contexts for its samples immediately
+    // Wait for all logits to be ready for this step
     if (g_num_devices > 0) {
       HIP_CHECK(hipSetDevice(g_num_devices - 1));
       for (int m = 0; m < M; ++m) {
-        const int base = mb_start[m];
-        const int bs = mb_size[m];
-        if (bs <= 0) continue;
         HIP_CHECK(hipEventSynchronize(ev_logits_ready[m]));
+      }
+    }
 
-        // Process only samples in this micro-batch
-        for (int j = 0; j < bs; ++j) {
-          int i = base + j;
-          if (!h_active[i])
-            continue;
-          PromptCtx &ctx = ctxs[i];
-
-          // Copy logits for this sample into ctx.h_logits
-          memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V],
-                 (size_t)V * sizeof(float));
-
-          ctx.pos++;
-          h_pos[i] = ctx.pos;
-          int next;
-          if (ctx.pos < ctx.num_prompt_tokens) {
-            next = ctx.prompt_tokens[ctx.pos];
-          } else {
-            ctx.is_context_phase = false;
-            next = sample(ctx.sampler, ctx.h_logits);
-            ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
-            ctx.num_generated++;
-          }
-
-          if (next == 199999 || next == 200002) {
-            ctx.finished = true;
-            h_active[i] = 0;
-            num_finished++;
-            const char *piece = decode_piece(tokenizer, ctx.token, next);
-            if (piece)
-              ctx.output_str += piece;
-            ctx.token = next;
-            continue;
-          }
-
-          const char *piece = decode_piece(tokenizer, ctx.token, next);
-          if (piece)
-            ctx.output_str += piece;
-
-          ctx.token = next;
-          h_tokens[i] = next;
-
-          // Respect max steps constraint
-          if (ctx.max_steps != 0 && ctx.pos + 1 >= ctx.max_steps) {
-            ctx.finished = true;
-            h_active[i] = 0;
-            num_finished++;
-          }
-        }
+    // For each active context, advance one step
+    for (int i = 0; i < B; ++i) {
+      if (!h_active[i])
+        continue;
+      PromptCtx &ctx = ctxs[i];
+      // Copy logits for this sample into ctx.h_logits
+      memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V], (size_t)V * sizeof(float));
+      ctx.pos++;
+      h_pos[i] = ctx.pos;
+      int next;
+      if (ctx.pos < ctx.num_prompt_tokens) {
+        next = ctx.prompt_tokens[ctx.pos];
+      } else {
+        ctx.is_context_phase = false;
+        next = sample(ctx.sampler, ctx.h_logits);
+        ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
+        ctx.num_generated++;
+      }
+      if (next == 199999 || next == 200002) {
+        ctx.finished = true;
+        h_active[i] = 0;
+        num_finished++;
+        const char *piece = decode_piece(tokenizer, ctx.token, next);
+        if (piece)
+          ctx.output_str += piece;
+        ctx.token = next;
+        continue;
+      }
+      const char *piece = decode_piece(tokenizer, ctx.token, next);
+      if (piece)
+        ctx.output_str += piece;
+      ctx.token = next;
+      h_tokens[i] = next;
+      // Respect max steps constraint
+      if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
+        ctx.finished = true;
+        h_active[i] = 0;
+        num_finished++;
       }
     }
   }
@@ -847,11 +826,6 @@ static long long run_requests_pipeline(Transformer *transformer,
     for (int m = 0; m < (int)ev_logits_ready.size(); ++m) {
       HIP_CHECK(hipEventDestroy(ev_logits_ready[m]));
     }
-  }
-
-  // Free pinned host buffer
-  if (h_logits_batch) {
-    HIP_CHECK(hipHostFree(h_logits_batch));
   }
 
   return total_tokens;
