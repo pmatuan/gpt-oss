@@ -814,7 +814,7 @@ static long long run_requests_pipeline(Transformer *transformer,
           h_tokens[i] = next;
 
           // Respect max steps constraint
-          if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
+          if (ctx.max_steps != 0 && ctx.pos + 1 >= ctx.max_steps) {
             ctx.finished = true;
             h_active[i] = 0;
             num_finished++;
