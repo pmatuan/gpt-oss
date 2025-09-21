@@ -20,6 +20,7 @@
 #define GETP_RUN
 
 static Config *model_config;
+static bool model_120b = false;
 
 static std::vector<DeviceContext> g_devices;
 static int g_num_devices = 0;
@@ -302,6 +303,7 @@ static void cleanup_device_context(DeviceContext &ctx) {
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   model_config = &transformer->config;
+  model_120b = (model_config->n_experts == 128);
 
   HIP_CHECK(hipGetDeviceCount(&g_num_devices));
   if (g_num_devices <= 0) {
