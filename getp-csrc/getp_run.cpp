@@ -868,12 +868,12 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
     // Single pipeline over all devices: run all requests together
     num_token_out = run_requests_pipeline(transformer, tokenizer, ctxs, num_requests);
 
-    // Sequential, ordered output & cleanup
-    for (int idx = 0; idx < num_requests; ++idx) {
-      safe_printf(ctxs[idx].output_str.c_str());
-      safe_printf("\n");
-      free_prompt_ctx_heap_buffers(ctxs[idx]);
-    }
+    // // Sequential, ordered output & cleanup
+    // for (int idx = 0; idx < num_requests; ++idx) {
+    //   safe_printf(ctxs[idx].output_str.c_str());
+    //   safe_printf("\n");
+    //   free_prompt_ctx_heap_buffers(ctxs[idx]);
+    // }
     delete[] ctxs;
 
     printf("Multi-GPU inference completed. Total tokens generated: %lld\n",
@@ -911,12 +911,12 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   for (auto &th : workers)
     th.join();
 
-  // Sequential, ordered output & cleanup
-  for (int idx = 0; idx < num_requests; ++idx) {
-    safe_printf(ctxs[idx].output_str.c_str());
-    safe_printf("\n");
-    free_prompt_ctx_heap_buffers(ctxs[idx]);
-  }
+  // // Sequential, ordered output & cleanup
+  // for (int idx = 0; idx < num_requests; ++idx) {
+  //   safe_printf(ctxs[idx].output_str.c_str());
+  //   safe_printf("\n");
+  //   free_prompt_ctx_heap_buffers(ctxs[idx]);
+  // }
   delete[] ctxs;
 
   printf("Multi-GPU inference completed. Total tokens generated: %lld\n",
