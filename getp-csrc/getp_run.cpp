@@ -715,12 +715,12 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
         dim3 gridQKV_gemm((QKV_D + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
         dim3 blockQKV(16, 4, 1);
-        matmul_bias_gemm_kernel_bf16_mfma<<<gridQKV_gemm, blockQKV>>>(
+        matmul_bias_gemm_kernel_bf16_mfma<2880><<<gridQKV_gemm, blockQKV>>>(
             ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * (size_t)QKV_D * (size_t)H,
             ctx.gpu_weights_fp32.d_b_qkv ? (ctx.gpu_weights_fp32.d_b_qkv + (size_t)l * QKV_D) : nullptr,
-            H, QKV_D, batch_size,
+            QKV_D, batch_size,
             ctx.gpu_activations.d_pos);
       }      
     }
@@ -771,10 +771,10 @@ static float *gpu_forward_device_batch(Transformer *transformer,
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
         dim3 gridO_gemm((H + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
         dim3 blockO(16, 4, 1);
-        matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO>>>(
+        matmul_bias_gemm_kernel_bf16_mfma<4096><<<gridO_gemm, blockO>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * H * O_N,
-            ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size,
+            ctx.gpu_weights_fp32.d_b_o + l * H, H, batch_size,
             ctx.gpu_activations.d_pos);
       }
 
@@ -1000,9 +1000,9 @@ static float *gpu_forward_device_batch(Transformer *transformer,
       PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma", 0);
       dim3 gridV_gemm((V + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
       dim3 blockV(16, 4, 1);
-      matmul_bias_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
+      matmul_bias_gemm_kernel_bf16_mfma<2880><<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
-          ctx.gpu_weights_bf16.d_out_bf16, nullptr, H, V, batch_size,
+          ctx.gpu_weights_bf16.d_out_bf16, nullptr, V, batch_size,
           ctx.gpu_activations.d_pos);
     }
   }
