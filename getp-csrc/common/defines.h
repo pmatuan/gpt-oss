@@ -73,6 +73,9 @@ struct GPUWeightBuffersBF16 {
 struct DeviceContext {
   int device_id;
 
+  int stage_start;
+  int stage_end;
+
   GPUActivationBuffers gpu_activations;
   GPUWeightBuffersFP32 gpu_weights_fp32;
   GPUExpertBiasBuffers gpu_expert_bias;
@@ -127,5 +130,10 @@ static inline void free_prompt_ctx_heap_buffers(PromptCtx &ctx) {
   }
   ctx.output_str.clear(); // Clear the string
 }
+
+static Config *model_config;
+
+static std::vector<DeviceContext> g_devices;
+static int g_num_devices = 0;
 
 #endif // GETP_COMMON_DEFINES_H

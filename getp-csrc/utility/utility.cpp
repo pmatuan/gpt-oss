@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static inline void debug_print_gpu_memory(const char *tag, int device_id) {
+void debug_print_gpu_memory(const char *tag, int device_id) {
   size_t free_b = 0, total_b = 0;
   hipError_t err = hipMemGetInfo(&free_b, &total_b);
   if (err != hipSuccess) {

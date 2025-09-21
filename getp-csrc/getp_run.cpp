@@ -1,10 +1,4 @@
-#include "attention/attention.cpp"
-#include "common/defines.h"
-#include "getp_eval.cpp"
-#include "matmul/matmul.cpp"
-#include "profiler/profiler.cpp"
-#include "utility/utility.cpp"
-#include "utility/utility.h"
+#include "pipeline.cpp"
 #include <math.h>
 #include <mutex>
 #include <omp.h>
@@ -18,10 +12,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-static Config *model_config;
-
-static std::vector<DeviceContext> g_devices;
-static int g_num_devices = 0;
+static inline bool use_large_model = false;
 
 static void init_device_context(DeviceContext &ctx, int device_id,
                                 Transformer *transformer) {
@@ -289,6 +280,7 @@ static void cleanup_device_context(DeviceContext &ctx) {
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   model_config = &transformer->config;
+  use_large_model = model_config->n_experts >= 128;;
 
   HIP_CHECK(hipGetDeviceCount(&g_num_devices));
   if (g_num_devices <= 0) {
@@ -298,19 +290,37 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   printf("Found %d HIP devices, initializing multi-GPU setup...\n",
          g_num_devices);
+  // Enable peer access between all device pairs if possible
+  for (int i = 0; i < g_num_devices; ++i) {
+    HIP_CHECK(hipSetDevice(i));
+    for (int j = 0; j < g_num_devices; ++j) {
+      if (i == j)
+        continue;
+      int canAccess = 0;
+      hipError_t e = hipDeviceCanAccessPeer(&canAccess, i, j);
+      if (e == hipSuccess && canAccess) {
+        // Ignore errors if already enabled
+        HIP_CHECK(hipDeviceEnablePeerAccess(j, 0));
+      }
+    }
+  }
   g_devices.resize(g_num_devices);
 
 // init all devices in parallel
 #pragma omp parallel for num_threads(g_num_devices)
   for (int i = 0; i < g_num_devices; ++i) {
-    init_device_context(g_devices[i], i, transformer);
+    if (use_large_model) {
+      init_device_context_pp(g_devices[i], i, transformer);
+    } else {
+      init_device_context(g_devices[i], i, transformer);
+    }
   }
 
   printf("Multi-GPU initialization complete!\n");
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
-#pragma omp parallel for num_threads(g_num_devices)
+  #pragma omp parallel for num_threads(g_num_devices)
   for (int i = 0; i < g_num_devices; ++i) {
     cleanup_device_context(g_devices[i]);
   }
@@ -885,9 +895,32 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   PromptCtx *ctxs = new PromptCtx[num_requests];
 
-#pragma omp parallel for schedule(dynamic)
+  #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < num_requests; ++i) {
     setup_prompt_ctx(ctxs[i], requests, i, sampler, transformer, tokenizer);
+  }
+
+  // Print transformers config
+  printf("num experts: %d, experts per token: %d\n",
+         transformer->config.n_experts, transformer->config.experts_per_token);
+  if (use_large_model) {
+    printf("Using pipeline parallelism for MoE with %d experts\n",
+           transformer->config.n_experts);
+    
+    // Single pipeline over all devices: run all requests together
+    num_token_out = run_requests_pipeline(transformer, tokenizer, ctxs, num_requests);
+
+    // Sequential, ordered output & cleanup
+    for (int idx = 0; idx < num_requests; ++idx) {
+      safe_printf(ctxs[idx].output_str.c_str());
+      safe_printf("\n");
+      free_prompt_ctx_heap_buffers(ctxs[idx]);
+    }
+    delete[] ctxs;
+
+    printf("Multi-GPU inference completed. Total tokens generated: %lld\n",
+          num_token_out);
+    return num_token_out;
   }
 
   int ctxs_per_device = num_requests / g_num_devices;

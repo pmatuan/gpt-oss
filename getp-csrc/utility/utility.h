@@ -4,7 +4,7 @@
 #include "../common/defines.h"
 
 // GPU Memory Debugging
-static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
+void debug_print_gpu_memory(const char *tag, int device_id = 0);
 
 // Grid Dimension Utilities (removed - using direct dim3 initialization)
 __device__ __forceinline__ short f32_to_bf16_bits_short(float f);
