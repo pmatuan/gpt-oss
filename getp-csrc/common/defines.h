@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <string>
 #include <stdlib.h>
+#include "vector"
 
 typedef hip_bfloat16 bf16_t;
 
