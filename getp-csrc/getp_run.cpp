@@ -1,5 +1,6 @@
 #include "attention/attention.cpp"
 #include "common/defines.h"
+#include "communication/communication.cpp"
 #include "getp_eval.cpp"
 #include "matmul/matmul.cpp"
 #include "profiler/profiler.cpp"
@@ -24,6 +25,8 @@ static bool model_120b = false;
 
 static std::vector<DeviceContext> g_devices;
 static int g_num_devices = 0;
+
+static CommunicationContext g_comm_ctx;
 
 static void init_device_context(DeviceContext &ctx, int device_id,
                                 Transformer *transformer) {
@@ -164,16 +167,54 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   // Expert biases FP32
   const int IM_ = model_config->intermediate_dim;
-  HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1,
-                      (size_t)L * E_ * (2 * IM_) * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1, w->b_mlp1,
-                      (size_t)L * E_ * (2 * IM_) * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2,
-                      (size_t)L * E_ * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2, w->b_mlp2,
-                      (size_t)L * E_ * H_ * sizeof(float),
-                      hipMemcpyHostToDevice));
+  if (model_120b) {
+    // Get local expert range for this device
+    int local_expert_start = g_comm_ctx.expert_dist.device_expert_start[device_id];
+    int local_expert_count = g_comm_ctx.expert_dist.device_expert_count[device_id];
+    
+    // Allocate only for local experts
+    HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1,
+                        (size_t)L * local_expert_count * (2 * IM_) * sizeof(float)));
+    
+    // Copy only local expert biases
+    for (int l = 0; l < L; ++l) {
+      size_t layer_offset = (size_t)l * E_ * (2 * IM_);
+      size_t local_offset = (size_t)l * local_expert_count * (2 * IM_);
+      size_t expert_offset = (size_t)local_expert_start * (2 * IM_);
+      size_t copy_size = (size_t)local_expert_count * (2 * IM_) * sizeof(float);
+      
+      HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1 + local_offset,
+                          w->b_mlp1 + layer_offset + expert_offset, copy_size,
+                          hipMemcpyHostToDevice));
+    }
+    
+    HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2,
+                        (size_t)L * local_expert_count * H_ * sizeof(float)));
+    
+    // Copy only local expert biases for mlp2
+    for (int l = 0; l < L; ++l) {
+      size_t layer_offset = (size_t)l * E_ * H_;
+      size_t local_offset = (size_t)l * local_expert_count * H_;
+      size_t expert_offset = (size_t)local_expert_start * H_;
+      size_t copy_size = (size_t)local_expert_count * H_ * sizeof(float);
+      
+      HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2 + local_offset,
+                          w->b_mlp2 + layer_offset + expert_offset, copy_size,
+                          hipMemcpyHostToDevice));
+    }
+  } else {
+    // Original behavior: copy all expert biases to each device
+    HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1,
+                        (size_t)L * E_ * (2 * IM_) * sizeof(float)));
+    HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1, w->b_mlp1,
+                        (size_t)L * E_ * (2 * IM_) * sizeof(float),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2,
+                        (size_t)L * E_ * H_ * sizeof(float)));
+    HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2, w->b_mlp2,
+                        (size_t)L * E_ * H_ * sizeof(float),
+                        hipMemcpyHostToDevice));
+  }
 
   debug_print_gpu_memory("after expert biases", device_id);
 
@@ -201,23 +242,60 @@ static void init_device_context(DeviceContext &ctx, int device_id,
                            ctx.gpu_weights_bf16.d_w_o_bf16, n_streams,
                            chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp1_bf16,
-                      (size_t)L * E_ * (2 * IM_) * H_ * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E_ * (2 * IM_) * H_,
-                           ctx.gpu_weights_bf16.d_w_mlp1_bf16, n_streams,
-                           chunk_bytes);
-
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp2_bf16,
-                      (size_t)L * E_ * H_ * IM_ * sizeof(bf16_t)));
-  copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E_ * H_ * IM_,
-                           ctx.gpu_weights_bf16.d_w_mlp2_bf16, n_streams,
-                           chunk_bytes);
-
   HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_out_bf16,
                       (size_t)V_ * H_ * sizeof(bf16_t)));
   copy_fp32_to_bf16_device(w->out, (size_t)V_ * H_,
                            ctx.gpu_weights_bf16.d_out_bf16, n_streams,
                            chunk_bytes);
+
+  if (model_120b) {
+    // Get local expert range for this device
+    int local_expert_start = g_comm_ctx.expert_dist.device_expert_start[device_id];
+    int local_expert_count = g_comm_ctx.expert_dist.device_expert_count[device_id];
+    
+    // Allocate only for local experts
+    HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp1_bf16,
+                        (size_t)L * local_expert_count * (2 * IM_) * H_ * sizeof(bf16_t)));
+    
+    // Copy only local expert weights
+    for (int l = 0; l < L; ++l) {
+      size_t layer_offset = (size_t)l * E_ * (2 * IM_) * H_;
+      size_t local_offset = (size_t)l * local_expert_count * (2 * IM_) * H_;
+      size_t expert_offset = (size_t)local_expert_start * (2 * IM_) * H_;
+      size_t copy_size = (size_t)local_expert_count * (2 * IM_) * H_;
+      
+      copy_fp32_to_bf16_device(w->w_mlp1 + layer_offset + expert_offset, copy_size,
+                               ctx.gpu_weights_bf16.d_w_mlp1_bf16 + local_offset, 
+                               n_streams, chunk_bytes);
+    }
+    
+    HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+                        (size_t)L * local_expert_count * H_ * IM_ * sizeof(bf16_t)));
+    
+    // Copy only local expert weights for mlp2
+    for (int l = 0; l < L; ++l) {
+      size_t layer_offset = (size_t)l * E_ * H_ * IM_;
+      size_t local_offset = (size_t)l * local_expert_count * H_ * IM_;
+      size_t expert_offset = (size_t)local_expert_start * H_ * IM_;
+      size_t copy_size = (size_t)local_expert_count * H_ * IM_;
+      
+      copy_fp32_to_bf16_device(w->w_mlp2 + layer_offset + expert_offset, copy_size,
+                               ctx.gpu_weights_bf16.d_w_mlp2_bf16 + local_offset,
+                               n_streams, chunk_bytes);
+    }
+  } else {
+    HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp1_bf16,
+                        (size_t)L * E_ * (2 * IM_) * H_ * sizeof(bf16_t)));
+    copy_fp32_to_bf16_device(w->w_mlp1, (size_t)L * E_ * (2 * IM_) * H_,
+                             ctx.gpu_weights_bf16.d_w_mlp1_bf16, n_streams,
+                             chunk_bytes);
+
+    HIP_CHECK(hipMalloc(&ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+                        (size_t)L * E_ * H_ * IM_ * sizeof(bf16_t)));
+    copy_fp32_to_bf16_device(w->w_mlp2, (size_t)L * E_ * H_ * IM_,
+                             ctx.gpu_weights_bf16.d_w_mlp2_bf16, n_streams,
+                             chunk_bytes);
+  }
 
   debug_print_gpu_memory("after large BF16 weights (model loaded)", device_id);
 }
@@ -313,11 +391,22 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   printf("Found %d HIP devices, initializing multi-GPU setup...\n",
          g_num_devices);
+  
+  // Initialize communication context for 120B model
+  if (model_120b) {
+    printf("Initializing 120B model with expert parallelism across %d devices...\n", g_num_devices);
+    init_communication_context(g_comm_ctx, g_num_devices, 0, model_config->n_experts);
+  }
+  
   g_devices.resize(g_num_devices);
 
 // init all devices in parallel
 #pragma omp parallel for num_threads(g_num_devices)
   for (int i = 0; i < g_num_devices; ++i) {
+    if (model_120b) {
+      // Update communication context for each device
+      g_comm_ctx.current_device_id = i;
+    }
     init_device_context(g_devices[i], i, transformer);
   }
 
@@ -329,6 +418,12 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (int i = 0; i < g_num_devices; ++i) {
     cleanup_device_context(g_devices[i]);
   }
+  
+  // Cleanup communication context for 120B model
+  if (model_120b) {
+    cleanup_communication_context(g_comm_ctx);
+  }
+  
   g_devices.clear();
   g_num_devices = 0;
 }
@@ -828,150 +923,189 @@ static float *gpu_forward_device_batch(Transformer *transformer,
     const int n_experts = E;
 
     if (total_assignments > 0) {
-      HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_expert_counts, 0,
-                               (size_t)n_experts * sizeof(int), 0));
-
-      const int group_threads = 256;
-      const int group_blocks =
-          (total_assignments + group_threads - 1) / group_threads;
-
-      {
-        PROFILE_GPU_SCOPE("moe_group_count", 0);
-        moe_count_assignments_kernel<<<group_blocks, group_threads, 0>>>(
-            ctx.gpu_activations.d_expert_counts,
-            ctx.gpu_activations.d_topk_i,
-            total_assignments, n_experts);
-      }
-
-      std::vector<int> h_expert_counts(n_experts, 0);
-      HIP_CHECK(hipMemcpy(h_expert_counts.data(),
-                          ctx.gpu_activations.d_expert_counts,
-                          (size_t)n_experts * sizeof(int),
-                          hipMemcpyDeviceToHost));
-
-      std::vector<int> h_expert_offsets(n_experts + 1, 0);
-      std::vector<int> h_active_experts;
-      std::vector<int> h_active_counts;
-      h_active_experts.reserve(n_experts);
-      h_active_counts.reserve(n_experts);
-
-      int total_valid_assignments = 0;
-      for (int e_idx = 0; e_idx < n_experts; ++e_idx) {
-        h_expert_offsets[e_idx] = total_valid_assignments;
-        const int count = h_expert_counts[e_idx];
-        if (count > 0) {
-          h_active_experts.push_back(e_idx);
-          h_active_counts.push_back(count);
+      if (model_120b) {
+        // 120B Model: Expert parallelism with communication
+        PROFILE_GPU_SCOPE("moe_expert_parallelism", 0);
+        
+        // Gather inputs for experts distributed across devices
+        float* d_gathered_inputs = nullptr;
+        int local_expert_count = g_comm_ctx.expert_dist.device_expert_count[device_id];
+        std::vector<int> gathered_counts(local_expert_count);
+        
+        {
+          PROFILE_GPU_SCOPE("gather_expert_inputs", 0);
+          gather_expert_inputs(g_comm_ctx,
+                              ctx.gpu_activations.d_t,
+                              ctx.gpu_activations.d_topk_i,
+                              ctx.gpu_activations.d_topk_v,
+                              batch_size, H, p->experts_per_token,
+                              &d_gathered_inputs, gathered_counts.data());
         }
-        total_valid_assignments += count;
-      }
-      h_expert_offsets[n_experts] = total_valid_assignments;
+        
+        // Process local experts (implementation depends on gathered inputs)
+        if (d_gathered_inputs) {
+          // Process local experts using standard MoE pipeline on gathered inputs
+          // This would use the existing MoE kernels but on the gathered data
+          // The implementation will be filled in the gather_expert_inputs function
+        }
+        
+        // Scatter expert outputs back to original devices
+        {
+          PROFILE_GPU_SCOPE("scatter_expert_outputs", 0);
+          // Prepare expert outputs array (this would be populated by local expert processing)
+          std::vector<const float*> d_expert_outputs(local_expert_count, nullptr);
+          
+          scatter_expert_outputs(g_comm_ctx, d_expert_outputs.data(), gathered_counts.data(), H,
+                                ctx.gpu_activations.d_e_agg);
+        }
+        
+      } else {
+        // Original behavior for non-120B models
+        HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_expert_counts, 0,
+                                 (size_t)n_experts * sizeof(int), 0));
 
-      HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_expert_offsets,
-                          h_expert_offsets.data(),
-                          (size_t)(n_experts + 1) * sizeof(int),
-                          hipMemcpyHostToDevice));
+        const int group_threads = 256;
+        const int group_blocks =
+            (total_assignments + group_threads - 1) / group_threads;
 
-      HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_expert_counts, 0,
-                               (size_t)n_experts * sizeof(int), 0));
+        {
+          PROFILE_GPU_SCOPE("moe_group_count", 0);
+          moe_count_assignments_kernel<<<group_blocks, group_threads, 0>>>(
+              ctx.gpu_activations.d_expert_counts,
+              ctx.gpu_activations.d_topk_i,
+              total_assignments, n_experts);
+        }
 
-      {
-        PROFILE_GPU_SCOPE("moe_group_scatter", 0);
-        moe_scatter_assignments_kernel<<<group_blocks, group_threads, 0>>>(
-            ctx.gpu_activations.d_expert_assignments,
-            ctx.gpu_activations.d_expert_counts,
-            ctx.gpu_activations.d_expert_offsets,
-            ctx.gpu_activations.d_topk_i,
-            total_assignments, n_experts);
-      }
+        std::vector<int> h_expert_counts(n_experts, 0);
+        HIP_CHECK(hipMemcpy(h_expert_counts.data(),
+                            ctx.gpu_activations.d_expert_counts,
+                            (size_t)n_experts * sizeof(int),
+                            hipMemcpyDeviceToHost));
 
-      const int num_active_experts = (int)h_active_experts.size();
-      const int num_assignments = total_valid_assignments;
+        std::vector<int> h_expert_offsets(n_experts + 1, 0);
+        std::vector<int> h_active_experts;
+        std::vector<int> h_active_counts;
+        h_active_experts.reserve(n_experts);
+        h_active_counts.reserve(n_experts);
 
-      if (num_assignments > 0 && num_active_experts > 0) {
-        // Build assignment -> expert-slot map so kernels can run over a flat list.
-        std::vector<int> h_assignment_active_slot(num_assignments, -1);
-        for (int slot = 0; slot < num_active_experts; ++slot) {
-          const int expert = h_active_experts[slot];
-          const int offset = h_expert_offsets[expert];
-          const int count = h_active_counts[slot];
-          for (int row = 0; row < count; ++row) {
-            h_assignment_active_slot[offset + row] = slot;
+        int total_valid_assignments = 0;
+        for (int e_idx = 0; e_idx < n_experts; ++e_idx) {
+          h_expert_offsets[e_idx] = total_valid_assignments;
+          const int count = h_expert_counts[e_idx];
+          if (count > 0) {
+            h_active_experts.push_back(e_idx);
+            h_active_counts.push_back(count);
           }
+          total_valid_assignments += count;
         }
+        h_expert_offsets[n_experts] = total_valid_assignments;
 
-        HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_active_experts,
-                            h_active_experts.data(),
-                            (size_t)num_active_experts * sizeof(int),
-                            hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_assignment_active_slot,
-                            h_assignment_active_slot.data(),
-                            (size_t)num_assignments * sizeof(int),
+        HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_expert_offsets,
+                            h_expert_offsets.data(),
+                            (size_t)(n_experts + 1) * sizeof(int),
                             hipMemcpyHostToDevice));
 
-        float *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
-        float *d_mlp1_raw = ctx.gpu_activations.d_mlp1_workspace;
-        float *d_mlp2_raw = ctx.gpu_activations.d_mlp2_workspace;
-        float *d_group_in = ctx.gpu_activations.d_moe_x_workspace;
+        HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_expert_counts, 0,
+                                 (size_t)n_experts * sizeof(int), 0));
 
         {
-          PROFILE_GPU_SCOPE("moe_gather_tokens", 0);
-          dim3 grid_gather((H + BLOCK_SIZE - 1) / BLOCK_SIZE,
-                           num_assignments, 1);
-          moe_gather_tokens_kernel<<<grid_gather, BLOCK_SIZE, 0>>>(
-              d_group_in, ctx.gpu_activations.d_t,
+          PROFILE_GPU_SCOPE("moe_group_scatter", 0);
+          moe_scatter_assignments_kernel<<<group_blocks, group_threads, 0>>>(
               ctx.gpu_activations.d_expert_assignments,
-              ctx.gpu_activations.d_assignment_active_slot,
-              ctx.gpu_activations.d_active_experts,
-              num_active_experts, num_assignments, H);
+              ctx.gpu_activations.d_expert_counts,
+              ctx.gpu_activations.d_expert_offsets,
+              ctx.gpu_activations.d_topk_i,
+              total_assignments, n_experts);
         }
 
-        {
-          PROFILE_GPU_SCOPE("moe_mlp1_gemm", 0);
-          dim3 grid_mlp1((2 * IM + TM - 1) / TM,
-                         num_assignments, 1);
-          moe_mlp1_matmul_bias_kernel<<<grid_mlp1, block, 0>>>(
-              d_mlp1_raw, d_group_in,
-              ctx.gpu_weights_bf16.d_w_mlp1_bf16,
-              ctx.gpu_expert_bias.g_b_mlp1,
-              ctx.gpu_activations.d_assignment_active_slot,
-              ctx.gpu_activations.d_active_experts,
-              l, E, H, IM, num_active_experts, num_assignments);
-        }
+        const int num_active_experts = (int)h_active_experts.size();
+        const int num_assignments = total_valid_assignments;
 
-        {
-          PROFILE_GPU_SCOPE("moe_swiglu", 0);
-          dim3 grid_swiglu((IM + BLOCK_SIZE - 1) / BLOCK_SIZE,
+        if (num_assignments > 0 && num_active_experts > 0) {
+          // Build assignment -> expert-slot map so kernels can run over a flat list.
+          std::vector<int> h_assignment_active_slot(num_assignments, -1);
+          for (int slot = 0; slot < num_active_experts; ++slot) {
+            const int expert = h_active_experts[slot];
+            const int offset = h_expert_offsets[expert];
+            const int count = h_active_counts[slot];
+            for (int row = 0; row < count; ++row) {
+              h_assignment_active_slot[offset + row] = slot;
+            }
+          }
+
+          HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_active_experts,
+                              h_active_experts.data(),
+                              (size_t)num_active_experts * sizeof(int),
+                              hipMemcpyHostToDevice));
+          HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_assignment_active_slot,
+                              h_assignment_active_slot.data(),
+                              (size_t)num_assignments * sizeof(int),
+                              hipMemcpyHostToDevice));
+
+          float *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
+          float *d_mlp1_raw = ctx.gpu_activations.d_mlp1_workspace;
+          float *d_mlp2_raw = ctx.gpu_activations.d_mlp2_workspace;
+          float *d_group_in = ctx.gpu_activations.d_moe_x_workspace;
+
+          {
+            PROFILE_GPU_SCOPE("moe_gather_tokens", 0);
+            dim3 grid_gather((H + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                             num_assignments, 1);
+            moe_gather_tokens_kernel<<<grid_gather, BLOCK_SIZE, 0>>>(
+                d_group_in, ctx.gpu_activations.d_t,
+                ctx.gpu_activations.d_expert_assignments,
+                ctx.gpu_activations.d_assignment_active_slot,
+                ctx.gpu_activations.d_active_experts,
+                num_active_experts, num_assignments, H);
+          }
+
+          {
+            PROFILE_GPU_SCOPE("moe_mlp1_gemm", 0);
+            dim3 grid_mlp1((2 * IM + TM - 1) / TM,
                            num_assignments, 1);
-          moe_swiglu_activation_kernel<<<grid_swiglu, BLOCK_SIZE, 0>>>(
-              d_gate_up_topk, d_mlp1_raw, p->swiglu_limit,
-              num_assignments, IM);
-        }
+            moe_mlp1_matmul_bias_kernel<<<grid_mlp1, block, 0>>>(
+                d_mlp1_raw, d_group_in,
+                ctx.gpu_weights_bf16.d_w_mlp1_bf16,
+                ctx.gpu_expert_bias.g_b_mlp1,
+                ctx.gpu_activations.d_assignment_active_slot,
+                ctx.gpu_activations.d_active_experts,
+                l, E, H, IM, num_active_experts, num_assignments);
+          }
 
-        {
-          PROFILE_GPU_SCOPE("moe_mlp2_gemm", 0);
-          dim3 grid_mlp2((H + TM - 1) / TM,
-                         num_assignments, 1);
-          moe_mlp2_matmul_bias_kernel<<<grid_mlp2, block, 0>>>(
-              d_mlp2_raw, d_gate_up_topk,
-              ctx.gpu_weights_bf16.d_w_mlp2_bf16,
-              ctx.gpu_expert_bias.g_b_mlp2,
-              ctx.gpu_activations.d_assignment_active_slot,
-              ctx.gpu_activations.d_active_experts,
-              l, E, IM, H, num_active_experts, num_assignments);
-        }
+          {
+            PROFILE_GPU_SCOPE("moe_swiglu", 0);
+            dim3 grid_swiglu((IM + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                             num_assignments, 1);
+            moe_swiglu_activation_kernel<<<grid_swiglu, BLOCK_SIZE, 0>>>(
+                d_gate_up_topk, d_mlp1_raw, p->swiglu_limit,
+                num_assignments, IM);
+          }
 
-        {
-          PROFILE_GPU_SCOPE("moe_weighted_accum", 0);
-          dim3 grid_accum((H + BLOCK_SIZE - 1) / BLOCK_SIZE,
-                          num_assignments, 1);
-          moe_weighted_accum_kernel<<<grid_accum, BLOCK_SIZE, 0>>>(
-              ctx.gpu_activations.d_e_agg,
-              d_mlp2_raw,
-              ctx.gpu_activations.d_topk_v,
-              ctx.gpu_activations.d_expert_assignments,
-              ctx.gpu_activations.d_assignment_active_slot,
-              num_active_experts, num_assignments, H);
+          {
+            PROFILE_GPU_SCOPE("moe_mlp2_gemm", 0);
+            dim3 grid_mlp2((H + TM - 1) / TM,
+                           num_assignments, 1);
+            moe_mlp2_matmul_bias_kernel<<<grid_mlp2, block, 0>>>(
+                d_mlp2_raw, d_gate_up_topk,
+                ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+                ctx.gpu_expert_bias.g_b_mlp2,
+                ctx.gpu_activations.d_assignment_active_slot,
+                ctx.gpu_activations.d_active_experts,
+                l, E, IM, H, num_active_experts, num_assignments);
+          }
+
+          {
+            PROFILE_GPU_SCOPE("moe_weighted_accum", 0);
+            dim3 grid_accum((H + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                            num_assignments, 1);
+            moe_weighted_accum_kernel<<<grid_accum, BLOCK_SIZE, 0>>>(
+                ctx.gpu_activations.d_e_agg,
+                d_mlp2_raw,
+                ctx.gpu_activations.d_topk_v,
+                ctx.gpu_activations.d_expert_assignments,
+                ctx.gpu_activations.d_assignment_active_slot,
+                num_active_experts, num_assignments, H);
+          }
         }
       }
     }
