@@ -7,7 +7,6 @@ CFLAGS += --offload-arch=gfx90a
 endif
 
 CPP_FILES = run.cpp tokenizer.cpp
-PROFILER_FILES = getp-csrc/profiler/profiler.cpp
 
 # Basic build that should work on most systems.
 .PHONY: run
@@ -31,13 +30,6 @@ runfast: $(CPP_FILES) tokenizer-bin
 .PHONY: runomp
 runomp: $(CPP_FILES) tokenizer-bin
 	$(CC) $(CFLAGS) -O3 -fopenmp -march=native $(CPP_FILES) -o run
-
-# Build with OpenMP and profiling enabled.
-# Usage: make runprof
-# Shows detailed timing of all GPU kernels and CPU functions at the end
-.PHONY: runprof
-runprof: $(CPP_FILES) tokenizer-bin
-	$(CC) $(CFLAGS) -O3 -fopenmp -march=native -DENABLE_PROFILING $(CPP_FILES) -o run
 
 # Build the 'decode' utility.
 .PHONY: decode
