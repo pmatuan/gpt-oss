@@ -61,11 +61,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
                       L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
 
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_cos_vals, (D / 2) * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_sin_vals, (D / 2) * sizeof(float)));
-
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_token2row, S * sizeof(int)));
   {
     int *h_token2row = (int *)malloc(S * sizeof(int));
@@ -217,8 +212,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_logits));
   if (ctx.gpu_activations.d_inv_rms)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_cos_vals));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_sin_vals));
   if (ctx.gpu_activations.d_token2row)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_token2row));
   if (ctx.gpu_activations.d_tokens)

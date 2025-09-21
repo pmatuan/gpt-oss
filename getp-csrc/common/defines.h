@@ -45,7 +45,6 @@ struct GPUActivationBuffers {
   float *d_qkv, *d_q;
   bf16_t *d_key_cache, *d_value_cache;
   float *d_logits;
-  float *d_cos_vals, *d_sin_vals;
   int *d_token2row;
   int *d_tokens;
   int *d_pos;
