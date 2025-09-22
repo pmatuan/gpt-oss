@@ -52,6 +52,10 @@ __global__ void fused_topk_softmax_batch_kernel(
     float *topk_v, int *topk_i, const float *scores, int E, int K,
     int batch_size, const int *pos);
 
+__global__ void argmax_batch_kernel(const float *logits, int *out_indices,
+                                    int vocab_size, int batch_size,
+                                    const int *pos);
+
 // Data Type Conversion Utilities
 void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
                                int n_streams, size_t chunk_bytes);

@@ -72,8 +72,9 @@ static void init_device_context_pp(DeviceContext &ctx, int device_id,
   HIP_CHECK(
     hipMalloc(&ctx.gpu_activations.d_key_cache, (size_t)local_L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
-            (size_t)local_L * S * KV * sizeof(bf16_t)));
+                      (size_t)local_L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens, sizeof(int)));
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_token2row, S * sizeof(int)));
   {
@@ -244,6 +245,7 @@ static inline void ensure_device_capacity_pp(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_key_cache);
     FREE_IF(ctx.gpu_activations.d_value_cache);
     FREE_IF(ctx.gpu_activations.d_logits);
+    FREE_IF(ctx.gpu_activations.d_next_tokens);
   // mask & token2row remain shared
   #undef FREE_IF
 
@@ -279,6 +281,8 @@ static inline void ensure_device_capacity_pp(DeviceContext &ctx, int B) {
     // Auxiliary buffers
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
                         (size_t)B * V * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens,
+                        (size_t)B * sizeof(int)));
 
     ctx.capacity_B = B;
   }
@@ -332,12 +336,12 @@ static inline void ensure_device_capacity_pp(DeviceContext &ctx, int B) {
     ctx.n_streams = B;
 }
 
-static float *gpu_forward_device_batch_pp(Transformer *transformer,
-                                       const int *tokens, const int *pos,
-                                       int batch_size, int device_id,
-                                       int max_pos_in_batch,
-                                       int b_base,
-                                       hipStream_t stream) {
+static float *gpu_forward_device_batch_pp_logits(Transformer *transformer,
+                                              const int *tokens, const int *pos,
+                                              int batch_size, int device_id,
+                                              int max_pos_in_batch,
+                                              int b_base,
+                                              hipStream_t stream) {
   DeviceContext &ctx = g_devices[device_id];
   HIP_CHECK(hipSetDevice(device_id));
 
@@ -667,6 +671,40 @@ static float *gpu_forward_device_batch_pp(Transformer *transformer,
   }
 }
 
+static int *gpu_forward_device_batch_pp_tokens(Transformer *transformer,
+                                               const int *tokens,
+                                               const int *pos, int batch_size,
+                                               int device_id,
+                                               int max_pos_in_batch,
+                                               int b_base,
+                                               hipStream_t stream) {
+  float *d_logits = gpu_forward_device_batch_pp_logits(
+      transformer, tokens, pos, batch_size, device_id, max_pos_in_batch,
+      b_base, stream);
+
+  if (device_id != g_num_devices - 1)
+    return nullptr;
+
+  DeviceContext &ctx = g_devices[device_id];
+  HIP_CHECK(hipSetDevice(device_id));
+
+  if (batch_size <= 0)
+    return ctx.gpu_activations.d_next_tokens + (size_t)b_base;
+
+  const int vocab_size = model_config->vocab_size;
+  const int threads = 256;
+  dim3 grid(batch_size, 1, 1);
+  dim3 block(threads, 1, 1);
+  size_t shared_bytes = (size_t)threads * (sizeof(float) + sizeof(int));
+
+  argmax_batch_kernel<<<grid, block, shared_bytes, stream>>>(
+      d_logits, ctx.gpu_activations.d_next_tokens + (size_t)b_base, vocab_size,
+      batch_size, ctx.gpu_activations.d_pos + b_base);
+  HIP_CHECK(hipGetLastError());
+
+  return ctx.gpu_activations.d_next_tokens + (size_t)b_base;
+}
+
 static long long run_requests_pipeline(Transformer *transformer,
                                        Tokenizer *tokenizer, PromptCtx *ctxs,
                                        int num_ctxs) {
@@ -686,10 +724,9 @@ static long long run_requests_pipeline(Transformer *transformer,
     ensure_device_capacity_pp(g_devices[dev], B);
   }
   const Config *p = model_config;
-  const int V = p->vocab_size;
-  // Temporary host buffer for batched logits (from last stage) - pinned for async D2H
-  float *h_logits_batch = nullptr;
-  HIP_CHECK(hipHostMalloc((void **)&h_logits_batch, (size_t)B * V * sizeof(float)));
+  // Temporary host buffer for next tokens (from last stage) - pinned for async D2H
+  int *h_next_batch = nullptr;
+  HIP_CHECK(hipHostMalloc((void **)&h_next_batch, (size_t)B * sizeof(int)));
 
   int maxM = std::min(g_num_devices, B);
   int target_bs = 4;
@@ -719,7 +756,7 @@ static long long run_requests_pipeline(Transformer *transformer,
   std::vector<hipStream_t> p2p_streams(g_num_devices);
   std::vector<std::vector<hipEvent_t>> ev_compute_done(g_num_devices, std::vector<hipEvent_t>(M));
   std::vector<std::vector<hipEvent_t>> ev_copy_done(std::max(0, g_num_devices - 1), std::vector<hipEvent_t>(M));
-  std::vector<hipEvent_t> ev_logits_ready(M);
+  std::vector<hipEvent_t> ev_tokens_ready(M);
 
   for (int dev = 0; dev < g_num_devices; ++dev) {
     HIP_CHECK(hipSetDevice(dev));
@@ -737,7 +774,7 @@ static long long run_requests_pipeline(Transformer *transformer,
   if (g_num_devices > 0) {
     HIP_CHECK(hipSetDevice(g_num_devices - 1));
     for (int m = 0; m < M; ++m) {
-      HIP_CHECK(hipEventCreateWithFlags(&ev_logits_ready[m], hipEventDisableTiming));
+      HIP_CHECK(hipEventCreateWithFlags(&ev_tokens_ready[m], hipEventDisableTiming));
     }
   }
 
@@ -785,11 +822,11 @@ static long long run_requests_pipeline(Transformer *transformer,
         }
 
         HIP_CHECK(hipSetDevice(s));
-        float *d_log = gpu_forward_device_batch_pp(transformer,
-                                                h_tokens.data() + base,
-                                                h_pos.data() + base,
-                                                bs, s, mmax, base,
-                                                compute_streams[s]);
+        int *d_next = gpu_forward_device_batch_pp_tokens(transformer,
+                                                         h_tokens.data() + base,
+                                                         h_pos.data() + base,
+                                                         bs, s, mmax, base,
+                                                         compute_streams[s]);
         // Mark compute done for this stage & micro-batch
         HIP_CHECK(hipEventRecord(ev_compute_done[s][m], compute_streams[s]));
         if (s < g_num_devices - 1) {
@@ -814,22 +851,24 @@ static long long run_requests_pipeline(Transformer *transformer,
           // Last stage: D2H copy logits after compute done
           HIP_CHECK(hipSetDevice(s));
           HIP_CHECK(hipStreamWaitEvent(p2p_streams[s], ev_compute_done[s][m], 0));
-          HIP_CHECK(hipMemcpyAsync(&h_logits_batch[(size_t)base * V], d_log,
-                                   (size_t)bs * V * sizeof(float),
-                                   hipMemcpyDeviceToHost, p2p_streams[s]));
-          HIP_CHECK(hipEventRecord(ev_logits_ready[m], p2p_streams[s]));
+          if (d_next) {
+            HIP_CHECK(hipMemcpyAsync(&h_next_batch[base], d_next,
+                                     (size_t)bs * sizeof(int),
+                                     hipMemcpyDeviceToHost, p2p_streams[s]));
+          }
+          HIP_CHECK(hipEventRecord(ev_tokens_ready[m], p2p_streams[s]));
         }
       }
     }
 
-    // Wait per micro-batch for logits and advance contexts for its samples immediately
+    // Wait per micro-batch for next-token results and advance contexts immediately
     if (g_num_devices > 0) {
       HIP_CHECK(hipSetDevice(g_num_devices - 1));
       for (int m = 0; m < M; ++m) {
         const int base = mb_start[m];
         const int bs = mb_size[m];
         if (bs <= 0) continue;
-        HIP_CHECK(hipEventSynchronize(ev_logits_ready[m]));
+        HIP_CHECK(hipEventSynchronize(ev_tokens_ready[m]));
 
         // Process only samples in this micro-batch
         for (int j = 0; j < bs; ++j) {
@@ -838,10 +877,6 @@ static long long run_requests_pipeline(Transformer *transformer,
             continue;
           PromptCtx &ctx = ctxs[i];
 
-          // Copy logits for this sample into ctx.h_logits
-          memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V],
-                 (size_t)V * sizeof(float));
-
           ctx.pos++;
           h_pos[i] = ctx.pos;
           int next;
@@ -849,7 +884,7 @@ static long long run_requests_pipeline(Transformer *transformer,
             next = ctx.prompt_tokens[ctx.pos];
           } else {
             ctx.is_context_phase = false;
-            next = sample(ctx.sampler, ctx.h_logits);
+            next = h_next_batch[i];
             ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
             ctx.num_generated++;
           }
@@ -903,9 +938,14 @@ static long long run_requests_pipeline(Transformer *transformer,
   }
   if (g_num_devices > 0) {
     HIP_CHECK(hipSetDevice(g_num_devices - 1));
-    for (int m = 0; m < (int)ev_logits_ready.size(); ++m) {
-      HIP_CHECK(hipEventDestroy(ev_logits_ready[m]));
+    for (int m = 0; m < (int)ev_tokens_ready.size(); ++m) {
+      HIP_CHECK(hipEventDestroy(ev_tokens_ready[m]));
     }
+  }
+
+  // Free pinned host buffer
+  if (h_next_batch) {
+    HIP_CHECK(hipHostFree(h_next_batch));
   }
 
   return total_tokens;

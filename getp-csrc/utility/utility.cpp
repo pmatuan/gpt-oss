@@ -372,6 +372,56 @@ __global__ void fused_topk_softmax_batch_kernel(
   }
 }
 
+__global__ void argmax_batch_kernel(const float *logits, int *out_indices,
+                                    int vocab_size, int batch_size,
+                                    const int *pos) {
+  const int b = blockIdx.x;
+  if (b >= batch_size)
+    return;
+  if (pos && pos[b] < 0) {
+    if (threadIdx.x == 0)
+      out_indices[b] = -1;
+    return;
+  }
+
+  const float *row = logits + (size_t)b * vocab_size;
+  const int tid = threadIdx.x;
+
+  float local_max = -INFINITY;
+  int local_idx = -1;
+  for (int idx = tid; idx < vocab_size; idx += blockDim.x) {
+    float val = row[idx];
+    if (val > local_max) {
+      local_max = val;
+      local_idx = idx;
+    }
+  }
+
+  extern __shared__ unsigned char smem_argmax[];
+  float *s_vals = reinterpret_cast<float *>(smem_argmax);
+  int *s_idx = reinterpret_cast<int *>(s_vals + blockDim.x);
+  s_vals[tid] = local_max;
+  s_idx[tid] = local_idx;
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      float other_val = s_vals[tid + offset];
+      int other_idx = s_idx[tid + offset];
+      if (other_val > s_vals[tid] ||
+          (other_val == s_vals[tid] && other_idx < s_idx[tid])) {
+        s_vals[tid] = other_val;
+        s_idx[tid] = other_idx;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    out_indices[b] = s_idx[0];
+  }
+}
+
 void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
                                int n_streams, size_t chunk_bytes) {
   if (n == 0)
