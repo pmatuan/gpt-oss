@@ -4,13 +4,6 @@
 #include <math.h>
 
 
-__device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
-  union { uint32_t u; float f; } cvt;
-  cvt.u = ((uint32_t)bits) << 16;
-  return cvt.f;
-}
-
-
 // x:[B,n], w:[d,n], y:[B,d]
 __global__ __launch_bounds__(64, 2)
 void matmul_bias_gemm_kernel_bf16_mfma(

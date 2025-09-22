@@ -1,5 +1,6 @@
 #include "pipeline.cpp"
 #include "utility/utility.h"
+#include "matmul/matmul.cpp"
 #include <math.h>
 #include <mutex>
 #include <omp.h>
