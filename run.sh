@@ -1,0 +1,1 @@
+srun --gres=gpu:8 ./run "${MODELBIN_ROOT}/gpt-oss-120b.bin" -m getp -i data/input.txt -o data/output120b.txt

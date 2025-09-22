@@ -1,0 +1,42 @@
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 32
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 24
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 2048
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+requests size = 67174400 B
+Num requests: 256
+Found 2 HIP devices, initializing multi-GPU setup...
+Initializing device 0 (layers [0, 12))...
+[DEVICE] 0 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+Initializing device 1 (layers [12, 24))...
+[DEVICE] 1 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 0 [HIP] after activations: HBM free 63.71 GiB / total 63.98 GiB (used 0.28 GiB)
+[DEVICE] 0 [HIP] after small FP32 weights: HBM free 63.70 GiB / total 63.98 GiB (used 0.29 GiB)
+[DEVICE] 0 [HIP] after expert biases: HBM free 63.68 GiB / total 63.98 GiB (used 0.30 GiB)
+[DEVICE] 1 [HIP] after activations: HBM free 63.71 GiB / total 63.98 GiB (used 0.28 GiB)
+[DEVICE] 1 [HIP] after small FP32 weights: HBM free 63.70 GiB / total 63.98 GiB (used 0.29 GiB)
+[DEVICE] 1 [HIP] after expert biases: HBM free 63.68 GiB / total 63.98 GiB (used 0.30 GiB)
+[DEVICE] 0 [HIP] after large BF16 weights (model loaded): HBM free 43.12 GiB / total 63.98 GiB (used 20.86 GiB)
+[DEVICE] 1 [HIP] after large BF16 weights (model loaded): HBM free 43.12 GiB / total 63.98 GiB (used 20.86 GiB)
+Multi-GPU initialization complete!
+
+warm up elapsed time(s): 11.048000
+Processing 256 requests across 2 GPUs...
+num experts: 32, experts per token: 4
+Using pipeline parallelism for MoE with 32 experts
+[MB] Micro-batching enabled: M=2, micro_bs=128, B=256, devices=2
+Multi-GPU inference completed. Total tokens generated: 245416
+
+elapsed time(s): 892.746000, achieved throughput TPS (tok/s): 274.900140
+
+finish elapsed time(s): 0.071000

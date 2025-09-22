@@ -87,6 +87,12 @@ struct DeviceContext {
   int capacity_B = 1;
   hipStream_t *streams = nullptr;
   int n_streams = 0;
+
+  // Reusable MoE routing buffers (allocated per capacity_B)
+  int *d_expert_counts = nullptr;   // size E
+  int *d_expert_offsets = nullptr;  // size E+1
+  int *d_assignment_batches = nullptr; // size capacity_B * experts_per_token
+  int *d_assignment_slots = nullptr;   // size capacity_B * experts_per_token
 };
 
 // Prompt Context Structure
