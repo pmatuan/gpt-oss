@@ -4,6 +4,9 @@
 #include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <vector>
+#include <algorithm>
+#include <cstring>
 
 void debug_print_gpu_memory(const char *tag, int device_id) {
   size_t free_b = 0, total_b = 0;
@@ -561,4 +564,70 @@ void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
   free(pinned_chunks);
   free(events);
   free(streams);
+}
+
+size_t matmul_packed_elems(int rows, int cols) {
+  if (rows <= 0 || cols <= 0)
+    return 0;
+  const size_t tiles_cols =
+      ((size_t)rows + MATMUL_TILE_COLS - 1) / MATMUL_TILE_COLS;
+  const size_t tiles_k =
+      ((size_t)cols + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
+  return tiles_cols * tiles_k * (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
+}
+
+void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
+                              bf16_t *dst) {
+  if (!src || !dst || rows <= 0 || cols <= 0)
+    return;
+
+  const size_t tiles_cols =
+      ((size_t)rows + MATMUL_TILE_COLS - 1) / MATMUL_TILE_COLS;
+  const size_t tiles_k =
+      ((size_t)cols + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
+  const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
+  const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
+
+  std::vector<bf16_t> tile(tile_elems, bf16_t(0.0f));
+
+  for (size_t tile_col = 0; tile_col < tiles_cols; ++tile_col) {
+    const int col_base = (int)(tile_col * MATMUL_TILE_COLS);
+    const int col_block = std::min(rows - col_base, MATMUL_TILE_COLS);
+
+    for (size_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
+      const int k_base = (int)(tile_k * MATMUL_TILE_K);
+      const int k_block = std::min(cols - k_base, MATMUL_TILE_K);
+
+      std::fill(tile.begin(), tile.end(), bf16_t(0.0f));
+
+      if (col_block > 0 && k_block > 0) {
+        for (int group = 0; group < MATMUL_TILE_K; group += MATMUL_CHUNK_K) {
+          const int k_off = k_base + group;
+          const int remaining = k_block - group;
+          if (remaining <= 0)
+            break;
+          const int actual_chunk = remaining > MATMUL_CHUNK_K ? MATMUL_CHUNK_K
+                                                               : remaining;
+          const size_t group_base =
+              (size_t)(group / MATMUL_CHUNK_K) * group_stride;
+
+          for (int col = 0; col < col_block; ++col) {
+            const float *src_row =
+                src + (size_t)(col_base + col) * cols + k_off;
+            const size_t dst_base =
+                group_base + (size_t)col * MATMUL_CHUNK_K;
+
+            for (int i = 0; i < actual_chunk; ++i) {
+              tile[dst_base + i] = hip_bfloat16(src_row[i]);
+            }
+          }
+        }
+      }
+
+      const size_t tile_offset =
+          (tile_col * tiles_k + tile_k) * tile_elems;
+      std::memcpy(dst + tile_offset, tile.data(),
+                  tile_elems * sizeof(bf16_t));
+    }
+  }
 }

@@ -24,6 +24,9 @@ typedef hip_bfloat16 bf16_t;
 #define MLP1_TILE_IM 8
 #define MLP2_TILE_TOKENS 8
 #define MLP2_TILE_H 8
+#define MATMUL_TILE_COLS 32
+#define MATMUL_TILE_K 16
+#define MATMUL_CHUNK_K 4
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
@@ -88,6 +91,11 @@ struct DeviceContext {
   int capacity_B = 1;
   hipStream_t *streams = nullptr;
   int n_streams = 0;
+  size_t stride_w_qkv_bf16 = 0;
+  size_t stride_w_o_bf16 = 0;
+  size_t stride_w_out_bf16 = 0;
+  size_t stride_w_mlp1_bf16 = 0;
+  size_t stride_w_mlp2_bf16 = 0;
 };
 
 // Prompt Context Structure

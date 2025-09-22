@@ -58,6 +58,10 @@ __global__ void argmax_batch_kernel(const float *logits, int *out_indices,
 
 // Data Type Conversion Utilities
 void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
-                               int n_streams, size_t chunk_bytes);
+                              int n_streams, size_t chunk_bytes);
+
+size_t matmul_packed_elems(int rows, int cols);
+void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
+                              bf16_t *dst);
 
 #endif // GETP_UTILITY_H
