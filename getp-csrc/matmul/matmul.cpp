@@ -4,6 +4,13 @@
 #include <math.h>
 
 
+__device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
+  union { uint32_t u; float f; } cvt;
+  cvt.u = ((uint32_t)bits) << 16;
+  return cvt.f;
+}
+
+
 // x:[B,n], w:[d,n], y:[B,d]
 __global__ void matmul_bias_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
@@ -172,205 +179,220 @@ __global__ void matmul_bias_gemm_kernel_float(
   }
 }
 
-// ================= MLP1 (Gate & Up) : per-batch, no CB =================
+__global__ void count_expert_assignments_kernel(
+    int* __restrict__ counts,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    int batch_size,
+    int experts_per_token,
+    int E)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * experts_per_token;
+  if (idx >= total) return;
+
+  const int batch_idx = idx / experts_per_token;
+  if (pos && pos[batch_idx] < 0) return;
+
+  const int expert = topk_i[idx];
+  if (expert < 0 || expert >= E) return;
+
+  atomicAdd(counts + expert, 1);
+}
+
+__global__ void build_expert_assignments_kernel(
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ expert_offsets,
+    int* __restrict__ expert_counters,
+    int* __restrict__ assignment_batches,
+    int* __restrict__ assignment_slots,
+    int batch_size,
+    int experts_per_token,
+    int E)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * experts_per_token;
+  if (idx >= total) return;
+
+  const int batch_idx = idx / experts_per_token;
+  if (pos && pos[batch_idx] < 0) return;
+
+  const int expert = topk_i[idx];
+  if (expert < 0 || expert >= E) return;
+
+  const int slot = idx % experts_per_token;
+  const int offset = atomicAdd(expert_counters + expert, 1);
+  const int write_idx = expert_offsets[expert] + offset;
+
+  assignment_batches[write_idx] = batch_idx;
+  assignment_slots[write_idx] = slot;
+}
+
+// ================= MLP1 (Gate & Up) : batched per expert =================
 __global__ void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up_topk, // [K, B, IM] (K = EXPERT_PER_TOKEN)
-    const float* __restrict__ x,      // [B, H]
-    const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
-    const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
-    const int* __restrict__ topk_i,   // [B, K]
+    float* __restrict__ gate_up_topk,
+    const float* __restrict__ x,
+    const bf16_t* __restrict__ w_mlp1_all,
+    const float* __restrict__ b_mlp1_all,
+    const int* __restrict__ assignment_batches,
+    const int* __restrict__ assignment_slots,
+    const int* __restrict__ expert_offsets,
     int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size,
     const int *pos)
 {
-  const int batch_idx = blockIdx.y;
-  if (batch_idx >= batch_size) return;
+  const int expert_id = blockIdx.z;
+  const int start = expert_offsets[expert_id];
+  const int end = expert_offsets[expert_id + 1];
+  const int count = end - start;
+  if (count <= 0) return;
+
+  const int tile_start_token = blockIdx.y * MLP1_TILE_TOKENS;
+  if (tile_start_token >= count) return;
+  const int tile_rows = min(MLP1_TILE_TOKENS, count - tile_start_token);
+
+  const int tile_start_im = blockIdx.x * MLP1_TILE_IM;
+  if (tile_start_im >= IM) return;
+  const int tile_cols = min(MLP1_TILE_IM, IM - tile_start_im);
+
+  const int local_im = threadIdx.x;
+  const int local_token = threadIdx.y;
+
+  if (local_im >= tile_cols || local_token >= tile_rows) return;
+
+  const int assignment_idx = start + tile_start_token + local_token;
+  const int batch_idx = assignment_batches[assignment_idx];
+  const int slot = assignment_slots[assignment_idx];
+  if (batch_idx < 0 || slot < 0) return;
   if (pos && pos[batch_idx] < 0) return;
 
-  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
-  int expert_id;
+  const int im_idx = tile_start_im + local_im;
 
-  const int tid  = threadIdx.x;
-  const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;          // warp id in block
+  const size_t base_2im = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)(2 * IM);
+  const size_t gate_row_off = ((size_t)(2 * im_idx + 0)) * (size_t)H;
+  const size_t up_row_off   = ((size_t)(2 * im_idx + 1)) * (size_t)H;
 
-  const int i    = blockIdx.x * TM + wid;   // output row in IM (0..IM-1)
-  const int kidx = blockIdx.z;              // expert index per token
+  const bf16_t* __restrict__ w_gate = w_mlp1_all + (base_2im * (size_t)H) + gate_row_off;
+  const bf16_t* __restrict__ w_up   = w_mlp1_all + (base_2im * (size_t)H) + up_row_off;
+  const float* __restrict__ x_row   = x + (size_t)batch_idx * (size_t)H;
 
-  if (wid >= TM || i >= IM || kidx >= EXPERT_PER_TOKEN)
-    return;
+  float acc_gate = 0.0f;
+  float acc_up   = 0.0f;
 
-  // Load expert ID for current batch
-  expert_id = topk_i[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
-  if (expert_id < 0) return;
+  const int vec_limit = H & ~3;
+  const int vec_count = vec_limit >> 2;
+  const float4* __restrict__ x4 = reinterpret_cast<const float4*>(x_row);
+  const uint2* __restrict__ w_gate4 = reinterpret_cast<const uint2*>(w_gate);
+  const uint2* __restrict__ w_up4   = reinterpret_cast<const uint2*>(w_up);
 
-  float acc_gate = 0.f, acc_up = 0.f;
+  #pragma unroll
+  for (int v = 0; v < vec_count; ++v) {
+    const float4 xv = x4[v];
+    const float4 gv = bf16quad_to_float4(w_gate4[v]);
+    const float4 uv = bf16quad_to_float4(w_up4[v]);
+    acc_gate = fmaf(gv.x, xv.x, acc_gate);
+    acc_gate = fmaf(gv.y, xv.y, acc_gate);
+    acc_gate = fmaf(gv.z, xv.z, acc_gate);
+    acc_gate = fmaf(gv.w, xv.w, acc_gate);
 
-  // K loop over H, loading x for current batch
-  for (int k_base = 0; k_base < H; k_base += TK) {
-    const int k_size = min(TK, H - k_base);
-
-    // Load X for current batch
-    const float* __restrict__ xb = x + (size_t)batch_idx * H + k_base;
-    // vec4 part
-    const int vec4 = (k_size >> 2);
-    float4* __restrict__ s4 = reinterpret_cast<float4*>(lds_x);
-    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xb);
-    for (int v = tid; v < vec4; v += BLOCK_SIZE) { s4[v] = x4[v]; }
-    // tail
-    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE) {
-      lds_x[k] = xb[k];
-    }
-    __syncthreads();
-
-    // Compute for current batch
-    // weights layout:
-    // base = ((l * E + expert) * (2*IM)) * H + (2*i + {0,1}) * H + k_base
-    const size_t base_2im = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)(2 * IM);
-    const size_t gate_off = ((base_2im + (size_t)(2 * i + 0)) * (size_t)H) + (size_t)k_base;
-    const size_t up_off   = ((base_2im + (size_t)(2 * i + 1)) * (size_t)H) + (size_t)k_base;
-
-    const uint2* __restrict__ gate_q = reinterpret_cast<const uint2*>(w_mlp1_all + gate_off);
-    const uint2* __restrict__  up_q  = reinterpret_cast<const uint2*>(w_mlp1_all + up_off);
-
-    // vector compute (4 bf16 weights at a time)
-    const int vec4k = (k_size >> 2);
-    for (int v = lane; v < vec4k; v += WF_SIZE) {
-      const float4 w_gate = bf16quad_to_float4(gate_q[v]);
-      const float4 w_up   = bf16quad_to_float4(up_q[v]);
-      const float4 xv     = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
-      acc_gate = fmaf(w_gate.x, xv.x, acc_gate);
-      acc_gate = fmaf(w_gate.y, xv.y, acc_gate);
-      acc_gate = fmaf(w_gate.z, xv.z, acc_gate);
-      acc_gate = fmaf(w_gate.w, xv.w, acc_gate);
-
-      acc_up = fmaf(w_up.x, xv.x, acc_up);
-      acc_up = fmaf(w_up.y, xv.y, acc_up);
-      acc_up = fmaf(w_up.z, xv.z, acc_up);
-      acc_up = fmaf(w_up.w, xv.w, acc_up);
-    }
-    // tail pairs/singles
-    const int tail_start = vec4k << 2;
-    for (int k = tail_start + lane; k < k_size; k += WF_SIZE) {
-      // bf16 -> f32 (single)
-      uint32_t ug = ((uint32_t)(*reinterpret_cast<const uint16_t*>(
-                        (w_mlp1_all + gate_off + k)))) << 16;
-      uint32_t uu = ((uint32_t)(*reinterpret_cast<const uint16_t*>(
-                        (w_mlp1_all + up_off   + k)))) << 16;
-      union { uint32_t u; float f; } cg, cu; cg.u = ug; cu.u = uu;
-      acc_gate = fmaf(cg.f, lds_x[k], acc_gate);
-      acc_up   = fmaf(cu.f, lds_x[k], acc_up);
-    }
-    __syncthreads();
+    acc_up = fmaf(uv.x, xv.x, acc_up);
+    acc_up = fmaf(uv.y, xv.y, acc_up);
+    acc_up = fmaf(uv.z, xv.z, acc_up);
+    acc_up = fmaf(uv.w, xv.w, acc_up);
   }
 
-  // warp reduce and output for current batch
-  float gate_sum = warp_reduce_sum(acc_gate);
-  float up_sum   = warp_reduce_sum(acc_up);
+  const uint16_t* __restrict__ w_gate_u16 = reinterpret_cast<const uint16_t*>(w_gate);
+  const uint16_t* __restrict__ w_up_u16   = reinterpret_cast<const uint16_t*>(w_up);
 
-  if (lane == 0) {
-    const size_t b_gate_base = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)(2 * IM);
-    float gate = gate_sum + b_mlp1_all[b_gate_base + (size_t)(2 * i + 0)];
-    float up   = up_sum   + b_mlp1_all[b_gate_base + (size_t)(2 * i + 1)];
-
-    // clip + SwiGLU-ish (như bản bạn đang dùng)
-    gate = __saturatef((gate + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
-    up   = __saturatef((up   + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
-    const float alpha = 1.702f;
-    gate = gate * __saturatef(0.5f + 0.5f * tanhf(alpha * gate * 0.5f));
-    gate = gate * (up + 1.0f);
-
-    float* __restrict__ gu = gate_up_topk + (((size_t)kidx * (size_t)batch_size + (size_t)batch_idx) * (size_t)IM);
-    gu[i] = gate;
+  for (int k = vec_limit; k < H; ++k) {
+    const float xv = x_row[k];
+    acc_gate = fmaf(bf16_bits_to_float(w_gate_u16[k]), xv, acc_gate);
+    acc_up   = fmaf(bf16_bits_to_float(w_up_u16[k]), xv, acc_up);
   }
+
+  const float* __restrict__ b_base = b_mlp1_all + base_2im;
+  float gate_val = acc_gate + b_base[2 * im_idx + 0];
+  float up_val   = acc_up   + b_base[2 * im_idx + 1];
+
+  gate_val = __saturatef((gate_val + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
+  up_val   = __saturatef((up_val   + swiglu_limit) / (2.0f * swiglu_limit)) * (2.0f * swiglu_limit) - swiglu_limit;
+  const float alpha = 1.702f;
+  const float gate_act = gate_val * __saturatef(0.5f + 0.5f * tanhf(alpha * gate_val * 0.5f));
+  const float final_gate = gate_act * (up_val + 1.0f);
+
+  float* __restrict__ gu = gate_up_topk + (((size_t)slot * (size_t)batch_size + (size_t)batch_idx) * (size_t)IM);
+  gu[im_idx] = final_gate;
 }
 
 
-// ============ MLP2 (weighted accum) : per-batch, no CB ==============
+// ============ MLP2 (weighted accum) : batched per expert ==============
 __global__ void mlp2_bias_weighted_accum_gemm_kernel(
-    float* __restrict__ e_agg,              // [B, H] (accumulator)
-    const float* __restrict__ gate_up_topk, // [K, B, IM]
-    const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
-    const float* __restrict__ b_mlp2_all,   // [L, E, H]
-    const int* __restrict__ topk_i,         // [B, K]
-    const float* __restrict__ topk_v,       // [B, K]
+    float* __restrict__ e_agg,
+    const float* __restrict__ gate_up_topk,
+    const bf16_t* __restrict__ w_mlp2_all,
+    const float* __restrict__ b_mlp2_all,
+    const int* __restrict__ assignment_batches,
+    const int* __restrict__ assignment_slots,
+    const int* __restrict__ expert_offsets,
+    const float* __restrict__ topk_v,
     int l_layer, int E, int IM, int H,
     int batch_size, const int *pos)
 {
-  const int batch_idx = blockIdx.y;
-  if (batch_idx >= batch_size) return;
+  const int expert_id = blockIdx.z;
+  const int start = expert_offsets[expert_id];
+  const int end = expert_offsets[expert_id + 1];
+  const int count = end - start;
+  if (count <= 0) return;
+
+  const int tile_start_token = blockIdx.y * MLP2_TILE_TOKENS;
+  if (tile_start_token >= count) return;
+  const int tile_rows = min(MLP2_TILE_TOKENS, count - tile_start_token);
+
+  const int tile_start_h = blockIdx.x * MLP2_TILE_H;
+  if (tile_start_h >= H) return;
+  const int tile_cols = min(MLP2_TILE_H, H - tile_start_h);
+
+  const int local_h = threadIdx.x;
+  const int local_token = threadIdx.y;
+  if (local_h >= tile_cols || local_token >= tile_rows) return;
+
+  const int assignment_idx = start + tile_start_token + local_token;
+  const int batch_idx = assignment_batches[assignment_idx];
+  const int slot = assignment_slots[assignment_idx];
+  if (batch_idx < 0 || slot < 0) return;
   if (pos && pos[batch_idx] < 0) return;
 
-  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
-  int expert_id;
-  float expert_w;
+  const int h_idx = tile_start_h + local_h;
+  const float expert_weight = topk_v[(size_t)batch_idx * (size_t)EXPERT_PER_TOKEN + slot];
+  if (expert_weight == 0.0f) return;
 
-  const int tid  = threadIdx.x;
-  const int lane = tid & (WF_SIZE - 1);
-  const int wid  = tid >> 6;
+  const float* __restrict__ gate_vec = gate_up_topk + (((size_t)slot * (size_t)batch_size + (size_t)batch_idx) * (size_t)IM);
+  const size_t base = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)H;
+  const bf16_t* __restrict__ w_row = w_mlp2_all + (base + (size_t)h_idx) * (size_t)IM;
 
-  const int row  = blockIdx.x * TM + wid;   // output H row
-  const int kidx = blockIdx.z;              // expert index per token
+  float acc = 0.0f;
+  const int vec_limit = IM & ~3;
+  const int vec_count = vec_limit >> 2;
+  const float4* __restrict__ gate4 = reinterpret_cast<const float4*>(gate_vec);
+  const uint2* __restrict__ w_row4 = reinterpret_cast<const uint2*>(w_row);
 
-  if (wid >= TM || row >= H || kidx >= EXPERT_PER_TOKEN)
-    return;
-
-  // Load expert ID and weight for current batch
-  expert_id = topk_i[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
-  expert_w = topk_v[(size_t)batch_idx * EXPERT_PER_TOKEN + kidx];
-  if (expert_id < 0 || expert_w == 0.f) return;
-
-  float acc = 0.f;
-
-  // K loop over IM, loading gate_up_topk for current batch
-  for (int k_base = 0; k_base < IM; k_base += TK) {
-    const int k_size = min(TK, IM - k_base);
-
-    // Load data for current batch
-    const float* __restrict__ xb =
-        gate_up_topk + (((size_t)kidx * (size_t)batch_size + (size_t)batch_idx) * (size_t)IM + (size_t)k_base);
-
-    // vectorized load to shared
-    const int vec4 = (k_size >> 2);
-    float4* __restrict__ s4 = reinterpret_cast<float4*>(lds_x);
-    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xb);
-    for (int v = tid; v < vec4; v += BLOCK_SIZE) { s4[v] = x4[v]; }
-    for (int k = (vec4 << 2) + tid; k < k_size; k += BLOCK_SIZE) {
-      lds_x[k] = xb[k];
-    }
-    __syncthreads();
-
-    // Compute for current batch
-    // weight row: w[l, expert, row, k_base: ]
-    const size_t base = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)H * (size_t)IM;
-    const bf16_t* __restrict__ w_row = w_mlp2_all + base + (size_t)row * (size_t)IM + (size_t)k_base;
-
-    // vector compute
-    const uint2* __restrict__ wq = reinterpret_cast<const uint2*>(w_row);
-    const int vec4k = (k_size >> 2);
-    for (int v = lane; v < vec4k; v += WF_SIZE) {
-      const float4 wv = bf16quad_to_float4(wq[v]);
-      const float4 xv = *reinterpret_cast<const float4*>(&lds_x[v << 2]);
-      acc = fmaf(wv.x, xv.x, acc);
-      acc = fmaf(wv.y, xv.y, acc);
-      acc = fmaf(wv.z, xv.z, acc);
-      acc = fmaf(wv.w, xv.w, acc);
-    }
-    // tail
-    for (int k = (vec4k << 2) + lane; k < k_size; k += WF_SIZE) {
-      uint32_t u = ((uint32_t)(*reinterpret_cast<const uint16_t*>(&w_row[k]))) << 16;
-      union { uint32_t u; float f; } cvt; cvt.u = u;
-      acc = fmaf(cvt.f, lds_x[k], acc);
-    }
-    __syncthreads();
+  #pragma unroll
+  for (int v = 0; v < vec_count; ++v) {
+    const float4 gv = gate4[v];
+    const float4 wv = bf16quad_to_float4(w_row4[v]);
+    acc = fmaf(wv.x, gv.x, acc);
+    acc = fmaf(wv.y, gv.y, acc);
+    acc = fmaf(wv.z, gv.z, acc);
+    acc = fmaf(wv.w, gv.w, acc);
   }
 
-  // reduce and write for current batch (1 atomic per (batch,row) per expert)
-  float acc_sum = warp_reduce_sum(acc);
-  if (lane == 0) {
-    const size_t b_mlp2_base = ((size_t)l_layer * (size_t)E + (size_t)expert_id) * (size_t)H;
-    float out = acc_sum + b_mlp2_all[b_mlp2_base + (size_t)row];
-    float contrib = out * expert_w;
-    atomicAdd(e_agg + (size_t)batch_idx * (size_t)H + (size_t)row, contrib);
+  const uint16_t* __restrict__ w_row_u16 = reinterpret_cast<const uint16_t*>(w_row);
+  for (int k = vec_limit; k < IM; ++k) {
+    acc = fmaf(bf16_bits_to_float(w_row_u16[k]), gate_vec[k], acc);
   }
+
+  const float bias = b_mlp2_all[base + (size_t)h_idx];
+  const float contrib = (acc + bias) * expert_weight;
+  atomicAdd(e_agg + (size_t)batch_idx * (size_t)H + (size_t)h_idx, contrib);
 }
