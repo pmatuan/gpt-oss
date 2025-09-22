@@ -13,22 +13,64 @@ rope theta: 150000.000000
 rope_scaling_factor: 32.000000
 sliding window: 128
 swiglu_limit: 7.000000
-requests size = 16793600 B
-Num requests: 64
-Found 1 HIP devices, initializing multi-GPU setup...
+requests size = 537395200 B
+Num requests: 2048
+Found 8 HIP devices, initializing multi-GPU setup...
 Initializing device 0...
+Initializing device 1...
+Initializing device 3...
+[DEVICE] 1 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+Initializing device 4...
+Initializing device 7...
+[DEVICE] 4 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+Initializing device 2...
+Initializing device 6...
+[DEVICE] 3 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 7 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
 [DEVICE] 0 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 6 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 2 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+Initializing device 5...
+[DEVICE] 5 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 1 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 1 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 1 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
+[DEVICE] 4 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 4 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 4 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
 [DEVICE] 0 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
 [DEVICE] 0 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
 [DEVICE] 0 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
+[DEVICE] 5 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 5 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 5 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
+[DEVICE] 6 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 6 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 6 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
+[DEVICE] 3 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 3 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 3 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
+[DEVICE] 2 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 2 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 2 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
+[DEVICE] 7 [HIP] after activations: HBM free 63.66 GiB / total 63.98 GiB (used 0.33 GiB)
+[DEVICE] 7 [HIP] after small FP32 weights: HBM free 63.65 GiB / total 63.98 GiB (used 0.34 GiB)
+[DEVICE] 7 [HIP] after expert biases: HBM free 63.62 GiB / total 63.98 GiB (used 0.37 GiB)
 [DEVICE] 0 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 2 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 1 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 6 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 3 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 7 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 5 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
+[DEVICE] 4 [HIP] after large BF16 weights (model loaded): HBM free 24.67 GiB / total 63.98 GiB (used 39.31 GiB)
 Multi-GPU initialization complete!
 
-warm up elapsed time(s): 55.761000
-Processing 64 requests across 1 GPUs...
+warm up elapsed time(s): 57.424000
+Processing 2048 requests across 8 GPUs...
 num experts: 32, experts per token: 4
-Multi-GPU inference completed. Total tokens generated: 62275
+Multi-GPU inference completed. Total tokens generated: 2036874
 
-elapsed time(s): 308.268000, achieved throughput TPS (tok/s): 202.015778
+elapsed time(s): 1198.927000, achieved throughput TPS (tok/s): 1698.914112
 
-finish elapsed time(s): 0.006000
+finish elapsed time(s): 0.609000
