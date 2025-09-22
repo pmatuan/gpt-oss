@@ -20,6 +20,10 @@ typedef hip_bfloat16 bf16_t;
 #define MAX_BATCH_SIZE 256
 #define TM_MM 32
 #define TN_MM 32
+#define MLP1_TILE_TOKENS 8
+#define MLP1_TILE_IM 8
+#define MLP2_TILE_TOKENS 8
+#define MLP2_TILE_H 8
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
@@ -45,7 +49,6 @@ struct GPUActivationBuffers {
   float *d_qkv, *d_q;
   bf16_t *d_key_cache, *d_value_cache;
   float *d_logits;
-  float *d_cos_vals, *d_sin_vals;
   int *d_token2row;
   int *d_tokens;
   int *d_pos;
