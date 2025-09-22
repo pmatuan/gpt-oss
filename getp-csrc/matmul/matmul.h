@@ -62,4 +62,23 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     int l_layer, int E, int IM, int H,
     int batch_size, const int *pos);
 
+__global__ void mlp1_fused_gemm_kernel_old(
+    float* __restrict__ gate_up_topk, // [K, B, IM] (K = EXPERT_PER_TOKEN)
+    const float* __restrict__ x,      // [B, H]
+    const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H] (row-major in last dim)
+    const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
+    const int* __restrict__ topk_i,   // [B, K]
+    int l_layer, int E, int H, int IM,
+    float swiglu_limit, int batch_size,
+    const int *pos);
+
+__global__ void mlp2_bias_weighted_accum_gemm_kernel_old(
+    float* __restrict__ e_agg,              // [B, H] (accumulator)
+    const float* __restrict__ gate_up_topk, // [K, B, IM]
+    const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
+    const float* __restrict__ b_mlp2_all,   // [L, E, H]
+    const int* __restrict__ topk_i,         // [B, K]
+    const float* __restrict__ topk_v,       // [B, K]
+    int l_layer, int E, int IM, int H,
+    int batch_size, const int *pos);
 #endif // GETP_MATMUL_H
