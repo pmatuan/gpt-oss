@@ -692,7 +692,7 @@ static long long run_requests_pipeline(Transformer *transformer,
   HIP_CHECK(hipHostMalloc((void **)&h_logits_batch, (size_t)B * V * sizeof(float)));
 
   int maxM = std::min(g_num_devices, B);
-  int target_bs = 16;
+  int target_bs = 4;
   int M = std::min(maxM, std::max(1, B / target_bs));
   int micro_bs = (M > 0) ? (B + M - 1) / M : B;
   if (micro_bs <= 0)
@@ -822,52 +822,63 @@ static long long run_requests_pipeline(Transformer *transformer,
       }
     }
 
-    // Wait for all logits to be ready for this step
+    // Wait per micro-batch for logits and advance contexts for its samples immediately
     if (g_num_devices > 0) {
       HIP_CHECK(hipSetDevice(g_num_devices - 1));
       for (int m = 0; m < M; ++m) {
+        const int base = mb_start[m];
+        const int bs = mb_size[m];
+        if (bs <= 0) continue;
         HIP_CHECK(hipEventSynchronize(ev_logits_ready[m]));
-      }
-    }
 
-    // For each active context, advance one step
-    for (int i = 0; i < B; ++i) {
-      if (!h_active[i])
-        continue;
-      PromptCtx &ctx = ctxs[i];
-      // Copy logits for this sample into ctx.h_logits
-      memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V], (size_t)V * sizeof(float));
-      ctx.pos++;
-      h_pos[i] = ctx.pos;
-      int next;
-      if (ctx.pos < ctx.num_prompt_tokens) {
-        next = ctx.prompt_tokens[ctx.pos];
-      } else {
-        ctx.is_context_phase = false;
-        next = sample(ctx.sampler, ctx.h_logits);
-        ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
-        ctx.num_generated++;
-      }
-      if (next == 199999 || next == 200002) {
-        ctx.finished = true;
-        h_active[i] = 0;
-        num_finished++;
-        const char *piece = decode_piece(tokenizer, ctx.token, next);
-        if (piece)
-          ctx.output_str += piece;
-        ctx.token = next;
-        continue;
-      }
-      const char *piece = decode_piece(tokenizer, ctx.token, next);
-      if (piece)
-        ctx.output_str += piece;
-      ctx.token = next;
-      h_tokens[i] = next;
-      // Respect max steps constraint
-      if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
-        ctx.finished = true;
-        h_active[i] = 0;
-        num_finished++;
+        // Process only samples in this micro-batch
+        for (int j = 0; j < bs; ++j) {
+          int i = base + j;
+          if (!h_active[i])
+            continue;
+          PromptCtx &ctx = ctxs[i];
+
+          // Copy logits for this sample into ctx.h_logits
+          memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V],
+                 (size_t)V * sizeof(float));
+
+          ctx.pos++;
+          h_pos[i] = ctx.pos;
+          int next;
+          if (ctx.pos < ctx.num_prompt_tokens) {
+            next = ctx.prompt_tokens[ctx.pos];
+          } else {
+            ctx.is_context_phase = false;
+            next = sample(ctx.sampler, ctx.h_logits);
+            ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
+            ctx.num_generated++;
+          }
+
+          if (next == 199999 || next == 200002) {
+            ctx.finished = true;
+            h_active[i] = 0;
+            num_finished++;
+            const char *piece = decode_piece(tokenizer, ctx.token, next);
+            if (piece)
+              ctx.output_str += piece;
+            ctx.token = next;
+            continue;
+          }
+
+          const char *piece = decode_piece(tokenizer, ctx.token, next);
+          if (piece)
+            ctx.output_str += piece;
+
+          ctx.token = next;
+          h_tokens[i] = next;
+
+          // Respect max steps constraint
+          if (ctx.max_steps != 0 && ctx.pos + 1 >= ctx.max_steps) {
+            ctx.finished = true;
+            h_active[i] = 0;
+            num_finished++;
+          }
+        }
       }
     }
   }
