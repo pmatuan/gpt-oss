@@ -137,6 +137,123 @@ void matmul_bias_gemm_kernel_bf16_mfma(
   }
 }
 
+// No-bias variant: x:[B,n], w:[d,n], y:[B,d]
+__global__ __launch_bounds__(64, 2)
+void matmul_gemm_kernel_bf16_mfma(
+    float* __restrict__ y,          // [B x d]
+    const float* __restrict__ x,    // [B x n] (fp32)
+    const bf16_t* __restrict__ w,   // [d x n] (bf16)
+    int n, int d, int B,
+    const int* __restrict__ pos)    // nullable; pos[b] < 0 -> skip row
+{
+  const int tx = threadIdx.x; // 0..15
+  const int ty = threadIdx.y; // 0..3
+
+  const int M0 = blockIdx.y * 32;
+  const int N0 = blockIdx.x * 32;
+
+  const int c0 = N0 + tx;
+  const int c1 = N0 + tx + 16;
+  const bool c0_ok = (c0 < d);
+  const bool c1_ok = (c1 < d);
+
+  const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
+  const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
+  const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
+  const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
+  const size_t group_offset = (size_t)ty * group_stride;
+
+  size_t base_tile_c0 = 0;
+  const bool active_c0 = c0_ok;
+  if (active_c0) {
+    const int tile_col0 = c0 / MATMUL_TILE_COLS;
+    const int row_in_tile0 = c0 % MATMUL_TILE_COLS;
+    base_tile_c0 = ((size_t)tile_col0 * tiles_k) * tile_elems +
+                   (size_t)row_in_tile0 * MATMUL_CHUNK_K;
+  }
+
+  size_t base_tile_c1 = 0;
+  const bool active_c1 = c1_ok;
+  if (active_c1) {
+    const int tile_col1 = c1 / MATMUL_TILE_COLS;
+    const int row_in_tile1 = c1 % MATMUL_TILE_COLS;
+    base_tile_c1 = ((size_t)tile_col1 * tiles_k) * tile_elems +
+                   (size_t)row_in_tile1 * MATMUL_CHUNK_K;
+  }
+
+  const int r0 = M0 + tx;
+  const int r1 = M0 + tx + 16;
+  const bool r0_ok = (r0 < B) && (!(pos) || pos[r0] >= 0);
+  const bool r1_ok = (r1 < B) && (!(pos) || pos[r1] >= 0);
+
+  f32x4 acc00 = {0.f,0.f,0.f,0.f};
+  f32x4 acc01 = {0.f,0.f,0.f,0.f};
+  f32x4 acc10 = {0.f,0.f,0.f,0.f};
+  f32x4 acc11 = {0.f,0.f,0.f,0.f};
+
+  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
+    const int k_base = k0 + ty * MATMUL_CHUNK_K;
+    const int k_rem  = max(0, min(MATMUL_CHUNK_K, n - k_base));
+
+    const float* x_r0 = x + (size_t)r0 * n + k_base;
+    const float* x_r1 = x + (size_t)r1 * n + k_base;
+    s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_r0, 0, k_rem, r0_ok);
+    s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_r1, 0, k_rem, r1_ok);
+
+    const int tile_k_idx = k0 / MATMUL_TILE_K;
+    const size_t chunk_offset = (size_t)tile_k_idx * tile_elems + group_offset;
+
+    s16x4 Bvec_c0 = {0,0,0,0};
+    if (active_c0 && k_rem > 0) {
+      const uint16_t* src0 = w_u16 + base_tile_c0 + chunk_offset;
+      Bvec_c0[0] = (short)src0[0];
+      Bvec_c0[1] = (short)src0[1];
+      Bvec_c0[2] = (short)src0[2];
+      Bvec_c0[3] = (short)src0[3];
+      if (k_rem < MATMUL_CHUNK_K) {
+        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j) {
+          Bvec_c0[j] = 0;
+        }
+      }
+    }
+
+    s16x4 Bvec_c1 = {0,0,0,0};
+    if (active_c1 && k_rem > 0) {
+      const uint16_t* src1 = w_u16 + base_tile_c1 + chunk_offset;
+      Bvec_c1[0] = (short)src1[0];
+      Bvec_c1[1] = (short)src1[1];
+      Bvec_c1[2] = (short)src1[2];
+      Bvec_c1[3] = (short)src1[3];
+      if (k_rem < MATMUL_CHUNK_K) {
+        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j) {
+          Bvec_c1[j] = 0;
+        }
+      }
+    }
+
+    acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0, acc00, 0,0,0);
+    acc01 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c1, acc01, 0,0,0);
+    acc10 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c0, acc10, 0,0,0);
+    acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1, acc11, 0,0,0);
+  }
+
+  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
+    const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
+    const int row_hi = row_lo + 16;
+
+    if (row_lo < B && (!(pos) || pos[row_lo] >= 0)) {
+      float* y0 = y + (size_t)row_lo * d;
+      if (c0_ok) y0[c0]   = acc00[i];
+      if (c1_ok) y0[c1]   = acc01[i];
+    }
+    if (row_hi < B && (!(pos) || pos[row_hi] >= 0)) {
+      float* y1 = y + (size_t)row_hi * d;
+      if (c0_ok) y1[c0]   = acc10[i];
+      if (c1_ok) y1[c1]   = acc11[i];
+    }
+  }
+}
+
 /**
  * Y = X @ W^T + B (float version)
  * x: [B, n], w: [d, n], y: [B, d]
