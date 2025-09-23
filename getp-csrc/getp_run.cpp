@@ -86,11 +86,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_value_cache,
                       L * S * KV * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, V * sizeof(float)));
-
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_cos_vals, (D / 2) * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&ctx.gpu_activations.d_sin_vals, (D / 2) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens, sizeof(int)));
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_token2row, S * sizeof(int)));
   {
@@ -258,10 +254,9 @@ static void cleanup_device_context(DeviceContext &ctx) {
   HIP_CHECK(hipFree(ctx.gpu_activations.d_key_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_value_cache));
   HIP_CHECK(hipFree(ctx.gpu_activations.d_logits));
+  HIP_CHECK(hipFree(ctx.gpu_activations.d_next_tokens));
   if (ctx.gpu_activations.d_inv_rms)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_cos_vals));
-  HIP_CHECK(hipFree(ctx.gpu_activations.d_sin_vals));
   if (ctx.gpu_activations.d_token2row)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_token2row));
   if (ctx.gpu_activations.d_tokens)
@@ -378,6 +373,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     FREE_IF(ctx.gpu_activations.d_key_cache);
     FREE_IF(ctx.gpu_activations.d_value_cache);
     FREE_IF(ctx.gpu_activations.d_logits);
+    FREE_IF(ctx.gpu_activations.d_next_tokens);
 // token2row remains shared
 #undef FREE_IF
 
@@ -458,6 +454,8 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     // Auxiliary buffers
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
                         (size_t)B * V * sizeof(float)));
+    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens, 
+                        (size_t)B * sizeof(int)));
 
     ctx.capacity_B = B;
   } else {
@@ -655,10 +653,10 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
   }
 }
 
-static float *gpu_forward_device_batch(Transformer *transformer,
-                                       const int *tokens, const int *pos,
-                                       int batch_size, int device_id,
-                                       int max_pos_in_batch) {
+static float *gpu_forward_device_batch_logits(Transformer *transformer,
+                                              const int *tokens, const int *pos,
+                                              int batch_size, int device_id,
+                                              int max_pos_in_batch) {
   PROFILE_SCOPE("gpu_forward_device_batch");
   DeviceContext &ctx = g_devices[device_id];
   HIP_CHECK(hipSetDevice(device_id));
@@ -970,6 +968,33 @@ static float *gpu_forward_device_batch(Transformer *transformer,
   return ctx.gpu_activations.d_logits;
 }
 
+static int *gpu_forward_device_batch(Transformer *transformer,
+                                     const int *tokens, const int *pos,
+                                     int batch_size, int device_id,
+                                     int max_pos_in_batch) {
+  float *d_logits = gpu_forward_device_batch_logits(
+      transformer, tokens, pos, batch_size, device_id, max_pos_in_batch);
+
+  DeviceContext &ctx = g_devices[device_id];
+  HIP_CHECK(hipSetDevice(device_id));
+
+  if (batch_size <= 0)
+    return ctx.gpu_activations.d_next_tokens;
+
+  const int vocab_size = model_config->vocab_size;
+  const int threads = 256;
+  dim3 grid(batch_size, 1, 1);
+  dim3 block(threads, 1, 1);
+  size_t shared_bytes = (size_t)threads * (sizeof(float) + sizeof(int));
+
+  argmax_batch_kernel<<<grid, block, shared_bytes>>>(
+      d_logits, ctx.gpu_activations.d_next_tokens, vocab_size, batch_size,
+      ctx.gpu_activations.d_pos);
+  HIP_CHECK(hipGetLastError());
+
+  return ctx.gpu_activations.d_next_tokens;
+}
+
 static long long run_requests_on_device(Transformer *transformer,
                                         Tokenizer *tokenizer, PromptCtx *ctxs,
                                         int num_ctxs, int device_id) {
@@ -993,17 +1018,8 @@ static long long run_requests_on_device(Transformer *transformer,
 
     // Ensure device buffers sized for B and clear KV caches
     ensure_device_capacity(g_devices[device_id], B);
-    const Config *p = model_config;
-    const int D = p->head_dim;
-    const int Hk = p->n_kv_heads;
-    const int KV = D * Hk;
-    const int L = p->n_layers;
-    const int S = p->seq_len;
-    DeviceContext &dctx = g_devices[device_id];
 
-    // Temporary host buffer for batched logits
-    const int V = p->vocab_size;
-    std::vector<float> h_logits_batch((size_t)B * V);
+    std::vector<int> h_next_tokens(B, -1);
 
     int num_finished = 0;
     while (num_finished < B) {
@@ -1019,12 +1035,10 @@ static long long run_requests_on_device(Transformer *transformer,
         }
       }
 
-      float *d_log =
+      int *d_next =
           gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(),
                                    B, device_id, max_pos_in_batch);
-
-      HIP_CHECK(hipMemcpy(h_logits_batch.data(), d_log,
-                          (size_t)B * V * sizeof(float),
+      HIP_CHECK(hipMemcpy(h_next_tokens.data(), d_next, (size_t)B * sizeof(int),
                           hipMemcpyDeviceToHost));
 
       // For each active context, advance one step
@@ -1033,10 +1047,6 @@ static long long run_requests_on_device(Transformer *transformer,
           continue;
         PromptCtx &ctx = batch_ctxs[i];
 
-        // Copy logits for this sample into ctx.h_logits
-        memcpy(ctx.h_logits, &h_logits_batch[(size_t)i * V],
-               (size_t)V * sizeof(float));
-
         ctx.pos++;
         h_pos[i] = ctx.pos;
         int next;
@@ -1044,7 +1054,7 @@ static long long run_requests_on_device(Transformer *transformer,
           next = ctx.prompt_tokens[ctx.pos];
         } else {
           ctx.is_context_phase = false;
-          next = sample(ctx.sampler, ctx.h_logits);
+          next = h_next_tokens[i];
           ctx.output_tokens[ctx.pos - ctx.num_prompt_tokens] = next;
           ctx.num_generated++;
         }
@@ -1068,7 +1078,7 @@ static long long run_requests_on_device(Transformer *transformer,
         h_tokens[i] = next;
 
         // Respect max steps constraint
-        if (ctx.max_steps != 0 && ctx.pos >= ctx.max_steps) {
+        if (ctx.max_steps != 0 && ctx.pos + 1 >= ctx.max_steps) {
           ctx.finished = true;
           h_active[i] = 0;
           num_finished++;

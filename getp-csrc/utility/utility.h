@@ -56,4 +56,8 @@ __global__ void fused_topk_softmax_batch_kernel(
 void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
                                int n_streams, size_t chunk_bytes);
 
+__global__ void argmax_batch_kernel(const float *logits, int *out_indices,
+                                    int vocab_size, int batch_size,
+                                    const int *pos);
+
 #endif // GETP_UTILITY_H
