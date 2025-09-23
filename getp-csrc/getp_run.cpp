@@ -985,7 +985,10 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     // 2) MatMul for logits - separate GEMM version (no bias)
     {
       PROFILE_GPU_SCOPE("matmul_gemm_kernel_bf16_mfma", 0);
-      dim3 gridV_gemm((V + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
+      dim3 gridV_gemm(
+          (V + MATMUL_GEMM_TILE_COLS - 1) / MATMUL_GEMM_TILE_COLS,
+          (batch_size + MATMUL_GEMM_TILE_ROWS - 1) / MATMUL_GEMM_TILE_ROWS,
+          1);
       dim3 blockV(16, 4, 1);
       matmul_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,

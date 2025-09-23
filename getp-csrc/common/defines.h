@@ -28,6 +28,9 @@ typedef hip_bfloat16 bf16_t;
 #define MATMUL_TILE_COLS 32
 #define MATMUL_TILE_K 16
 #define MATMUL_CHUNK_K 4
+// Specialized tiling for logits GEMM (no-bias) where output dimension is huge
+#define MATMUL_GEMM_TILE_COLS 64
+#define MATMUL_GEMM_TILE_ROWS 32
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
