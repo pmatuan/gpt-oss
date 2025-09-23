@@ -4,7 +4,7 @@
 #include "../common/defines.h"
 
 // GPU Memory Debugging
-static inline void debug_print_gpu_memory(const char *tag, int device_id = 0);
+void debug_print_gpu_memory(const char *tag, int device_id = 0);
 
 // Grid Dimension Utilities (removed - using direct dim3 initialization)
 __device__ __forceinline__ short f32_to_bf16_bits_short(float f);
@@ -52,12 +52,16 @@ __global__ void fused_topk_softmax_batch_kernel(
     float *topk_v, int *topk_i, const float *scores, int E, int K,
     int batch_size, const int *pos);
 
-// Data Type Conversion Utilities
-void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
-                               int n_streams, size_t chunk_bytes);
-
 __global__ void argmax_batch_kernel(const float *logits, int *out_indices,
                                     int vocab_size, int batch_size,
                                     const int *pos);
+
+// Data Type Conversion Utilities
+void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
+                              int n_streams, size_t chunk_bytes);
+
+size_t matmul_packed_elems(int rows, int cols);
+void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
+                              bf16_t *dst);
 
 #endif // GETP_UTILITY_H

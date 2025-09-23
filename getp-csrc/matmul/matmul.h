@@ -7,7 +7,7 @@
 __global__ void matmul_bias_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
     const float* __restrict__ x,    // [B x n] (fp32)
-    const bf16_t* __restrict__ w,   // [d x n] (bf16)
+    const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
     const float* __restrict__ bias, // [d] or nullptr
     int n, int d, int B,
     const int* __restrict__ pos);
@@ -38,28 +38,26 @@ __global__ void build_expert_assignments_kernel(
     int experts_per_token,
     int E);
 
-__global__ void mlp1_fused_gemm_kernel(
-    float* __restrict__ gate_up_topk, // [K, B, IM]
-    const float* __restrict__ x,      // [B, H]
-    const bf16_t* __restrict__ w_mlp1_all, // [L, E, 2*IM, H]
-    const float* __restrict__ b_mlp1_all,  // [L, E, 2*IM]
-    const int* __restrict__ assignment_batches,
-    const int* __restrict__ assignment_slots,
-    const int* __restrict__ expert_offsets,
-    int l_layer, int E, int H, int IM,
-    float swiglu_limit, int batch_size,
-    const int *pos);
+__global__ void
+mlp1_fused_gemm_kernel(float *__restrict__ gate_up_topk,      // [K, B, IM]
+                       const float *__restrict__ x,           // [B, H]
+                       const bf16_t *__restrict__ w_mlp1_all, // [L, E, 2*IM, H]
+                       size_t stride_w_mlp1,
+                       const float *__restrict__ b_mlp1_all, // [L, E, 2*IM]
+                       const int *__restrict__ assignment_batches,
+                       const int *__restrict__ assignment_slots,
+                       const int *__restrict__ expert_offsets, int l_layer,
+                       int E, int H, int IM, float swiglu_limit, int batch_size,
+                       const int *pos);
 
 __global__ void mlp2_bias_weighted_accum_gemm_kernel(
-    float* __restrict__ e_agg,              // [B, H]
-    const float* __restrict__ gate_up_topk, // [K, B, IM]
-    const bf16_t* __restrict__ w_mlp2_all,  // [L, E, H, IM]
-    const float* __restrict__ b_mlp2_all,   // [L, E, H]
-    const int* __restrict__ assignment_batches,
-    const int* __restrict__ assignment_slots,
-    const int* __restrict__ expert_offsets,
-    const float* __restrict__ topk_v,
-    int l_layer, int E, int IM, int H,
-    int batch_size, const int *pos);
-
+    float *__restrict__ e_agg,              // [B, H]
+    const float *__restrict__ gate_up_topk, // [K, B, IM]
+    const bf16_t *__restrict__ w_mlp2_all,  // [L, E, H, IM]
+    size_t stride_w_mlp2,
+    const float *__restrict__ b_mlp2_all, // [L, E, H]
+    const int *__restrict__ assignment_batches,
+    const int *__restrict__ assignment_slots,
+    const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
+    int l_layer, int E, int IM, int H, int batch_size, const int *pos);
 #endif // GETP_MATMUL_H
