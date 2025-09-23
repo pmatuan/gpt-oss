@@ -679,13 +679,17 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
   }
 }
 
-static float *gpu_forward_device_batch_logits(Transformer *transformer,
-                                              const int *tokens, const int *pos,
-                                              int batch_size, int device_id,
-                                              int max_pos_in_batch) {
+static int *gpu_forward_device_batch(Transformer *transformer,
+                                     const int *tokens, const int *pos,
+                                     int batch_size, int device_id,
+                                     int max_pos_in_batch) {
   PROFILE_SCOPE("gpu_forward_device_batch");
   DeviceContext &ctx = g_devices[device_id];
   HIP_CHECK(hipSetDevice(device_id));
+
+  if (batch_size <= 0) {
+    return ctx.gpu_activations.d_next_tokens;
+  }
 
   const Config *p = model_config;
   const int H = p->hidden_dim;
@@ -990,31 +994,12 @@ static float *gpu_forward_device_batch_logits(Transformer *transformer,
     }
   }
 
-  return ctx.gpu_activations.d_logits;
-}
+  dim3 grid_argmax(batch_size, 1, 1);
+  size_t shared_bytes = (size_t)BLOCK_SIZE * (sizeof(float) + sizeof(int));
 
-static int *gpu_forward_device_batch(Transformer *transformer,
-                                     const int *tokens, const int *pos,
-                                     int batch_size, int device_id,
-                                     int max_pos_in_batch) {
-  float *d_logits = gpu_forward_device_batch_logits(
-      transformer, tokens, pos, batch_size, device_id, max_pos_in_batch);
-
-  DeviceContext &ctx = g_devices[device_id];
-  HIP_CHECK(hipSetDevice(device_id));
-
-  if (batch_size <= 0)
-    return ctx.gpu_activations.d_next_tokens;
-
-  const int vocab_size = model_config->vocab_size;
-  const int threads = 256;
-  dim3 grid(batch_size, 1, 1);
-  dim3 block(threads, 1, 1);
-  size_t shared_bytes = (size_t)threads * (sizeof(float) + sizeof(int));
-
-  argmax_batch_kernel<<<grid, block, shared_bytes>>>(
-      d_logits, ctx.gpu_activations.d_next_tokens, vocab_size, batch_size,
-      ctx.gpu_activations.d_pos);
+  argmax_batch_kernel<<<grid_argmax, block, shared_bytes>>>(
+      ctx.gpu_activations.d_logits, ctx.gpu_activations.d_next_tokens,
+      V, batch_size, ctx.gpu_activations.d_pos);
   HIP_CHECK(hipGetLastError());
 
   return ctx.gpu_activations.d_next_tokens;
