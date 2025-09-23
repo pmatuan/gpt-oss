@@ -743,7 +743,7 @@ static float *gpu_forward_device_batch_logits(Transformer *transformer,
             ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * ctx.stride_w_qkv_bf16,
-            ctx.gpu_weights_fp32.d_b_qkv ? (ctx.gpu_weights_fp32.d_b_qkv + (size_t)l * QKV_D) : nullptr,
+            ctx.gpu_weights_fp32.d_b_qkv + (size_t)l * QKV_D,
             H, QKV_D, batch_size,
             ctx.gpu_activations.d_pos);
       }
