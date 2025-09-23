@@ -21,10 +21,10 @@ typedef hip_bfloat16 bf16_t;
 #define MAX_BATCH_SIZE 256
 #define TM_MM 32
 #define TN_MM 32
-#define MLP1_TILE_TOKENS 8
-#define MLP1_TILE_IM 8
-#define MLP2_TILE_TOKENS 8
-#define MLP2_TILE_H 8
+#define MLP_TILE_TOKENS 32
+#define MLP_TILE_COLS 32
+#define MLP_THREAD_X 16
+#define MLP_THREAD_Y 4
 #define MATMUL_TILE_COLS 32
 #define MATMUL_TILE_K 16
 #define MATMUL_CHUNK_K 4

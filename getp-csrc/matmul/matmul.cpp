@@ -274,14 +274,33 @@ __global__ void build_expert_assignments_kernel(
 }
 
 // ================= MLP1 (Gate & Up) : batched per expert =================
-__global__ void mlp1_fused_gemm_kernel(
+__device__ __forceinline__ float clamp_with_limit(float v, float limit) {
+  if (limit <= 0.0f)
+    return v;
+  const float inv_range = 1.0f / (2.0f * limit);
+  const float normalized = __saturatef((v + limit) * inv_range);
+  return normalized * (2.0f * limit) - limit;
+}
+
+__device__ __forceinline__ float swiglu_fused(float gate, float up,
+                                              float limit) {
+  const float gate_val = clamp_with_limit(gate, limit);
+  const float up_val = clamp_with_limit(up, limit);
+  const float alpha = 1.702f;
+  const float gate_act = gate_val *
+      __saturatef(0.5f + 0.5f * tanhf(alpha * gate_val * 0.5f));
+  return gate_act * (up_val + 1.0f);
+}
+
+__global__ __launch_bounds__(64, 2)
+void mlp1_fused_gemm_kernel(
     float *__restrict__ gate_up_topk, const float *__restrict__ x,
     const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
     const float *__restrict__ b_mlp1_all,
     const int *__restrict__ assignment_batches,
     const int *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, int l_layer, int E, int H, int IM,
-    float swiglu_limit, int batch_size, const int *pos) {
+    float swiglu_limit, int batch_size, const int *__restrict__ pos) {
   const int expert_id = blockIdx.z;
   const int start = expert_offsets[expert_id];
   const int end = expert_offsets[expert_id + 1];
@@ -289,131 +308,197 @@ __global__ void mlp1_fused_gemm_kernel(
   if (count <= 0)
     return;
 
-  const int tile_start_token = blockIdx.y * MLP1_TILE_TOKENS;
-  if (tile_start_token >= count)
+  const int M0 = blockIdx.y * MLP_TILE_TOKENS;
+  if (M0 >= count)
     return;
-  const int tile_rows = min(MLP1_TILE_TOKENS, count - tile_start_token);
+  const int tile_rows = min(MLP_TILE_TOKENS, count - M0);
 
-  const int tile_start_im = blockIdx.x * MLP1_TILE_IM;
-  if (tile_start_im >= IM)
-    return;
-  const int tile_cols = min(MLP1_TILE_IM, IM - tile_start_im);
-
-  const int local_im = threadIdx.x;
-  const int local_token = threadIdx.y;
-
-  if (local_im >= tile_cols || local_token >= tile_rows)
+  const int total_cols = 2 * IM;
+  const int N0 = blockIdx.x * MLP_TILE_COLS;
+  if (N0 >= total_cols)
     return;
 
-  const int assignment_idx = start + tile_start_token + local_token;
-  const int batch_idx = assignment_batches[assignment_idx];
-  const int slot = assignment_slots[assignment_idx];
-  if (batch_idx < 0 || slot < 0)
-    return;
-  if (pos && pos[batch_idx] < 0)
-    return;
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int lane = ty * MLP_THREAD_X + tx;
 
-  const int im_idx = tile_start_im + local_im;
+  __shared__ int sh_batch[MLP_TILE_TOKENS];
+  __shared__ int sh_slot[MLP_TILE_TOKENS];
+  __shared__ int sh_valid[MLP_TILE_TOKENS];
+
+  for (int idx = lane; idx < MLP_TILE_TOKENS;
+       idx += MLP_THREAD_X * MLP_THREAD_Y) {
+    int batch = -1;
+    int slot = -1;
+    int valid = 0;
+    if (idx < tile_rows) {
+      const int assignment_idx = start + M0 + idx;
+      batch = assignment_batches[assignment_idx];
+      slot = assignment_slots[assignment_idx];
+      if (batch >= 0 && slot >= 0) {
+        const bool pos_ok = (!pos) || (pos[batch] >= 0);
+        if (pos_ok)
+          valid = 1;
+      }
+    }
+    sh_batch[idx] = batch;
+    sh_slot[idx] = slot;
+    sh_valid[idx] = valid;
+  }
+  __syncthreads();
+
+  const int row_tile0 = tx;
+  const int row_tile1 = tx + 16;
+  const bool row0_active = (row_tile0 < tile_rows) && (sh_valid[row_tile0] != 0);
+  const bool row1_active = (row_tile1 < tile_rows) && (sh_valid[row_tile1] != 0);
+  const int batch0 = row0_active ? sh_batch[row_tile0] : 0;
+  const int batch1 = row1_active ? sh_batch[row_tile1] : 0;
 
   const size_t matrix_idx = (size_t)l_layer * (size_t)E + (size_t)expert_id;
-  const size_t base_2im = matrix_idx * (size_t)(2 * IM);
-  const bf16_t *__restrict__ w_matrix = w_mlp1_all + matrix_idx * stride_w_mlp1;
-  const uint16_t *__restrict__ w_matrix_u16 =
+  const bf16_t *__restrict__ w_matrix =
+      w_mlp1_all + matrix_idx * stride_w_mlp1;
+  const uint16_t *__restrict__ w_u16 =
       reinterpret_cast<const uint16_t *>(w_matrix);
-  const float *__restrict__ x_row = x + (size_t)batch_idx * (size_t)H;
+  const float *__restrict__ bias_base =
+      b_mlp1_all + matrix_idx * (size_t)(2 * IM);
 
-  const int rows = 2 * IM;
-  const int cols = H;
-  const int gate_row = 2 * im_idx;
-  const int up_row = gate_row + 1;
-
-  float acc_gate = 0.0f;
-  float acc_up = 0.0f;
-
-  const int tiles_k = (cols + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
+  const int tiles_k = (H + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
   const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
   const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-  const size_t base_gate =
-      ((size_t)(gate_row / MATMUL_TILE_COLS) * tiles_k) * tile_elems +
-      (size_t)(gate_row % MATMUL_TILE_COLS) * MATMUL_CHUNK_K;
-  const size_t base_up =
-      ((size_t)(up_row / MATMUL_TILE_COLS) * tiles_k) * tile_elems +
-      (size_t)(up_row % MATMUL_TILE_COLS) * MATMUL_CHUNK_K;
+  const size_t group_offset = (size_t)ty * group_stride;
 
-  for (int k_base = 0; k_base < cols; k_base += MATMUL_CHUNK_K) {
-    const int tile_k_idx = k_base >> 4;
-    const int group = (k_base >> 2) & ((MATMUL_TILE_K / MATMUL_CHUNK_K) - 1);
+  const int c0 = N0 + (tx << 1);
+  const int c1 = c0 + 1;
+  const bool c0_ok = (c0 < total_cols);
+  const bool c1_ok = (c1 < total_cols);
+  const int im_idx = c0 >> 1;
+  const bool col_pair_ok = c0_ok && c1_ok && (im_idx < IM);
+
+  size_t base_tile_c0 = 0;
+  if (c0_ok) {
+    const int tile_col0 = c0 / MATMUL_TILE_COLS;
+    const int row_in_tile0 = c0 % MATMUL_TILE_COLS;
+    base_tile_c0 = ((size_t)tile_col0 * tiles_k) * tile_elems +
+                   (size_t)row_in_tile0 * MATMUL_CHUNK_K;
+  }
+  size_t base_tile_c1 = 0;
+  if (c1_ok) {
+    const int tile_col1 = c1 / MATMUL_TILE_COLS;
+    const int row_in_tile1 = c1 % MATMUL_TILE_COLS;
+    base_tile_c1 = ((size_t)tile_col1 * tiles_k) * tile_elems +
+                   (size_t)row_in_tile1 * MATMUL_CHUNK_K;
+  }
+
+  f32x4 acc00 = {0.f, 0.f, 0.f, 0.f};
+  f32x4 acc01 = {0.f, 0.f, 0.f, 0.f};
+  f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
+  f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
+
+  for (int k0 = 0; k0 < H; k0 += MATMUL_TILE_K) {
+    const int k_base = k0 + ty * MATMUL_CHUNK_K;
+    const int k_rem = max(0, min(MATMUL_CHUNK_K, H - k_base));
+
+    const float *x_ptr0 = row0_active
+                              ? x + (size_t)batch0 * (size_t)H + k_base
+                              : x;
+    const float *x_ptr1 = row1_active
+                              ? x + (size_t)batch1 * (size_t)H + k_base
+                              : x;
+
+    s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_ptr0, 0, k_rem, row0_active);
+    s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_ptr1, 0, k_rem, row1_active);
+
+    const int tile_k_idx = k0 / MATMUL_TILE_K;
     const size_t chunk_offset =
-        (size_t)tile_k_idx * tile_elems + (size_t)group * group_stride;
+        (size_t)tile_k_idx * tile_elems + group_offset;
 
-    const uint16_t *src_gate = w_matrix_u16 + base_gate + chunk_offset;
-    const uint16_t *src_up = w_matrix_u16 + base_up + chunk_offset;
-    const uint2 gate_u2 = *reinterpret_cast<const uint2 *>(src_gate);
-    const uint2 up_u2 = *reinterpret_cast<const uint2 *>(src_up);
-    const float4 gate_vals = bf16quad_to_float4(gate_u2);
-    const float4 up_vals = bf16quad_to_float4(up_u2);
+    s16x4 Bvec_c0 = {0, 0, 0, 0};
+    if (c0_ok && k_rem > 0) {
+      const uint16_t *src0 = w_u16 + base_tile_c0 + chunk_offset;
+      Bvec_c0[0] = (short)src0[0];
+      Bvec_c0[1] = (short)src0[1];
+      Bvec_c0[2] = (short)src0[2];
+      Bvec_c0[3] = (short)src0[3];
+      if (k_rem < MATMUL_CHUNK_K) {
+        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
+          Bvec_c0[j] = 0;
+      }
+    }
 
-    if (k_base + MATMUL_CHUNK_K <= cols) {
-      const float4 xv = *reinterpret_cast<const float4 *>(x_row + k_base);
-      acc_gate = fmaf(gate_vals.x, xv.x, acc_gate);
-      acc_gate = fmaf(gate_vals.y, xv.y, acc_gate);
-      acc_gate = fmaf(gate_vals.z, xv.z, acc_gate);
-      acc_gate = fmaf(gate_vals.w, xv.w, acc_gate);
+    s16x4 Bvec_c1 = {0, 0, 0, 0};
+    if (c1_ok && k_rem > 0) {
+      const uint16_t *src1 = w_u16 + base_tile_c1 + chunk_offset;
+      Bvec_c1[0] = (short)src1[0];
+      Bvec_c1[1] = (short)src1[1];
+      Bvec_c1[2] = (short)src1[2];
+      Bvec_c1[3] = (short)src1[3];
+      if (k_rem < MATMUL_CHUNK_K) {
+        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
+          Bvec_c1[j] = 0;
+      }
+    }
 
-      acc_up = fmaf(up_vals.x, xv.x, acc_up);
-      acc_up = fmaf(up_vals.y, xv.y, acc_up);
-      acc_up = fmaf(up_vals.z, xv.z, acc_up);
-      acc_up = fmaf(up_vals.w, xv.w, acc_up);
-    } else {
-      const int tail = cols - k_base;
-      if (tail > 0) {
-        const float xv0 = x_row[k_base + 0];
-        acc_gate = fmaf(gate_vals.x, xv0, acc_gate);
-        acc_up = fmaf(up_vals.x, xv0, acc_up);
-        if (tail > 1) {
-          const float xv1 = x_row[k_base + 1];
-          acc_gate = fmaf(gate_vals.y, xv1, acc_gate);
-          acc_up = fmaf(up_vals.y, xv1, acc_up);
-        }
-        if (tail > 2) {
-          const float xv2 = x_row[k_base + 2];
-          acc_gate = fmaf(gate_vals.z, xv2, acc_gate);
-          acc_up = fmaf(up_vals.z, xv2, acc_up);
-        }
+    acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
+                                                       acc00, 0, 0, 0);
+    acc01 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c1,
+                                                       acc01, 0, 0, 0);
+    acc10 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c0,
+                                                       acc10, 0, 0, 0);
+    acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1,
+                                                       acc11, 0, 0, 0);
+  }
+
+  const float bias_gate = c0_ok ? bias_base[c0] : 0.0f;
+  const float bias_up = c1_ok ? bias_base[c1] : 0.0f;
+
+  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
+    const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
+    const int idx_lo = row_lo - M0;
+    if (idx_lo >= 0 && idx_lo < tile_rows && col_pair_ok &&
+        sh_valid[idx_lo]) {
+      const int batch = sh_batch[idx_lo];
+      const int slot = sh_slot[idx_lo];
+      if (batch >= 0 && slot >= 0) {
+        float gate = acc00[i] + bias_gate;
+        float up = acc01[i] + bias_up;
+        const float val = swiglu_fused(gate, up, swiglu_limit);
+        float *dst = gate_up_topk +
+            (((size_t)slot * (size_t)batch_size + (size_t)batch) *
+             (size_t)IM);
+        dst[im_idx] = val;
+      }
+    }
+
+    const int row_hi = row_lo + 16;
+    const int idx_hi = row_hi - M0;
+    if (idx_hi >= 0 && idx_hi < tile_rows && col_pair_ok &&
+        sh_valid[idx_hi]) {
+      const int batch = sh_batch[idx_hi];
+      const int slot = sh_slot[idx_hi];
+      if (batch >= 0 && slot >= 0) {
+        float gate = acc10[i] + bias_gate;
+        float up = acc11[i] + bias_up;
+        const float val = swiglu_fused(gate, up, swiglu_limit);
+        float *dst = gate_up_topk +
+            (((size_t)slot * (size_t)batch_size + (size_t)batch) *
+             (size_t)IM);
+        dst[im_idx] = val;
       }
     }
   }
-
-  const float *__restrict__ b_base = b_mlp1_all + base_2im;
-  float gate_val = acc_gate + b_base[2 * im_idx + 0];
-  float up_val = acc_up + b_base[2 * im_idx + 1];
-
-  gate_val = __saturatef((gate_val + swiglu_limit) / (2.0f * swiglu_limit)) *
-                 (2.0f * swiglu_limit) -
-             swiglu_limit;
-  up_val = __saturatef((up_val + swiglu_limit) / (2.0f * swiglu_limit)) *
-               (2.0f * swiglu_limit) -
-           swiglu_limit;
-  const float alpha = 1.702f;
-  const float gate_act =
-      gate_val * __saturatef(0.5f + 0.5f * tanhf(alpha * gate_val * 0.5f));
-  const float final_gate = gate_act * (up_val + 1.0f);
-
-  float *__restrict__ gu =
-      gate_up_topk +
-      (((size_t)slot * (size_t)batch_size + (size_t)batch_idx) * (size_t)IM);
-  gu[im_idx] = final_gate;
 }
 
 // ============ MLP2 (weighted accum) : batched per expert ==============
-__global__ void mlp2_bias_weighted_accum_gemm_kernel(
+__global__ __launch_bounds__(64, 2)
+void mlp2_bias_weighted_accum_gemm_kernel(
     float *__restrict__ e_agg, const float *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const float *__restrict__ b_mlp2_all,
     const int *__restrict__ assignment_batches,
     const int *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
-    int l_layer, int E, int IM, int H, int batch_size, const int *pos) {
+    int l_layer, int E, int IM, int H, int batch_size,
+    const int *__restrict__ pos) {
   const int expert_id = blockIdx.z;
   const int start = expert_offsets[expert_id];
   const int end = expert_offsets[expert_id + 1];
@@ -421,83 +506,200 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
   if (count <= 0)
     return;
 
-  const int tile_start_token = blockIdx.y * MLP2_TILE_TOKENS;
-  if (tile_start_token >= count)
+  const int M0 = blockIdx.y * MLP_TILE_TOKENS;
+  if (M0 >= count)
     return;
-  const int tile_rows = min(MLP2_TILE_TOKENS, count - tile_start_token);
+  const int tile_rows = min(MLP_TILE_TOKENS, count - M0);
 
-  const int tile_start_h = blockIdx.x * MLP2_TILE_H;
-  if (tile_start_h >= H)
-    return;
-  const int tile_cols = min(MLP2_TILE_H, H - tile_start_h);
-
-  const int local_h = threadIdx.x;
-  const int local_token = threadIdx.y;
-  if (local_h >= tile_cols || local_token >= tile_rows)
+  const int N0 = blockIdx.x * MLP_TILE_COLS;
+  if (N0 >= H)
     return;
 
-  const int assignment_idx = start + tile_start_token + local_token;
-  const int batch_idx = assignment_batches[assignment_idx];
-  const int slot = assignment_slots[assignment_idx];
-  if (batch_idx < 0 || slot < 0)
-    return;
-  if (pos && pos[batch_idx] < 0)
-    return;
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int lane = ty * MLP_THREAD_X + tx;
 
-  const int h_idx = tile_start_h + local_h;
-  const float expert_weight =
-      topk_v[(size_t)batch_idx * (size_t)EXPERT_PER_TOKEN + slot];
-  if (expert_weight == 0.0f)
-    return;
+  __shared__ int sh_batch[MLP_TILE_TOKENS];
+  __shared__ int sh_slot[MLP_TILE_TOKENS];
+  __shared__ int sh_valid[MLP_TILE_TOKENS];
+  __shared__ float sh_weight[MLP_TILE_TOKENS];
 
-  const float *__restrict__ gate_vec =
-      gate_up_topk +
-      (((size_t)slot * (size_t)batch_size + (size_t)batch_idx) * (size_t)IM);
+  for (int idx = lane; idx < MLP_TILE_TOKENS;
+       idx += MLP_THREAD_X * MLP_THREAD_Y) {
+    int batch = -1;
+    int slot = -1;
+    float weight = 0.0f;
+    int valid = 0;
+    if (idx < tile_rows) {
+      const int assignment_idx = start + M0 + idx;
+      batch = assignment_batches[assignment_idx];
+      slot = assignment_slots[assignment_idx];
+      if (batch >= 0 && slot >= 0) {
+        const bool pos_ok = (!pos) || (pos[batch] >= 0);
+        if (pos_ok) {
+          weight = topk_v[(size_t)batch * (size_t)EXPERT_PER_TOKEN + slot];
+          if (weight != 0.0f)
+            valid = 1;
+        }
+      }
+    }
+    sh_batch[idx] = batch;
+    sh_slot[idx] = slot;
+    sh_weight[idx] = weight;
+    sh_valid[idx] = valid;
+  }
+  __syncthreads();
+
+  const int row_tile0 = tx;
+  const int row_tile1 = tx + 16;
+  const bool row0_active = (row_tile0 < tile_rows) && (sh_valid[row_tile0] != 0);
+  const bool row1_active = (row_tile1 < tile_rows) && (sh_valid[row_tile1] != 0);
+
+  size_t gate_base0 = 0;
+  if (row0_active) {
+    gate_base0 = ((size_t)sh_slot[row_tile0] * (size_t)batch_size +
+                  (size_t)sh_batch[row_tile0]) * (size_t)IM;
+  }
+  size_t gate_base1 = 0;
+  if (row1_active) {
+    gate_base1 = ((size_t)sh_slot[row_tile1] * (size_t)batch_size +
+                  (size_t)sh_batch[row_tile1]) * (size_t)IM;
+  }
+
   const size_t matrix_idx = (size_t)l_layer * (size_t)E + (size_t)expert_id;
-  const size_t base = matrix_idx * (size_t)H;
-  const bf16_t *__restrict__ w_matrix = w_mlp2_all + matrix_idx * stride_w_mlp2;
-  const uint16_t *__restrict__ w_matrix_u16 =
+  const bf16_t *__restrict__ w_matrix =
+      w_mlp2_all + matrix_idx * stride_w_mlp2;
+  const uint16_t *__restrict__ w_u16 =
       reinterpret_cast<const uint16_t *>(w_matrix);
+  const float *__restrict__ bias_base =
+      b_mlp2_all + matrix_idx * (size_t)H;
 
-  float acc = 0.0f;
-  const int rows = H;
-  const int cols = IM;
-
-  const int tiles_k = (cols + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
+  const int tiles_k = (IM + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
   const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
   const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-  const size_t base_row =
-      ((size_t)(h_idx / MATMUL_TILE_COLS) * tiles_k) * tile_elems +
-      (size_t)(h_idx % MATMUL_TILE_COLS) * MATMUL_CHUNK_K;
+  const size_t group_offset = (size_t)ty * group_stride;
 
-  for (int k_base = 0; k_base < cols; k_base += MATMUL_CHUNK_K) {
-    const int tile_k_idx = k_base >> 4;
-    const int group = (k_base >> 2) & ((MATMUL_TILE_K / MATMUL_CHUNK_K) - 1);
+  const int c0 = N0 + tx;
+  const int c1 = N0 + tx + 16;
+  const bool c0_ok = (c0 < H);
+  const bool c1_ok = (c1 < H);
+
+  size_t base_tile_c0 = 0;
+  if (c0_ok) {
+    const int tile_col0 = c0 / MATMUL_TILE_COLS;
+    const int row_in_tile0 = c0 % MATMUL_TILE_COLS;
+    base_tile_c0 = ((size_t)tile_col0 * tiles_k) * tile_elems +
+                   (size_t)row_in_tile0 * MATMUL_CHUNK_K;
+  }
+  size_t base_tile_c1 = 0;
+  if (c1_ok) {
+    const int tile_col1 = c1 / MATMUL_TILE_COLS;
+    const int row_in_tile1 = c1 % MATMUL_TILE_COLS;
+    base_tile_c1 = ((size_t)tile_col1 * tiles_k) * tile_elems +
+                   (size_t)row_in_tile1 * MATMUL_CHUNK_K;
+  }
+
+  f32x4 acc00 = {0.f, 0.f, 0.f, 0.f};
+  f32x4 acc01 = {0.f, 0.f, 0.f, 0.f};
+  f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
+  f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
+
+  for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K) {
+    const int k_base = k0 + ty * MATMUL_CHUNK_K;
+    const int k_rem = max(0, min(MATMUL_CHUNK_K, IM - k_base));
+
+    const float *gate_ptr0 = row0_active
+                                 ? gate_up_topk + gate_base0 + k_base
+                                 : gate_up_topk;
+    const float *gate_ptr1 = row1_active
+                                 ? gate_up_topk + gate_base1 + k_base
+                                 : gate_up_topk;
+
+    s16x4 Avec_r0 =
+        pack4_bf16_from_f32_guard(gate_ptr0, 0, k_rem, row0_active);
+    s16x4 Avec_r1 =
+        pack4_bf16_from_f32_guard(gate_ptr1, 0, k_rem, row1_active);
+
+    const int tile_k_idx = k0 / MATMUL_TILE_K;
     const size_t chunk_offset =
-        (size_t)tile_k_idx * tile_elems + (size_t)group * group_stride;
-    const uint16_t *src = w_matrix_u16 + base_row + chunk_offset;
-    const uint2 w_u2 = *reinterpret_cast<const uint2 *>(src);
-    const float4 w_vals = bf16quad_to_float4(w_u2);
+        (size_t)tile_k_idx * tile_elems + group_offset;
 
-    if (k_base + MATMUL_CHUNK_K <= cols) {
-      const float4 gv = *reinterpret_cast<const float4 *>(gate_vec + k_base);
-      acc = fmaf(w_vals.x, gv.x, acc);
-      acc = fmaf(w_vals.y, gv.y, acc);
-      acc = fmaf(w_vals.z, gv.z, acc);
-      acc = fmaf(w_vals.w, gv.w, acc);
-    } else {
-      const int tail = cols - k_base;
-      if (tail > 0) {
-        acc = fmaf(w_vals.x, gate_vec[k_base + 0], acc);
-        if (tail > 1)
-          acc = fmaf(w_vals.y, gate_vec[k_base + 1], acc);
-        if (tail > 2)
-          acc = fmaf(w_vals.z, gate_vec[k_base + 2], acc);
+    s16x4 Bvec_c0 = {0, 0, 0, 0};
+    if (c0_ok && k_rem > 0) {
+      const uint16_t *src0 = w_u16 + base_tile_c0 + chunk_offset;
+      Bvec_c0[0] = (short)src0[0];
+      Bvec_c0[1] = (short)src0[1];
+      Bvec_c0[2] = (short)src0[2];
+      Bvec_c0[3] = (short)src0[3];
+      if (k_rem < MATMUL_CHUNK_K) {
+        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
+          Bvec_c0[j] = 0;
+      }
+    }
+
+    s16x4 Bvec_c1 = {0, 0, 0, 0};
+    if (c1_ok && k_rem > 0) {
+      const uint16_t *src1 = w_u16 + base_tile_c1 + chunk_offset;
+      Bvec_c1[0] = (short)src1[0];
+      Bvec_c1[1] = (short)src1[1];
+      Bvec_c1[2] = (short)src1[2];
+      Bvec_c1[3] = (short)src1[3];
+      if (k_rem < MATMUL_CHUNK_K) {
+        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
+          Bvec_c1[j] = 0;
+      }
+    }
+
+    acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
+                                                       acc00, 0, 0, 0);
+    acc01 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c1,
+                                                       acc01, 0, 0, 0);
+    acc10 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c0,
+                                                       acc10, 0, 0, 0);
+    acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1,
+                                                       acc11, 0, 0, 0);
+  }
+
+  const float bias_c0 = c0_ok ? bias_base[c0] : 0.0f;
+  const float bias_c1 = c1_ok ? bias_base[c1] : 0.0f;
+
+  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
+    const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
+    const int idx_lo = row_lo - M0;
+    if (idx_lo >= 0 && idx_lo < tile_rows && sh_valid[idx_lo]) {
+      const int batch = sh_batch[idx_lo];
+      const float weight = sh_weight[idx_lo];
+      if (batch >= 0 && weight != 0.0f) {
+        if (c0_ok) {
+          const float contrib = (acc00[i] + bias_c0) * weight;
+          atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)c0,
+                    contrib);
+        }
+        if (c1_ok) {
+          const float contrib = (acc01[i] + bias_c1) * weight;
+          atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)c1,
+                    contrib);
+        }
+      }
+    }
+
+    const int row_hi = row_lo + 16;
+    const int idx_hi = row_hi - M0;
+    if (idx_hi >= 0 && idx_hi < tile_rows && sh_valid[idx_hi]) {
+      const int batch = sh_batch[idx_hi];
+      const float weight = sh_weight[idx_hi];
+      if (batch >= 0 && weight != 0.0f) {
+        if (c0_ok) {
+          const float contrib = (acc10[i] + bias_c0) * weight;
+          atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)c0,
+                    contrib);
+        }
+        if (c1_ok) {
+          const float contrib = (acc11[i] + bias_c1) * weight;
+          atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)c1,
+                    contrib);
+        }
       }
     }
   }
-
-  const float bias = b_mlp2_all[base + (size_t)h_idx];
-  const float contrib = (acc + bias) * expert_weight;
-  atomicAdd(e_agg + (size_t)batch_idx * (size_t)H + (size_t)h_idx, contrib);
 }
