@@ -99,10 +99,13 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // RoPE params
     float theta, float rope_scaling_factor, int initial_context_length,
     // cache params
-    int layer_offset,   // = l * S * (Hk*D)
-    int kv_total_size,  // = L * S * (Hk*D)
+    int layer_idx,
+    const uint32_t *__restrict__ layer_offsets,
+    const int *__restrict__ layer_capacity,
+    uint32_t kv_batch_stride,
     int batch_size)
 {
+
     const int h = blockIdx.x;           // head idx
     const int b = blockIdx.y;           // batch idx
     const int i = threadIdx.x;          // [0..D/2)
@@ -118,10 +121,14 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     const int kv_size = Hk * D;
     const int KV      = kv_size;
 
+    const int cap = layer_capacity[layer_idx];
+    if (cap <= 0) return;
+    const uint32_t layer_base = layer_offsets[layer_idx];
+
     // base pointers per batch
     float* __restrict__ q_b      = q_out       + (size_t)b * q_size;
-    bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_total_size;
-    bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_total_size;
+    bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_batch_stride;
+    bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_batch_stride;
     const float* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
     // ---- compute RoPE angles for this (i, b)
@@ -162,8 +169,9 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // ---- K: read from qkv, apply RoPE, scatter to key_cache
     if (h < Hk) {
         const int k_off_qkv = q_size + h * D;           // K starts after Q
-        const int pos_off   = pos_b * KV + h * D;       // per-token head offset in cache
-        const size_t kc_idx = (size_t)layer_offset + (size_t)pos_off;
+        const int slot = pos_b % cap;
+        const size_t kc_idx = (size_t)layer_base + (size_t)slot * KV +
+                              (size_t)h * D;
 
         float k1 = qkv_b[k_off_qkv + i];
         float k2 = qkv_b[k_off_qkv + half + i];
@@ -175,7 +183,7 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
 
         // ---- V: read from qkv, direct scatter (no RoPE)
         const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
-        const size_t vc_idx = (size_t)layer_offset + (size_t)pos_off;
+        const size_t vc_idx = kc_idx;
         float v1 = qkv_b[v_off_qkv + i];
         float v2 = qkv_b[v_off_qkv + half + i];
         vcache_b[vc_idx + i]        = hip_bfloat16(v1);
