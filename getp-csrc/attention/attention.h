@@ -4,8 +4,8 @@
 #include "../common/defines.h"
 
 __global__ void attention_batch_kernel(
-    float *__restrict__ out_tb,  // [B, Hq*D]
-    const float *__restrict__ q, // [B, Hq*D], FP32 (already rotary-applied)
+    bf16_t *__restrict__ out_tb,  // [B, Hq*D] (bf16 storage)
+    const bf16_t *__restrict__ q, // [B, Hq*D], BF16 (already rotary-applied)
     const bf16_t *__restrict__ k_cache,    // [B, L*S*KV], BF16
     const bf16_t *__restrict__ v_cache,    // [B, L*S*KV], BF16
     const float *__restrict__ attn_sinks, // [L*Hq]

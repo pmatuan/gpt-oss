@@ -74,7 +74,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   return v;
 }
 
-__global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
+__global__ void copy_embedding_bf16_batch_kernel(bf16_t *dst, const bf16_t *src,
                                                  const int *tokens,
                                                  int batch_size,
                                                  int hidden_dim) {
@@ -84,12 +84,12 @@ __global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
   if (batch_idx < batch_size && i < hidden_dim && tokens[batch_idx] >= 0) {
     int token = tokens[batch_idx];
     dst[(size_t)batch_idx * hidden_dim + i] =
-        static_cast<float>(src[(size_t)token * hidden_dim + i]);
+        src[(size_t)token * hidden_dim + i];
   }
 }
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
-    float* __restrict__ q_out,
+    bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
     const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
@@ -126,7 +126,7 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     const uint32_t layer_base = layer_offsets[layer_idx];
 
     // base pointers per batch
-    float* __restrict__ q_b      = q_out       + (size_t)b * q_size;
+    bf16_t* __restrict__ q_b      = q_out       + (size_t)b * q_size;
     bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_batch_stride;
     bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_batch_stride;
     const float* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
@@ -162,8 +162,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
         // rotate
         float y1 = x1 * c - x2 * s;
         float y2 = x2 * c + x1 * s;
-        q_b[q_off + i]        = y1;
-        q_b[q_off + half + i] = y2;
+        q_b[q_off + i]        = hip_bfloat16(y1);
+        q_b[q_off + half + i] = hip_bfloat16(y2);
     }
 
     // ---- K: read from qkv, apply RoPE, scatter to key_cache
@@ -191,7 +191,7 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     }
 }
 
-__global__ void residual_add_batch_kernel(float *x, const float *residual,
+__global__ void residual_add_batch_kernel(bf16_t *x, const float *residual,
                                           int size,
                                           int batch_size,
                                           const int *pos) {
@@ -202,11 +202,13 @@ __global__ void residual_add_batch_kernel(float *x, const float *residual,
   if (pos && pos[b] < 0)
     return;
   if (i < size) {
-    x[(size_t)b * size + i] += residual[(size_t)b * size + i];
+    const size_t offset = (size_t)b * size + i;
+    float acc = static_cast<float>(x[offset]) + residual[offset];
+    x[offset] = hip_bfloat16(acc);
   }
 }
 
-__global__ void rmsnorm_batch_kernel(float *o, const float *x,
+__global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
                                      const float *weight, int size,
                                      const int *pos) {
   const int b = blockIdx.y;
@@ -218,40 +220,25 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   if (pos && pos[b] < 0)
     return;
 
-  const float *x_b = x + (size_t)b * size;
-  float *o_b = o + (size_t)b * size;
+  const bf16_t *x_b = x + (size_t)b * size;
+  bf16_t *o_b = o + (size_t)b * size;
 
-  // Vectorized sum of squares using float4
   float sum = 0.0f;
-  const int size4 = size >> 2;
-  
-  // Process float4 chunks
-  for (int i = tid; i < size4; i += blockDim.x) {
-    float4 v = reinterpret_cast<const float4*>(x_b)[i];
-    sum = fmaf(v.x, v.x, sum);
-    sum = fmaf(v.y, v.y, sum);
-    sum = fmaf(v.z, v.z, sum);
-    sum = fmaf(v.w, v.w, sum);
-  }
-  
-  // Handle remaining elements
-  for (int i = (size4 << 2) + tid; i < size; i += blockDim.x) {
-    float v = x_b[i];
+  for (int idx = tid; idx < size; idx += blockDim.x) {
+    float v = static_cast<float>(x_b[idx]);
     sum = fmaf(v, v, sum);
   }
 
-  // Warp reduction
 #pragma unroll
   for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
     sum += __shfl_down(sum, off, WF_SIZE);
   }
-  
+
   __shared__ float warp_sums[BLOCK_SIZE / WF_SIZE];
   if (lane == 0)
     warp_sums[wid] = sum;
   __syncthreads();
 
-  // Block reduction
   float total = 0.0f;
   if (tid < BLOCK_SIZE / WF_SIZE)
     total = warp_sums[tid];
@@ -267,25 +254,14 @@ __global__ void rmsnorm_batch_kernel(float *o, const float *x,
   }
   __syncthreads();
 
-  // Use rsqrt directly as in Python reference
   const float mean_sq = warp_sums[0] / (float)size;
   const float inv_rms = rsqrtf(mean_sq + 1e-5f);
-  
-  // Vectorized output computation
-  for (int i = tid; i < size4; i += blockDim.x) {
-    float4 v = reinterpret_cast<const float4*>(x_b)[i];
-    float4 w = reinterpret_cast<const float4*>(weight)[i];
-    float4 result;
-    result.x = w.x * (v.x * inv_rms);
-    result.y = w.y * (v.y * inv_rms);
-    result.z = w.z * (v.z * inv_rms);
-    result.w = w.w * (v.w * inv_rms);
-    reinterpret_cast<float4*>(o_b)[i] = result;
-  }
-  
-  // Handle remaining elements
-  for (int i = (size4 << 2) + tid; i < size; i += blockDim.x) {
-    o_b[i] = weight[i] * (x_b[i] * inv_rms);
+
+  for (int idx = tid; idx < size; idx += blockDim.x) {
+    float v = static_cast<float>(x_b[idx]);
+    float w = weight[idx];
+    float result = w * (v * inv_rms);
+    o_b[idx] = hip_bfloat16(result);
   }
 }
 

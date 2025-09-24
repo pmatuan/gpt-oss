@@ -43,9 +43,10 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   debug_print_gpu_memory("before allocations", device_id);
 
   // Activations
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, H * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, H * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb, D * Hq * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x, H * sizeof(bf16_t)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t, H * sizeof(bf16_t)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t_fp32, H * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb, D * Hq * sizeof(bf16_t)));
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score, E * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
@@ -61,7 +62,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (D * (Hq + 2 * Hk)) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(bf16_t)));
 
   ctx.gpu_activations.d_key_cache = nullptr;
   ctx.gpu_activations.d_value_cache = nullptr;
@@ -243,6 +244,8 @@ static void cleanup_device_context(DeviceContext &ctx) {
     HIP_CHECK(hipFree(ctx.gpu_activations.d_x));
   if (ctx.gpu_activations.d_t)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_t));
+  if (ctx.gpu_activations.d_t_fp32)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_t_fp32));
   if (ctx.gpu_activations.d_tb)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_tb));
   if (ctx.gpu_activations.d_router_score)
@@ -374,6 +377,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
 
     free_if(ctx.gpu_activations.d_x);
     free_if(ctx.gpu_activations.d_t);
+    free_if(ctx.gpu_activations.d_t_fp32);
     free_if(ctx.gpu_activations.d_tb);
     free_if(ctx.gpu_activations.d_router_score);
     free_if(ctx.gpu_activations.d_topk_v);
@@ -397,11 +401,14 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     ctx.h_kv_layer_capacity.clear();
 
     HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_x, (size_t)B * H * sizeof(float)));
+        hipMalloc(&ctx.gpu_activations.d_x, (size_t)B * H * sizeof(bf16_t)));
     HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(float)));
+        hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(bf16_t)));
+    HIP_CHECK(
+        hipMalloc(&ctx.gpu_activations.d_t_fp32,
+                   (size_t)B * H * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb,
-                        (size_t)B * D * Hq * sizeof(float)));
+                        (size_t)B * D * Hq * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
                         (size_t)B * p->n_experts * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
@@ -413,7 +420,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                         (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
-                        (size_t)B * Hq * D * sizeof(float)));
+                        (size_t)B * Hq * D * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
                         (size_t)B * V * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens,
@@ -423,15 +430,19 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   } else {
     if (!ctx.gpu_activations.d_x) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x,
-                          (size_t)ctx.capacity_B * H * sizeof(float)));
+                          (size_t)ctx.capacity_B * H * sizeof(bf16_t)));
     }
     if (!ctx.gpu_activations.d_t) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t,
+                          (size_t)ctx.capacity_B * H * sizeof(bf16_t)));
+    }
+    if (!ctx.gpu_activations.d_t_fp32) {
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t_fp32,
                           (size_t)ctx.capacity_B * H * sizeof(float)));
     }
     if (!ctx.gpu_activations.d_tb) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb,
-                          (size_t)ctx.capacity_B * D * Hq * sizeof(float)));
+                          (size_t)ctx.capacity_B * D * Hq * sizeof(bf16_t)));
     }
     if (!ctx.gpu_activations.d_router_score) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
@@ -455,7 +466,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     }
     if (!ctx.gpu_activations.d_q) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
-                          (size_t)ctx.capacity_B * Hq * D * sizeof(float)));
+                          (size_t)ctx.capacity_B * Hq * D * sizeof(bf16_t)));
     }
     if (!ctx.gpu_activations.d_logits) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
@@ -719,12 +730,6 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
   ctx.is_context_phase = true;
   ctx.finished = false;
   ctx.num_generated = 0;
-
-  if (ctx.output_str.empty()) {
-    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
-    if (first_piece)
-      ctx.output_str += first_piece;
-  }
 }
 
 static int *gpu_forward_device_batch(Transformer *transformer,
@@ -852,7 +857,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         dim3 gridO_gemm((H + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
         dim3 blockO(16, 4, 1);
         matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO>>>(
-            ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
+            ctx.gpu_activations.d_t_fp32, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * ctx.stride_w_o_bf16,
             ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size,
             ctx.gpu_activations.d_pos);
@@ -863,7 +868,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         PROFILE_GPU_SCOPE("residual_add_batch_kernel", 0);
         dim3 gridH_batch(gridH_thread.x, batch_size, 1);
         residual_add_batch_kernel<<<gridH_batch, block, 0>>>(
-            ctx.gpu_activations.d_x, ctx.gpu_activations.d_t, H, batch_size,
+            ctx.gpu_activations.d_x, ctx.gpu_activations.d_t_fp32, H, batch_size,
             ctx.gpu_activations.d_pos);
       }
     }
@@ -1129,16 +1134,9 @@ static long long run_requests_on_device(Transformer *transformer,
           ctx.finished = true;
           h_active[i] = 0;
           num_finished++;
-          const char *piece = decode_piece(tokenizer, ctx.token, next);
-          if (piece)
-            ctx.output_str += piece;
           ctx.token = next;
           continue;
         }
-
-        const char *piece = decode_piece(tokenizer, ctx.token, next);
-        if (piece)
-          ctx.output_str += piece;
 
         ctx.token = next;
         h_tokens[i] = next;
@@ -1218,8 +1216,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   // Sequential, ordered output & cleanup
   for (int idx = 0; idx < num_requests; ++idx) {
-    safe_printf(ctxs[idx].output_str.c_str());
-    safe_printf("\n");
     free_prompt_ctx_heap_buffers(ctxs[idx]);
   }
   delete[] ctxs;

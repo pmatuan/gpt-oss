@@ -8,7 +8,7 @@
 __global__ __launch_bounds__(64, 2)
 void matmul_bias_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
-    const float* __restrict__ x,    // [B x n] (fp32)
+    const bf16_t* __restrict__ x,   // [B x n] (bf16)
     const bf16_t* __restrict__ w,   // [d x n] (bf16)
     const float* __restrict__ bias, // [d] or nullptr
     int n, int d, int B,
@@ -70,11 +70,10 @@ void matmul_bias_gemm_kernel_bf16_mfma(
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
     const int k_rem  = max(0, min(MATMUL_CHUNK_K, n - k_base));
 
-    // A (X): row-major [B x n] -> take 4 fp32, convert to bf16 with guards
-    const float* x_r0 = x + (size_t)r0 * n + k_base;
-    const float* x_r1 = x + (size_t)r1 * n + k_base;
-    s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_r0, 0, k_rem, r0_ok);
-    s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_r1, 0, k_rem, r1_ok);
+    const bf16_t* x_r0 = r0_ok ? x + (size_t)r0 * n + k_base : nullptr;
+    const bf16_t* x_r1 = r1_ok ? x + (size_t)r1 * n + k_base : nullptr;
+    s16x4 Avec_r0 = pack4_bf16_from_bf16_guard(x_r0, 0, k_rem, r0_ok);
+    s16x4 Avec_r1 = pack4_bf16_from_bf16_guard(x_r1, 0, k_rem, r1_ok);
 
     // B (W): packed tiles
     const int tile_k_idx = k0 / MATMUL_TILE_K;
@@ -141,7 +140,7 @@ void matmul_bias_gemm_kernel_bf16_mfma(
 __global__ __launch_bounds__(64, 2)
 void matmul_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
-    const float* __restrict__ x,    // [B x n] (fp32)
+    const bf16_t* __restrict__ x,   // [B x n] (bf16)
     const bf16_t* __restrict__ w,   // [d x n] (bf16)
     int n, int d, int B,
     const int* __restrict__ pos)    // nullable; pos[b] < 0 -> skip row
@@ -198,10 +197,10 @@ void matmul_gemm_kernel_bf16_mfma(
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
     const int k_rem = max(0, min(MATMUL_CHUNK_K, n - k_base));
 
-    const float* x_r0 = x + (size_t)r0 * n + k_base;
-    const float* x_r1 = x + (size_t)r1 * n + k_base;
-    const s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_r0, 0, k_rem, r0_ok);
-    const s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_r1, 0, k_rem, r1_ok);
+    const bf16_t* x_r0 = r0_ok ? x + (size_t)r0 * n + k_base : nullptr;
+    const bf16_t* x_r1 = r1_ok ? x + (size_t)r1 * n + k_base : nullptr;
+    const s16x4 Avec_r0 = pack4_bf16_from_bf16_guard(x_r0, 0, k_rem, r0_ok);
+    const s16x4 Avec_r1 = pack4_bf16_from_bf16_guard(x_r1, 0, k_rem, r1_ok);
 
     const int tile_k_idx = k0 / MATMUL_TILE_K;
     const size_t chunk_offset = (size_t)tile_k_idx * tile_elems + group_offset;
@@ -258,9 +257,9 @@ void matmul_gemm_kernel_bf16_mfma(
  * Grid: (ceil(d/TM), B)
  */
  __global__ __launch_bounds__(BLOCK_SIZE, 1)
- void matmul_bias_gemm_kernel_float(
-     float* __restrict__ y,          // [B, d]
-     const float* __restrict__ x,    // [B, n]
+void matmul_bias_gemm_kernel_float(
+    float* __restrict__ y,          // [B, d]
+    const bf16_t* __restrict__ x,   // [B, n] (bf16)
      const float* __restrict__ w,    // [d, n] (row-major theo n)
      const float* __restrict__ bias, // [d] (có thể null)
      int n, int d, int batch_size, const int *pos)
@@ -286,20 +285,20 @@ void matmul_gemm_kernel_bf16_mfma(
      const int k_size = min(TK, n - k_base);
  
      // 1) Optimized vectorized load of X columns for current batch
-     const float* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
-     
-     // Load using vectorized operations
-     const int vec4_k = (k_size >> 2);
-     float4* __restrict__ lds_x4 = reinterpret_cast<float4*>(lds_x);
-     const float4* __restrict__ xb4 = reinterpret_cast<const float4*>(xb);
-     
-     for (int v = tid; v < vec4_k; v += BLOCK_SIZE) {
-       lds_x4[v] = xb4[v];
-     }
-     
-     // Handle remainder elements
-     for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
-       lds_x[k] = xb[k];
+    const bf16_t* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
+
+    // Load using vectorized operations
+    const int vec4_k = (k_size >> 2);
+    float4* __restrict__ lds_x4 = reinterpret_cast<float4*>(lds_x);
+    const uint2* __restrict__ xb4 = reinterpret_cast<const uint2*>(xb);
+
+    for (int v = tid; v < vec4_k; v += BLOCK_SIZE) {
+      lds_x4[v] = bf16quad_to_float4(xb4[v]);
+    }
+    
+    // Handle remainder elements
+    for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
+      lds_x[k] = static_cast<float>(xb[k]);
      }
      __syncthreads();
  
@@ -409,7 +408,7 @@ __device__ __forceinline__ float swiglu_fused(float gate, float up,
 
 __global__ __launch_bounds__(64, 2)
 void mlp1_fused_gemm_kernel(
-    float *__restrict__ gate_up_topk, const float *__restrict__ x,
+    float *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
     const float *__restrict__ b_mlp1_all,
     const int *__restrict__ assignment_batches,
@@ -513,15 +512,15 @@ void mlp1_fused_gemm_kernel(
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
     const int k_rem = max(0, min(MATMUL_CHUNK_K, H - k_base));
 
-    const float *x_ptr0 = row0_active
-                              ? x + (size_t)batch0 * (size_t)H + k_base
-                              : x;
-    const float *x_ptr1 = row1_active
-                              ? x + (size_t)batch1 * (size_t)H + k_base
-                              : x;
+    const bf16_t *x_ptr0 = row0_active
+                               ? x + (size_t)batch0 * (size_t)H + k_base
+                               : nullptr;
+    const bf16_t *x_ptr1 = row1_active
+                               ? x + (size_t)batch1 * (size_t)H + k_base
+                               : nullptr;
 
-    s16x4 Avec_r0 = pack4_bf16_from_f32_guard(x_ptr0, 0, k_rem, row0_active);
-    s16x4 Avec_r1 = pack4_bf16_from_f32_guard(x_ptr1, 0, k_rem, row1_active);
+    s16x4 Avec_r0 = pack4_bf16_from_bf16_guard(x_ptr0, 0, k_rem, row0_active);
+    s16x4 Avec_r1 = pack4_bf16_from_bf16_guard(x_ptr1, 0, k_rem, row1_active);
 
     const int tile_k_idx = k0 / MATMUL_TILE_K;
     const size_t chunk_offset =
