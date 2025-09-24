@@ -540,7 +540,22 @@ static void ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
   const int KV = p->head_dim * p->n_kv_heads;
   const int L = p->n_layers;
 
-  const int new_full_capacity = std::max(required_seq, 1);
+  int target_full = ctx.gpu_activations.kv_seq_capacity;
+  if (target_full <= 0)
+    target_full = 1;
+  while (target_full < required_seq) {
+    int grown = target_full * 2;
+    if (grown < required_seq)
+      grown = required_seq;
+    if (grown > p->seq_len)
+      grown = p->seq_len;
+    if (grown == target_full)
+      break;
+    target_full = grown;
+    if (target_full == p->seq_len)
+      break;
+  }
+  const int new_full_capacity = target_full;
   const int window_limit = has_window ? p->sliding_window : new_full_capacity;
   const int new_window_capacity = has_window
                                       ? std::min(new_full_capacity, window_limit)
