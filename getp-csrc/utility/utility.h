@@ -17,23 +17,23 @@ __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
 __device__ __forceinline__ float warp_reduce_sum(float v);
 
 // Embedding and Data Movement Kernels
-__global__ void copy_embedding_bf16_batch_kernel(float *dst, const bf16_t *src,
+__global__ void copy_embedding_bf16_batch_kernel(bf16_t *dst, const bf16_t *src,
                                                  const int *tokens,
                                                  int batch_size,
                                                  int hidden_dim);
 
 // Normalization Kernels
-__global__ void rmsnorm_batch_kernel(float *out, const float *x,
+__global__ void rmsnorm_batch_kernel(bf16_t *out, const bf16_t *x,
                                      const float *weight, int dim,
                                      const int *pos);
 
 // Utility Operations
-__global__ void residual_add_batch_kernel(float *x, const float *residual,
+__global__ void residual_add_batch_kernel(bf16_t *x, const float *residual,
                                           int dim, int batch_size,
                                           const int *pos);
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
-    float* __restrict__ q_out,
+    bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
     const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]

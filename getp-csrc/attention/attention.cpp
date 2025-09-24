@@ -1,12 +1,13 @@
 #include "../common/defines.h"
+#include "../utility/utility.h"
 #include "attention.h"
 #include <math.h>
 
 // Batched attention kernel: processes grid.y = batch dimension
 // Uses dynamic shared memory sized for (effective tokens + 1) floats
 __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
-    float *__restrict__ out_tb,  // [B, Hq*D]
-    const float *__restrict__ q, // [B, Hq*D], FP32 (already rotary-applied)
+    bf16_t *__restrict__ out_tb,  // [B, Hq*D] (bf16 storage)
+    const bf16_t *__restrict__ q, // [B, Hq*D], BF16 (already rotary-applied)
     const bf16_t *__restrict__ k_cache,
     const bf16_t *__restrict__ v_cache,
     const float *__restrict__ attn_sinks, // [L*Hq]
@@ -31,13 +32,13 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
   const float rsqrt_D = rsqrtf((float)D);
 
   // Base pointers for batch b and layer layer_idx
-  const float *__restrict__ q_b = q + (size_t)b * Hq * D;
+  const bf16_t *__restrict__ q_b = q + (size_t)b * Hq * D;
   const uint32_t layer_base = layer_offsets[layer_idx];
   const bf16_t *__restrict__ k_layer =
       k_cache + (size_t)b * kv_batch_stride + layer_base;
   const bf16_t *__restrict__ v_layer =
       v_cache + (size_t)b * kv_batch_stride + layer_base;
-  float *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
+  bf16_t *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
 
   extern __shared__ float s_att[];
 
@@ -56,23 +57,22 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     const int t = start_t + local_t;
     const int slot = t % cap;
     const bf16_t *k_ptr = k_layer + (size_t)slot * kv_dim + kv_head * D;
-    const float *q_ptr = q_b + head * D;
+    const bf16_t *q_ptr = q_b + head * D;
 
     float score = 0.0f;
     const int D4 = D >> 2;
-    const float4 *q4 = reinterpret_cast<const float4 *>(q_ptr);
+    const uint2 *q4 = reinterpret_cast<const uint2 *>(q_ptr);
 
     // Unrolled vectorized dot product for better ILP
     #pragma unroll 4
     for (int d4 = 0; d4 < D4; ++d4) {
-      // Convert bf16 to float4 for computation
       float4 kv;
       kv.x = static_cast<float>(k_ptr[d4 * 4 + 0]);
       kv.y = static_cast<float>(k_ptr[d4 * 4 + 1]);
       kv.z = static_cast<float>(k_ptr[d4 * 4 + 2]);
       kv.w = static_cast<float>(k_ptr[d4 * 4 + 3]);
       
-      float4 qv = q4[d4];
+      float4 qv = bf16quad_to_float4(q4[d4]);
       score = fmaf(qv.x, kv.x, score);
       score = fmaf(qv.y, kv.y, score);
       score = fmaf(qv.z, kv.z, score);
@@ -81,7 +81,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     
     // Handle remainder
     for (int d = (D4 << 2); d < D; ++d) {
-      score = fmaf(q_ptr[d], static_cast<float>(k_ptr[d]), score);
+      score = fmaf(static_cast<float>(q_ptr[d]), static_cast<float>(k_ptr[d]), score);
     }
     
     // Scale score
@@ -163,7 +163,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
         result = fmaf(s_att[local_t], static_cast<float>(v_ptr[d]), result);
       }
       
-      out_b[head * D + d] = result;
+      out_b[head * D + d] = hip_bfloat16(result);
     }
   }
 }
