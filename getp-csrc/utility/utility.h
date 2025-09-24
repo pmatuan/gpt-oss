@@ -43,8 +43,10 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // RoPE params
     float theta, float rope_scaling_factor, int initial_context_length,
     // cache params
-    int layer_offset,   // = l * S * (Hk*D)
-    int kv_total_size,  // = L * S * (Hk*D)
+    int layer_idx,
+    const uint32_t *__restrict__ layer_offsets,
+    const int *__restrict__ layer_capacity,
+    uint32_t kv_batch_stride,
     int batch_size);
 
 // Expert/MoE Utility Kernels

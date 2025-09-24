@@ -3,8 +3,10 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <stdint.h>
 #include <string>
 #include <stdlib.h>
+#include <vector>
 
 typedef hip_bfloat16 bf16_t;
 
@@ -18,7 +20,7 @@ typedef hip_bfloat16 bf16_t;
 #define EXPERT_PER_TOKEN 4
 #define EXPERT_PER_TOKEN_SHIFT 2
 #define EXPERT_PER_TOKEN_MASK (EXPERT_PER_TOKEN - 1)
-#define MAX_BATCH_SIZE 256
+#define MAX_BATCH_SIZE 512
 #define TM_MM 32
 #define TN_MM 32
 #define MLP_TILE_TOKENS 32
@@ -51,29 +53,16 @@ struct GPUActivationBuffers {
   float *d_x, *d_t, *d_tb;
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
-  float *d_gate_up, *d_e_agg;
+  float *d_e_agg;
   float *d_gate_up_workspace; // Pre-allocated workspace for MLP
-  int *d_expert_counts;
-  int *d_expert_offsets;
-  int *d_expert_assignments;
-  size_t expert_assign_capacity;
-  int *d_assignment_active_slot;
-  size_t assignment_active_capacity;
-  int *d_active_experts;
-  int *d_active_counts;
-  int active_expert_capacity;
-  float *d_moe_x_workspace;
-  float *d_mlp1_workspace;
-  float *d_mlp2_workspace;
   size_t gate_up_workspace_bytes;
-  size_t moe_x_workspace_bytes;
-  size_t mlp1_workspace_bytes;
-  size_t mlp2_workspace_bytes;
   float *d_qkv, *d_q;
   bf16_t *d_key_cache, *d_value_cache;
+  int kv_seq_capacity;
+  int kv_window_capacity;
+  uint32_t kv_batch_stride;
   float *d_logits;
   int *d_next_tokens;
-  int *d_token2row;
   int *d_tokens;
   int *d_pos;
   float *d_inv_rms;
@@ -113,6 +102,10 @@ struct DeviceContext {
   size_t stride_w_out_bf16 = 0;
   size_t stride_w_mlp1_bf16 = 0;
   size_t stride_w_mlp2_bf16 = 0;
+  std::vector<uint32_t> h_kv_layer_offsets;
+  std::vector<int> h_kv_layer_capacity;
+  uint32_t *d_kv_layer_offsets = nullptr;
+  int *d_kv_layer_capacity = nullptr;
 };
 
 // Prompt Context Structure

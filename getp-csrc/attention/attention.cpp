@@ -7,11 +7,13 @@
 __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     float *__restrict__ out_tb,  // [B, Hq*D]
     const float *__restrict__ q, // [B, Hq*D], FP32 (already rotary-applied)
-    const bf16_t *__restrict__ k_cache,    // [B, L*S*KV], BF16
-    const bf16_t *__restrict__ v_cache,    // [B, L*S*KV], BF16
+    const bf16_t *__restrict__ k_cache,
+    const bf16_t *__restrict__ v_cache,
     const float *__restrict__ attn_sinks, // [L*Hq]
-    int layer_idx, const int *__restrict__ pos, int D, int Hq, int Hk, int S,
-    int sliding_window, int kv_stride, int batch_size) {
+    int layer_idx, const int *__restrict__ pos, int D, int Hq, int Hk,
+    const uint32_t *__restrict__ layer_offsets,
+    const int *__restrict__ layer_capacity, int sliding_window,
+    uint32_t kv_batch_stride, int batch_size) {
   const int b = blockIdx.y;
   if (b >= batch_size)
     return;
@@ -19,7 +21,8 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
   const int lane = threadIdx.x;
 
   const int pos_b = pos[b];
-  if (pos_b < 0 || head >= Hq)
+  const int cap = layer_capacity[layer_idx];
+  if (pos_b < 0 || head >= Hq || cap <= 0)
     return;
 
   const int kv_dim = Hk * D;
@@ -29,10 +32,11 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
 
   // Base pointers for batch b and layer layer_idx
   const float *__restrict__ q_b = q + (size_t)b * Hq * D;
+  const uint32_t layer_base = layer_offsets[layer_idx];
   const bf16_t *__restrict__ k_layer =
-      k_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
+      k_cache + (size_t)b * kv_batch_stride + layer_base;
   const bf16_t *__restrict__ v_layer =
-      v_cache + (size_t)b * kv_stride + (size_t)layer_idx * S * kv_dim;
+      v_cache + (size_t)b * kv_batch_stride + layer_base;
   float *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
 
   extern __shared__ float s_att[];
@@ -50,7 +54,8 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
   // Compute attention scores with enhanced vectorization
   for (int local_t = lane; local_t < att_tokens; local_t += WF_SIZE) {
     const int t = start_t + local_t;
-    const bf16_t *k_ptr = k_layer + (size_t)t * kv_dim + kv_head * D;
+    const int slot = t % cap;
+    const bf16_t *k_ptr = k_layer + (size_t)slot * kv_dim + kv_head * D;
     const float *q_ptr = q_b + head * D;
 
     float score = 0.0f;
@@ -143,7 +148,8 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
         #pragma unroll
         for (int ti = 0; ti < TILE; ++ti) {
           const int t = start_t + local_t + ti;
-          const bf16_t *v_ptr = v_layer + (size_t)t * kv_dim + kv_head * D;
+          const int slot = t % cap;
+          const bf16_t *v_ptr = v_layer + (size_t)slot * kv_dim + kv_head * D;
           result = fmaf(s_att[local_t + ti], static_cast<float>(v_ptr[d]),
                         result);
         }
@@ -152,7 +158,8 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
       // Handle remainder
       for (; local_t < att_tokens; ++local_t) {
         const int t = start_t + local_t;
-        const bf16_t *v_ptr = v_layer + (size_t)t * kv_dim + kv_head * D;
+        const int slot = t % cap;
+        const bf16_t *v_ptr = v_layer + (size_t)slot * kv_dim + kv_head * D;
         result = fmaf(s_att[local_t], static_cast<float>(v_ptr[d]), result);
       }
       
