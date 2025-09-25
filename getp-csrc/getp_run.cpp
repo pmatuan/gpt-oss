@@ -68,6 +68,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.gpu_activations.d_value_cache = nullptr;
   ctx.gpu_activations.kv_seq_capacity = 0;
   ctx.gpu_activations.kv_window_capacity = 0;
+  ctx.gpu_activations.kv_seq_limit = 0;
   ctx.gpu_activations.kv_batch_stride = 0;
   ctx.h_kv_layer_offsets.clear();
   ctx.h_kv_layer_capacity.clear();
@@ -348,9 +349,12 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 }
 
 // ============================ Forward ============================
+static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq);
+
 // Ensure device has capacity for B batch slots (reallocates activations &
 // caches if needed)
-static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
+static inline void ensure_device_capacity(DeviceContext &ctx, int B,
+                                          int max_seq_hint = 0) {
   HIP_CHECK(hipSetDevice(ctx.device_id));
 
   const bool need_realloc = B > ctx.capacity_B;
@@ -394,6 +398,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
     ctx.gpu_activations.gate_up_workspace_bytes = 0;
     ctx.gpu_activations.kv_seq_capacity = 0;
     ctx.gpu_activations.kv_window_capacity = 0;
+    ctx.gpu_activations.kv_seq_limit = 0;
     ctx.gpu_activations.kv_batch_stride = 0;
     free_if(ctx.d_kv_layer_offsets);
     free_if(ctx.d_kv_layer_capacity);
@@ -538,12 +543,71 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B) {
   }
   if (ctx.n_streams < B)
     ctx.n_streams = B;
+  int seq_hint = max_seq_hint > 0 ? max_seq_hint : p->seq_len;
+  seq_hint = std::max(1, std::min(seq_hint, p->seq_len));
+
+  const bool need_kv_alloc =
+      !ctx.gpu_activations.d_key_cache || !ctx.gpu_activations.d_value_cache ||
+      ctx.gpu_activations.kv_seq_capacity == 0;
+
+  if (need_kv_alloc) {
+    auto kv_bytes_for_seq = [&](int seq) -> size_t {
+      seq = std::max(1, std::min(seq, p->seq_len));
+      const bool has_window = (p->sliding_window > 0);
+      const int even_layers = has_window ? (p->n_layers + 1) / 2 : 0;
+      const int odd_layers = p->n_layers - even_layers;
+      const int window_tokens = has_window ? std::min(seq, p->sliding_window)
+                                           : seq;
+      const size_t tokens_per_seq =
+          (size_t)odd_layers * seq + (size_t)even_layers * window_tokens;
+      const size_t elems_per_seq = tokens_per_seq * (size_t)KV;
+      return elems_per_seq * (size_t)ctx.capacity_B * sizeof(bf16_t);
+    };
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+
+    constexpr size_t kSafetyMargin = 1024ULL << 20; // 1024 MiB
+    size_t available_for_kv =
+        free_bytes > kSafetyMargin ? free_bytes - kSafetyMargin : 0;
+
+    int target_seq = seq_hint;
+    size_t key_bytes = kv_bytes_for_seq(target_seq);
+
+    while (target_seq > 1 &&
+           (key_bytes == 0 || 2 * key_bytes > available_for_kv)) {
+      const int next_seq = std::max(1, target_seq / 2);
+      if (next_seq == target_seq)
+        break;
+      target_seq = next_seq;
+      key_bytes = kv_bytes_for_seq(target_seq);
+    }
+
+    if (key_bytes == 0 || 2 * key_bytes > available_for_kv) {
+      double need_gib = (2.0 * (double)key_bytes) / (1024.0 * 1024.0 * 1024.0);
+      double avail_gib = (double)available_for_kv /
+                         (1024.0 * 1024.0 * 1024.0);
+      fprintf(stderr,
+              "Unable to allocate KV cache for batch %d: need %.2f GiB, have %.2f GiB\n",
+              ctx.capacity_B, need_gib, avail_gib);
+      exit(EXIT_FAILURE);
+    }
+
+    ctx.gpu_activations.kv_seq_limit = target_seq;
+    int actual_seq = ensure_kv_cache_capacity(ctx, target_seq);
+    ctx.gpu_activations.kv_seq_limit = actual_seq;
+  }
 }
 
-static void ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
+static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
   const Config *p = model_config;
   if (!p)
-    return;
+    return ctx.gpu_activations.kv_seq_capacity;
+
+  int seq_limit_hint = ctx.gpu_activations.kv_seq_limit;
+  if (seq_limit_hint > 0 && required_seq > seq_limit_hint)
+    required_seq = seq_limit_hint;
 
   required_seq = std::max(1, std::min(required_seq, p->seq_len));
 
@@ -551,64 +615,108 @@ static void ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
   const int KV = p->head_dim * p->n_kv_heads;
   const int L = p->n_layers;
 
-  int target_full = ctx.gpu_activations.kv_seq_capacity;
-  if (target_full <= 0)
-    target_full = 1;
+  int current_full = ctx.gpu_activations.kv_seq_capacity;
+  if (current_full >= required_seq && ctx.gpu_activations.d_key_cache &&
+      ctx.gpu_activations.d_value_cache) {
+    return current_full;
+  }
+
+  int target_full = current_full > 0 ? current_full : 1;
   while (target_full < required_seq) {
     int grown = target_full * 2;
     if (grown < required_seq)
       grown = required_seq;
+    if (seq_limit_hint > 0 && grown > seq_limit_hint)
+      grown = seq_limit_hint;
     if (grown > p->seq_len)
       grown = p->seq_len;
     if (grown == target_full)
       break;
     target_full = grown;
-    if (target_full == p->seq_len)
-      break;
   }
-  const int new_full_capacity = target_full;
-  const int window_limit = has_window ? p->sliding_window : new_full_capacity;
-  const int new_window_capacity = has_window
-                                      ? std::min(new_full_capacity, window_limit)
-                                      : new_full_capacity;
 
-  if (ctx.gpu_activations.d_key_cache && ctx.gpu_activations.d_value_cache &&
-      new_full_capacity <= ctx.gpu_activations.kv_seq_capacity &&
-      new_window_capacity <= ctx.gpu_activations.kv_window_capacity) {
-    return;
+  if (target_full <= current_full && ctx.gpu_activations.d_key_cache &&
+      ctx.gpu_activations.d_value_cache) {
+    if (seq_limit_hint > 0) {
+      ctx.gpu_activations.kv_seq_limit =
+          std::min(seq_limit_hint, ctx.gpu_activations.kv_seq_capacity);
+    } else {
+      ctx.gpu_activations.kv_seq_limit = ctx.gpu_activations.kv_seq_capacity;
+    }
+    return ctx.gpu_activations.kv_seq_capacity;
   }
 
   std::vector<uint32_t> old_offsets = ctx.h_kv_layer_offsets;
   std::vector<int> old_capacity = ctx.h_kv_layer_capacity;
   const uint32_t old_batch_stride = ctx.gpu_activations.kv_batch_stride;
-
-  std::vector<uint32_t> new_offsets(L + 1, 0);
-  std::vector<int> new_capacity(L, 0);
-
-  size_t accum = 0;
-  for (int l = 0; l < L; ++l) {
-    const bool layer_has_window = has_window && ((l & 1) == 0);
-    const int layer_cap = layer_has_window ? new_window_capacity
-                                           : new_full_capacity;
-    new_offsets[l] = static_cast<uint32_t>(accum);
-    new_capacity[l] = layer_cap;
-    accum += static_cast<size_t>(layer_cap) * KV;
-  }
-  new_offsets[L] = static_cast<uint32_t>(accum);
-
-  const size_t batch_stride_new = accum;
-  const size_t total_elems = (size_t)ctx.capacity_B * batch_stride_new;
-  const size_t total_bytes = total_elems * sizeof(bf16_t);
-
   bf16_t *old_key_ptr = ctx.gpu_activations.d_key_cache;
   bf16_t *old_value_ptr = ctx.gpu_activations.d_value_cache;
 
-  bf16_t *new_key = nullptr;
-  HIP_CHECK(hipMalloc(&new_key, total_bytes));
-  HIP_CHECK(hipMemsetAsync(new_key, 0, total_bytes, 0));
+  int attempt_full = target_full;
+  int fallback_full = current_full;
 
-  if (old_key_ptr) {
-    if (!old_offsets.empty()) {
+  while (attempt_full > fallback_full) {
+    const int window_limit = has_window ? p->sliding_window : attempt_full;
+    const int attempt_window = has_window ? std::min(attempt_full, window_limit)
+                                          : attempt_full;
+
+    std::vector<uint32_t> new_offsets(L + 1, 0);
+    std::vector<int> new_capacity(L, 0);
+
+    size_t accum = 0;
+    for (int l = 0; l < L; ++l) {
+      const bool layer_has_window = has_window && ((l & 1) == 0);
+      const int layer_cap = layer_has_window ? attempt_window : attempt_full;
+      new_offsets[l] = static_cast<uint32_t>(accum);
+      new_capacity[l] = layer_cap;
+      accum += static_cast<size_t>(layer_cap) * KV;
+    }
+    new_offsets[L] = static_cast<uint32_t>(accum);
+
+    const size_t batch_stride_new = accum;
+    const size_t total_elems = (size_t)ctx.capacity_B * batch_stride_new;
+    const size_t total_bytes = total_elems * sizeof(bf16_t);
+
+    bf16_t *new_key = nullptr;
+    hipError_t err_key = hipMalloc(&new_key, total_bytes);
+    if (err_key == hipErrorOutOfMemory) {
+      if (attempt_full == fallback_full + 1) {
+        attempt_full = fallback_full;
+      } else {
+        attempt_full = std::max(fallback_full + 1, attempt_full / 2);
+      }
+      continue;
+    } else if (err_key != hipSuccess) {
+      HIP_CHECK(err_key);
+    }
+    hipError_t err_mem_key = hipMemsetAsync(new_key, 0, total_bytes, 0);
+    if (err_mem_key != hipSuccess) {
+      HIP_CHECK(hipFree(new_key));
+      HIP_CHECK(err_mem_key);
+    }
+
+    bf16_t *new_value = nullptr;
+    hipError_t err_value = hipMalloc(&new_value, total_bytes);
+    if (err_value == hipErrorOutOfMemory) {
+      HIP_CHECK(hipFree(new_key));
+      if (attempt_full == fallback_full + 1) {
+        attempt_full = fallback_full;
+      } else {
+        attempt_full = std::max(fallback_full + 1, attempt_full / 2);
+      }
+      continue;
+    } else if (err_value != hipSuccess) {
+      HIP_CHECK(hipFree(new_key));
+      HIP_CHECK(err_value);
+    }
+    hipError_t err_mem_value = hipMemsetAsync(new_value, 0, total_bytes, 0);
+    if (err_mem_value != hipSuccess) {
+      HIP_CHECK(hipFree(new_key));
+      HIP_CHECK(hipFree(new_value));
+      HIP_CHECK(err_mem_value);
+    }
+
+    if (old_key_ptr && !old_offsets.empty()) {
       const size_t old_layers = old_capacity.size();
       for (int l = 0; l < std::min(L, static_cast<int>(old_layers)); ++l) {
         const int copy_tokens = std::min(old_capacity[l], new_capacity[l]);
@@ -629,16 +737,7 @@ static void ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
         }
       }
     }
-    HIP_CHECK(hipFree(old_key_ptr));
-  }
-  ctx.gpu_activations.d_key_cache = new_key;
-
-  bf16_t *new_value = nullptr;
-  HIP_CHECK(hipMalloc(&new_value, total_bytes));
-  HIP_CHECK(hipMemsetAsync(new_value, 0, total_bytes, 0));
-
-  if (old_value_ptr) {
-    if (!old_offsets.empty()) {
+    if (old_value_ptr && !old_offsets.empty()) {
       const size_t old_layers = old_capacity.size();
       for (int l = 0; l < std::min(L, static_cast<int>(old_layers)); ++l) {
         const int copy_tokens = std::min(old_capacity[l], new_capacity[l]);
@@ -659,33 +758,59 @@ static void ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
         }
       }
     }
-    HIP_CHECK(hipFree(old_value_ptr));
+
+    if (old_key_ptr)
+      HIP_CHECK(hipFree(old_key_ptr));
+    if (old_value_ptr)
+      HIP_CHECK(hipFree(old_value_ptr));
+
+    if (ctx.d_kv_layer_offsets)
+      HIP_CHECK(hipFree(ctx.d_kv_layer_offsets));
+    if (ctx.d_kv_layer_capacity)
+      HIP_CHECK(hipFree(ctx.d_kv_layer_capacity));
+
+    ctx.h_kv_layer_offsets = new_offsets;
+    ctx.h_kv_layer_capacity = new_capacity;
+
+    const size_t offsets_bytes = ctx.h_kv_layer_offsets.size() *
+                                 sizeof(uint32_t);
+    const size_t capacity_bytes = ctx.h_kv_layer_capacity.size() *
+                                  sizeof(int);
+    HIP_CHECK(hipMalloc(&ctx.d_kv_layer_offsets, offsets_bytes));
+    HIP_CHECK(hipMemcpy(ctx.d_kv_layer_offsets,
+                        ctx.h_kv_layer_offsets.data(), offsets_bytes,
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMalloc(&ctx.d_kv_layer_capacity, capacity_bytes));
+    HIP_CHECK(hipMemcpy(ctx.d_kv_layer_capacity,
+                        ctx.h_kv_layer_capacity.data(), capacity_bytes,
+                        hipMemcpyHostToDevice));
+
+    ctx.gpu_activations.d_key_cache = new_key;
+    ctx.gpu_activations.d_value_cache = new_value;
+    ctx.gpu_activations.kv_seq_capacity = attempt_full;
+    ctx.gpu_activations.kv_window_capacity = attempt_window;
+    ctx.gpu_activations.kv_batch_stride =
+        static_cast<uint32_t>(batch_stride_new);
+    ctx.gpu_activations.kv_seq_limit = attempt_full;
+
+    if (attempt_full < target_full) {
+      printf("[DEVICE] %d reduced KV cache to %d tokens due to allocation limits\n",
+             ctx.device_id, attempt_full);
+    }
+
+    return attempt_full;
   }
-  ctx.gpu_activations.d_value_cache = new_value;
-  ctx.gpu_activations.kv_seq_capacity = new_full_capacity;
-  ctx.gpu_activations.kv_window_capacity = new_window_capacity;
-  ctx.gpu_activations.kv_batch_stride = static_cast<uint32_t>(batch_stride_new);
 
-  if (ctx.d_kv_layer_offsets)
-    HIP_CHECK(hipFree(ctx.d_kv_layer_offsets));
-  if (ctx.d_kv_layer_capacity)
-    HIP_CHECK(hipFree(ctx.d_kv_layer_capacity));
+  if (ctx.gpu_activations.d_key_cache && ctx.gpu_activations.d_value_cache) {
+    ctx.gpu_activations.kv_seq_limit =
+        ctx.gpu_activations.kv_seq_capacity;
+    return ctx.gpu_activations.kv_seq_capacity;
+  }
 
-  ctx.h_kv_layer_offsets = new_offsets;
-  ctx.h_kv_layer_capacity = new_capacity;
-
-  const size_t offsets_bytes = ctx.h_kv_layer_offsets.size() *
-                               sizeof(uint32_t);
-  const size_t capacity_bytes = ctx.h_kv_layer_capacity.size() *
-                                sizeof(int);
-  HIP_CHECK(hipMalloc(&ctx.d_kv_layer_offsets, offsets_bytes));
-  HIP_CHECK(hipMalloc(&ctx.d_kv_layer_capacity, capacity_bytes));
-  HIP_CHECK(hipMemcpy(ctx.d_kv_layer_offsets,
-                      ctx.h_kv_layer_offsets.data(), offsets_bytes,
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(ctx.d_kv_layer_capacity,
-                      ctx.h_kv_layer_capacity.data(), capacity_bytes,
-                      hipMemcpyHostToDevice));
+  fprintf(stderr,
+          "Failed to allocate KV cache for device %d (batch=%d, seq=%d)\n",
+          ctx.device_id, ctx.capacity_B, required_seq);
+  exit(EXIT_FAILURE);
 }
 
 static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
@@ -761,7 +886,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
   const int V = p->vocab_size;
   const int QKV_D = D * (Hq + 2 * Hk);
 
-  ensure_kv_cache_capacity(ctx, max_pos_in_batch + 1);
+  (void)ensure_kv_cache_capacity(ctx, max_pos_in_batch + 1);
   const uint32_t kv_batch_stride = ctx.gpu_activations.kv_batch_stride;
 
   // Copy host tokens/positions into device buffers
@@ -1092,8 +1217,20 @@ static long long run_requests_on_device(Transformer *transformer,
     std::transform(batch_ctxs, batch_ctxs + B, h_tokens.begin(),
                    [](const PromptCtx &ctx) { return ctx.token; });
 
-    // Ensure device buffers sized for B and clear KV caches
-    ensure_device_capacity(g_devices[device_id], B);
+    int max_seq_hint = 0;
+    const int seq_cap = transformer->config.seq_len;
+    for (int i = 0; i < B; ++i) {
+      const PromptCtx &ctx = batch_ctxs[i];
+      int limit = ctx.max_steps > 0 ? ctx.max_steps : seq_cap;
+      limit = std::max(limit, ctx.num_prompt_tokens);
+      if (limit > seq_cap)
+        limit = seq_cap;
+      if (limit > max_seq_hint)
+        max_seq_hint = limit;
+    }
+
+    // Ensure device buffers sized for B and reserve KV cache up front
+    ensure_device_capacity(g_devices[device_id], B, max_seq_hint);
 
     std::vector<int> h_next_tokens(B, -1);
 
