@@ -730,6 +730,11 @@ static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
   ctx.is_context_phase = true;
   ctx.finished = false;
   ctx.num_generated = 0;
+  if (ctx.output_str.empty()) {
+    const char *first_piece = decode_piece(tokenizer, 200006, ctx.token);
+    if (first_piece)
+      ctx.output_str += first_piece;
+  }
 }
 
 static int *gpu_forward_device_batch(Transformer *transformer,
@@ -1134,9 +1139,16 @@ static long long run_requests_on_device(Transformer *transformer,
           ctx.finished = true;
           h_active[i] = 0;
           num_finished++;
+          const char *piece = decode_piece(tokenizer, ctx.token, next);
+          if (piece)
+            ctx.output_str += piece;
           ctx.token = next;
           continue;
         }
+
+        const char *piece = decode_piece(tokenizer, ctx.token, next);
+        if (piece)
+          ctx.output_str += piece;
 
         ctx.token = next;
         h_tokens[i] = next;
@@ -1216,6 +1228,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   // Sequential, ordered output & cleanup
   for (int idx = 0; idx < num_requests; ++idx) {
+    safe_printf(ctxs[idx].output_str.c_str());
+    safe_printf("\n");
     free_prompt_ctx_heap_buffers(ctxs[idx]);
   }
   delete[] ctxs;
