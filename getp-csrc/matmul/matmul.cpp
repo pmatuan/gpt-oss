@@ -166,6 +166,9 @@ void matmul_gemm_kernel_bf16_mfma(
 {
   constexpr int TILE_M = MATMUL_GEMM_TILE_ROWS; // rows per block (matches packing)
   constexpr int TILE_N = MATMUL_GEMM_TILE_COLS; // expanded columns per block
+  static_assert((MATMUL_GEMM_TILE_COLS % 16) == 0,
+                "MATMUL_GEMM_TILE_COLS must be a multiple of 16");
+  constexpr int COL_GROUPS = MATMUL_GEMM_TILE_COLS / 16;
 
   const int tx = threadIdx.x; // 0..15
   const int ty = threadIdx.y; // 0..3
@@ -173,15 +176,10 @@ void matmul_gemm_kernel_bf16_mfma(
   const int M0 = blockIdx.y * TILE_M;
   const int N0 = blockIdx.x * TILE_N;
 
-  const int cols[4] = {
-      N0 + tx,
-      N0 + tx + 16,
-      N0 + tx + 32,
-      N0 + tx + 48};
-
-  bool col_ok[4];
-  size_t base_tile[4] = {0, 0, 0, 0};
-  const uint16_t* w_base[4] = {nullptr, nullptr, nullptr, nullptr};
+  int cols[COL_GROUPS];
+  bool col_ok[COL_GROUPS];
+  size_t base_tile[COL_GROUPS] = {0};
+  const uint16_t* w_base[COL_GROUPS] = {nullptr};
 
   const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
   const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
@@ -189,8 +187,9 @@ void matmul_gemm_kernel_bf16_mfma(
   const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
   const size_t group_offset = (size_t)ty * group_stride;
 
-  for (int idx = 0; idx < 4; ++idx) {
-    const int c = cols[idx];
+  for (int idx = 0; idx < COL_GROUPS; ++idx) {
+    const int c = N0 + tx + idx * 16;
+    cols[idx] = c;
     const bool valid = (c < d);
     col_ok[idx] = valid;
     if (valid) {
@@ -209,54 +208,86 @@ void matmul_gemm_kernel_bf16_mfma(
   const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
   const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
 
-  f32x4 acc_lo[4];
-  f32x4 acc_hi[4];
-  for (int idx = 0; idx < 4; ++idx) {
+  f32x4 acc_lo[COL_GROUPS];
+  f32x4 acc_hi[COL_GROUPS];
+#pragma unroll
+  for (int idx = 0; idx < COL_GROUPS; ++idx) {
     acc_lo[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
     acc_hi[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
   }
 
-  size_t tile_offset = group_offset;
-  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
+  const uint16_t* x_ptr0 = r0_ok
+                               ? reinterpret_cast<const uint16_t*>(
+                                     x + (size_t)r0 * n) +
+                                     ty * MATMUL_CHUNK_K
+                               : nullptr;
+  const uint16_t* x_ptr1 = r1_ok
+                               ? reinterpret_cast<const uint16_t*>(
+                                     x + (size_t)r1 * n) +
+                                     ty * MATMUL_CHUNK_K
+                               : nullptr;
+
+  const uint16_t* w_ptr[COL_GROUPS];
+#pragma unroll
+  for (int idx = 0; idx < COL_GROUPS; ++idx) {
+    w_ptr[idx] = col_ok[idx] ? (w_base[idx] + group_offset) : nullptr;
+  }
+
+  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
     const int rem = n - k_base;
     if (rem <= 0) {
+      if (r0_ok) {
+        x_ptr0 += MATMUL_TILE_K;
+      }
+      if (r1_ok) {
+        x_ptr1 += MATMUL_TILE_K;
+      }
+#pragma unroll
+      for (int idx = 0; idx < COL_GROUPS; ++idx) {
+        if (col_ok[idx]) {
+          w_ptr[idx] += tile_elems;
+        }
+      }
       continue;
     }
 
     const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-    const bf16_t* x_r0 = (r0_ok && chunk_elems > 0)
-                             ? x + (size_t)r0 * n + k_base
-                             : nullptr;
-    const bf16_t* x_r1 = (r1_ok && chunk_elems > 0)
-                             ? x + (size_t)r1 * n + k_base
-                             : nullptr;
+    const s16x4 Avec_r0 =
+        (r0_ok && chunk_elems > 0) ? load_bf16x4_raw(x_ptr0, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
+    const s16x4 Avec_r1 =
+        (r1_ok && chunk_elems > 0) ? load_bf16x4_raw(x_ptr1, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
 
-    const s16x4 Avec_r0 = r0_ok ? load_bf16x4_raw(
-                                      reinterpret_cast<const uint16_t*>(x_r0),
-                                      chunk_elems)
-                                : s16x4{0, 0, 0, 0};
-    const s16x4 Avec_r1 = r1_ok ? load_bf16x4_raw(
-                                      reinterpret_cast<const uint16_t*>(x_r1),
-                                      chunk_elems)
-                                : s16x4{0, 0, 0, 0};
-
-    const size_t chunk_offset = tile_offset;
-    s16x4 Bvec[4];
+    s16x4 Bvec[COL_GROUPS];
 
 #pragma unroll
-    for (int idx = 0; idx < 4; ++idx) {
+    for (int idx = 0; idx < COL_GROUPS; ++idx) {
       Bvec[idx] = (col_ok[idx] && chunk_elems > 0)
-                      ? load_bf16x4_raw(w_base[idx] + chunk_offset, chunk_elems)
+                      ? load_bf16x4_raw(w_ptr[idx], chunk_elems)
                       : s16x4{0, 0, 0, 0};
     }
 
 #pragma unroll
-    for (int idx = 0; idx < 4; ++idx) {
+    for (int idx = 0; idx < COL_GROUPS; ++idx) {
       acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
           Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
       acc_hi[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
           Avec_r1, Bvec[idx], acc_hi[idx], 0, 0, 0);
+    }
+
+    if (r0_ok) {
+      x_ptr0 += MATMUL_TILE_K;
+    }
+    if (r1_ok) {
+      x_ptr1 += MATMUL_TILE_K;
+    }
+#pragma unroll
+    for (int idx = 0; idx < COL_GROUPS; ++idx) {
+      if (col_ok[idx]) {
+        w_ptr[idx] += tile_elems;
+      }
     }
   }
 
@@ -269,17 +300,21 @@ void matmul_gemm_kernel_bf16_mfma(
 
     if (row_lo_ok) {
       float* y0 = y + (size_t)row_lo * d;
-      if (col_ok[0]) y0[cols[0]] = acc_lo[0][i];
-      if (col_ok[1]) y0[cols[1]] = acc_lo[1][i];
-      if (col_ok[2]) y0[cols[2]] = acc_lo[2][i];
-      if (col_ok[3]) y0[cols[3]] = acc_lo[3][i];
+#pragma unroll
+      for (int idx = 0; idx < COL_GROUPS; ++idx) {
+        if (col_ok[idx]) {
+          y0[cols[idx]] = acc_lo[idx][i];
+        }
+      }
     }
     if (row_hi_ok) {
       float* y1 = y + (size_t)row_hi * d;
-      if (col_ok[0]) y1[cols[0]] = acc_hi[0][i];
-      if (col_ok[1]) y1[cols[1]] = acc_hi[1][i];
-      if (col_ok[2]) y1[cols[2]] = acc_hi[2][i];
-      if (col_ok[3]) y1[cols[3]] = acc_hi[3][i];
+#pragma unroll
+      for (int idx = 0; idx < COL_GROUPS; ++idx) {
+        if (col_ok[idx]) {
+          y1[cols[idx]] = acc_hi[idx][i];
+        }
+      }
     }
   }
 }
