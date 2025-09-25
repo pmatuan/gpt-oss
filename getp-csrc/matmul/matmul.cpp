@@ -49,35 +49,12 @@ void matmul_bias_gemm_kernel_bf16_mfma(
   // Per-lane columns (two 16-wide halves)
   const int c0 = N0 + tx;
   const int c1 = N0 + tx + 16;
-  const bool c0_ok = (c0 < d);
-  const bool c1_ok = (c1 < d);
 
   const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
   const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
   const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
   const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
   const size_t group_offset = (size_t)ty * group_stride;
-
-  size_t base_tile_c0 = 0;
-  const bool active_c0 = c0_ok;
-  if (active_c0) {
-    const int tile_col0 = c0 / MATMUL_TILE_COLS;
-    const int row_in_tile0 = c0 % MATMUL_TILE_COLS;
-    base_tile_c0 = ((size_t)tile_col0 * tiles_k) * tile_elems +
-                   (size_t)row_in_tile0 * MATMUL_CHUNK_K;
-  }
-
-  size_t base_tile_c1 = 0;
-  const bool active_c1 = c1_ok;
-  if (active_c1) {
-    const int tile_col1 = c1 / MATMUL_TILE_COLS;
-    const int row_in_tile1 = c1 % MATMUL_TILE_COLS;
-    base_tile_c1 = ((size_t)tile_col1 * tiles_k) * tile_elems +
-                   (size_t)row_in_tile1 * MATMUL_CHUNK_K;
-  }
-
-  const uint16_t* w_base_c0 = active_c0 ? w_u16 + base_tile_c0 : nullptr;
-  const uint16_t* w_base_c1 = active_c1 ? w_u16 + base_tile_c1 : nullptr;
 
   // Per-lane rows (two 16-high halves)
   const int r0 = M0 + tx;
@@ -86,6 +63,23 @@ void matmul_bias_gemm_kernel_bf16_mfma(
   const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
   const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
 
+  if (!r0_ok && !r1_ok) {
+    return;
+  }
+
+  const bool full_cols = (N0 + MATMUL_TILE_COLS) <= d;
+  const bool bias_ok = (bias != nullptr);
+  float bias_vals[2] = {0.f, 0.f};
+  if (bias_ok) {
+    if (full_cols) {
+      bias_vals[0] = bias[c0];
+      bias_vals[1] = bias[c1];
+    } else {
+      if (c0 < d) bias_vals[0] = bias[c0];
+      if (c1 < d) bias_vals[1] = bias[c1];
+    }
+  }
+
   // Accumulators for 4 MFMA fragments (32x32 tile = 2x2 of 16x16)
   f32x4 acc00 = {0.f,0.f,0.f,0.f};
   f32x4 acc01 = {0.f,0.f,0.f,0.f};
@@ -93,49 +87,97 @@ void matmul_bias_gemm_kernel_bf16_mfma(
   f32x4 acc11 = {0.f,0.f,0.f,0.f};
 
   // K-loop in steps of 16 (bf16 depth)
-  size_t tile_offset = group_offset;
-  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
+  const uint16_t* x_ptr0 = r0_ok
+                               ? reinterpret_cast<const uint16_t*>(
+                                     x + (size_t)r0 * n) +
+                                     ty * MATMUL_CHUNK_K
+                               : nullptr;
+  const uint16_t* x_ptr1 = r1_ok
+                               ? reinterpret_cast<const uint16_t*>(
+                                     x + (size_t)r1 * n) +
+                                     ty * MATMUL_CHUNK_K
+                               : nullptr;
+
+  const bool full_c0 = full_cols || (c0 < d);
+  const bool full_c1 = full_cols || (c1 < d);
+
+  const uint16_t* w_ptr_c0 = full_c0
+                                 ? (w_u16 + (((size_t)(c0 >> 5) * tiles_k) *
+                                             tile_elems +
+                                             ((size_t)(c0 & (MATMUL_TILE_COLS - 1))) *
+                                                 MATMUL_CHUNK_K +
+                                             group_offset))
+                                 : nullptr;
+  const uint16_t* w_ptr_c1 = full_c1
+                                 ? (w_u16 + (((size_t)(c1 >> 5) * tiles_k) *
+                                             tile_elems +
+                                             ((size_t)(c1 & (MATMUL_TILE_COLS - 1))) *
+                                                 MATMUL_CHUNK_K +
+                                             group_offset))
+                                 : nullptr;
+
+  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
     // Each ty takes a 4-wide slice in this k-tile
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
     const int rem = n - k_base;
     if (rem <= 0) {
+      if (r0_ok) {
+        x_ptr0 += MATMUL_TILE_K;
+      }
+      if (r1_ok) {
+        x_ptr1 += MATMUL_TILE_K;
+      }
+      if (full_c0) {
+        w_ptr_c0 += tile_elems;
+      }
+      if (full_c1) {
+        w_ptr_c1 += tile_elems;
+      }
       continue;
     }
 
     const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-    const uint16_t* x_src0 = (r0_ok && chunk_elems > 0)
-                                 ? reinterpret_cast<const uint16_t*>(
-                                       x + (size_t)r0 * n + k_base)
-                                 : nullptr;
-    const uint16_t* x_src1 = (r1_ok && chunk_elems > 0)
-                                 ? reinterpret_cast<const uint16_t*>(
-                                       x + (size_t)r1 * n + k_base)
-                                 : nullptr;
-
-    const s16x4 Avec_r0 = load_bf16x4_raw(x_src0, chunk_elems);
-    const s16x4 Avec_r1 = load_bf16x4_raw(x_src1, chunk_elems);
-
-    const size_t chunk_offset = tile_offset;
+    const s16x4 Avec_r0 =
+        (r0_ok && chunk_elems > 0) ? load_bf16x4_raw(x_ptr0, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
+    const s16x4 Avec_r1 =
+        (r1_ok && chunk_elems > 0) ? load_bf16x4_raw(x_ptr1, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
 
     const s16x4 Bvec_c0 =
-        load_bf16x4_raw((chunk_elems > 0 && active_c0) ? w_base_c0 + chunk_offset
-                                                       : nullptr,
-                        chunk_elems);
+        (chunk_elems > 0 && full_c0)
+            ? load_bf16x4_raw(w_ptr_c0, chunk_elems)
+            : s16x4{0, 0, 0, 0};
     const s16x4 Bvec_c1 =
-        load_bf16x4_raw((chunk_elems > 0 && active_c1) ? w_base_c1 + chunk_offset
-                                                       : nullptr,
-                        chunk_elems);
+        (chunk_elems > 0 && full_c1)
+            ? load_bf16x4_raw(w_ptr_c1, chunk_elems)
+            : s16x4{0, 0, 0, 0};
 
     // 4 MFMA ops (2x2 fragments)
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0, acc00, 0,0,0);
     acc01 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c1, acc01, 0,0,0);
     acc10 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c0, acc10, 0,0,0);
     acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1, acc11, 0,0,0);
+
+    if (r0_ok) {
+      x_ptr0 += MATMUL_TILE_K;
+    }
+    if (r1_ok) {
+      x_ptr1 += MATMUL_TILE_K;
+    }
+    if (full_c0) {
+      w_ptr_c0 += tile_elems;
+    }
+    if (full_c1) {
+      w_ptr_c1 += tile_elems;
+    }
   }
 
   // Runtime bias: only read when col is valid and bias != nullptr
-  const float b0 = (bias && c0_ok) ? bias[c0] : 0.f;
-  const float b1 = (bias && c1_ok) ? bias[c1] : 0.f;
+  const bool c0_ok = full_c0 && (c0 < d);
+  const bool c1_ok = full_c1 && (c1 < d);
+  const float b0 = (bias_ok && c0_ok) ? bias_vals[0] : 0.f;
+  const float b1 = (bias_ok && c1_ok) ? bias_vals[1] : 0.f;
 
   // Scatter back (each ty handles 4 row offsets within the 16x16 fragment)
   for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
@@ -176,30 +218,11 @@ void matmul_gemm_kernel_bf16_mfma(
   const int M0 = blockIdx.y * TILE_M;
   const int N0 = blockIdx.x * TILE_N;
 
-  int cols[COL_GROUPS];
-  bool col_ok[COL_GROUPS];
-  size_t base_tile[COL_GROUPS] = {0};
-  const uint16_t* w_base[COL_GROUPS] = {nullptr};
-
   const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
   const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
   const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
   const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
   const size_t group_offset = (size_t)ty * group_stride;
-
-  for (int idx = 0; idx < COL_GROUPS; ++idx) {
-    const int c = N0 + tx + idx * 16;
-    cols[idx] = c;
-    const bool valid = (c < d);
-    col_ok[idx] = valid;
-    if (valid) {
-      const int tile_col = c / MATMUL_TILE_COLS;
-      const int row_in_tile = c % MATMUL_TILE_COLS;
-      base_tile[idx] = ((size_t)tile_col * tiles_k) * tile_elems +
-                       (size_t)row_in_tile * MATMUL_CHUNK_K;
-      w_base[idx] = w_u16 + base_tile[idx];
-    }
-  }
 
   const bool has_pos = (pos != nullptr);
 
@@ -208,12 +231,142 @@ void matmul_gemm_kernel_bf16_mfma(
   const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
   const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
 
+  if (!r0_ok && !r1_ok) {
+    return;
+  }
+
   f32x4 acc_lo[COL_GROUPS];
   f32x4 acc_hi[COL_GROUPS];
 #pragma unroll
   for (int idx = 0; idx < COL_GROUPS; ++idx) {
     acc_lo[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
     acc_hi[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
+  }
+
+  const bool full_cols = (N0 + TILE_N) <= d;
+  if (full_cols) {
+    const int base_col = N0 + tx;
+    constexpr int col_stride = 16;
+
+    const uint16_t* x_ptr0 = r0_ok
+                                 ? reinterpret_cast<const uint16_t*>(
+                                       x + (size_t)r0 * n) +
+                                       ty * MATMUL_CHUNK_K
+                                 : nullptr;
+    const uint16_t* x_ptr1 = r1_ok
+                                 ? reinterpret_cast<const uint16_t*>(
+                                       x + (size_t)r1 * n) +
+                                       ty * MATMUL_CHUNK_K
+                                 : nullptr;
+
+    const uint16_t* w_ptr[COL_GROUPS];
+#pragma unroll
+    for (int idx = 0; idx < COL_GROUPS; ++idx) {
+      const int col = base_col + idx * col_stride;
+      const int tile_col = col >> 5; // MATMUL_TILE_COLS == 32
+      const int row_in_tile = col & (MATMUL_TILE_COLS - 1);
+      const size_t base_offset =
+          ((size_t)tile_col * tiles_k) * tile_elems +
+          (size_t)row_in_tile * MATMUL_CHUNK_K + group_offset;
+      w_ptr[idx] = w_u16 + base_offset;
+    }
+
+    for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
+      const int k_base = k0 + ty * MATMUL_CHUNK_K;
+      const int rem = n - k_base;
+      if (rem <= 0) {
+        if (r0_ok) {
+          x_ptr0 += MATMUL_TILE_K;
+        }
+        if (r1_ok) {
+          x_ptr1 += MATMUL_TILE_K;
+        }
+#pragma unroll
+        for (int idx = 0; idx < COL_GROUPS; ++idx) {
+          w_ptr[idx] += tile_elems;
+        }
+        continue;
+      }
+
+      const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
+      const s16x4 Avec_r0 =
+          (r0_ok && chunk_elems > 0) ? load_bf16x4_raw(x_ptr0, chunk_elems)
+                                     : s16x4{0, 0, 0, 0};
+      const s16x4 Avec_r1 =
+          (r1_ok && chunk_elems > 0) ? load_bf16x4_raw(x_ptr1, chunk_elems)
+                                     : s16x4{0, 0, 0, 0};
+
+      s16x4 Bvec[COL_GROUPS];
+
+#pragma unroll
+      for (int idx = 0; idx < COL_GROUPS; ++idx) {
+        Bvec[idx] = load_bf16x4_raw(w_ptr[idx], chunk_elems);
+      }
+
+#pragma unroll
+      for (int idx = 0; idx < COL_GROUPS; ++idx) {
+        acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+            Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
+        acc_hi[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+            Avec_r1, Bvec[idx], acc_hi[idx], 0, 0, 0);
+      }
+
+      if (r0_ok) {
+        x_ptr0 += MATMUL_TILE_K;
+      }
+      if (r1_ok) {
+        x_ptr1 += MATMUL_TILE_K;
+      }
+#pragma unroll
+      for (int idx = 0; idx < COL_GROUPS; ++idx) {
+        w_ptr[idx] += tile_elems;
+      }
+    }
+
+    for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
+      const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
+      const int row_hi = row_lo + 16;
+
+      const bool row_lo_ok = (row_lo < B) && (!has_pos || pos[row_lo] >= 0);
+      const bool row_hi_ok = (row_hi < B) && (!has_pos || pos[row_hi] >= 0);
+
+      if (row_lo_ok) {
+        float* y0 = y + (size_t)row_lo * d + base_col;
+#pragma unroll
+        for (int idx = 0; idx < COL_GROUPS; ++idx) {
+          y0[idx * col_stride] = acc_lo[idx][i];
+        }
+      }
+      if (row_hi_ok) {
+        float* y1 = y + (size_t)row_hi * d + base_col;
+#pragma unroll
+        for (int idx = 0; idx < COL_GROUPS; ++idx) {
+          y1[idx * col_stride] = acc_hi[idx][i];
+        }
+      }
+    }
+    return;
+  }
+
+  int cols_partial[COL_GROUPS];
+  bool col_ok[COL_GROUPS];
+  const uint16_t* w_ptr[COL_GROUPS];
+#pragma unroll
+  for (int idx = 0; idx < COL_GROUPS; ++idx) {
+    const int col = N0 + tx + idx * 16;
+    cols_partial[idx] = col;
+    const bool valid = (col < d);
+    col_ok[idx] = valid;
+    if (valid) {
+      const int tile_col = col >> 5;
+      const int row_in_tile = col & (MATMUL_TILE_COLS - 1);
+      const size_t base_offset =
+          ((size_t)tile_col * tiles_k) * tile_elems +
+          (size_t)row_in_tile * MATMUL_CHUNK_K + group_offset;
+      w_ptr[idx] = w_u16 + base_offset;
+    } else {
+      w_ptr[idx] = nullptr;
+    }
   }
 
   const uint16_t* x_ptr0 = r0_ok
@@ -226,12 +379,6 @@ void matmul_gemm_kernel_bf16_mfma(
                                      x + (size_t)r1 * n) +
                                      ty * MATMUL_CHUNK_K
                                : nullptr;
-
-  const uint16_t* w_ptr[COL_GROUPS];
-#pragma unroll
-  for (int idx = 0; idx < COL_GROUPS; ++idx) {
-    w_ptr[idx] = col_ok[idx] ? (w_base[idx] + group_offset) : nullptr;
-  }
 
   for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
@@ -303,7 +450,7 @@ void matmul_gemm_kernel_bf16_mfma(
 #pragma unroll
       for (int idx = 0; idx < COL_GROUPS; ++idx) {
         if (col_ok[idx]) {
-          y0[cols[idx]] = acc_lo[idx][i];
+          y0[cols_partial[idx]] = acc_lo[idx][i];
         }
       }
     }
@@ -312,7 +459,7 @@ void matmul_gemm_kernel_bf16_mfma(
 #pragma unroll
       for (int idx = 0; idx < COL_GROUPS; ++idx) {
         if (col_ok[idx]) {
-          y1[cols[idx]] = acc_hi[idx][i];
+          y1[cols_partial[idx]] = acc_hi[idx][i];
         }
       }
     }
@@ -536,6 +683,10 @@ void mlp1_fused_gemm_kernel(
   const int batch0 = row0_active ? sh_batch[row_tile0] : 0;
   const int batch1 = row1_active ? sh_batch[row_tile1] : 0;
 
+  if (!row0_active && !row1_active) {
+    return;
+  }
+
   const size_t matrix_idx = (size_t)l_layer * (size_t)E + (size_t)expert_id;
   const bf16_t *__restrict__ w_matrix =
       w_mlp1_all + matrix_idx * stride_w_mlp1;
@@ -573,45 +724,58 @@ void mlp1_fused_gemm_kernel(
 
   const uint16_t* w_base_c0 = c0_ok ? w_u16 + base_tile_c0 : nullptr;
   const uint16_t* w_base_c1 = c1_ok ? w_u16 + base_tile_c1 : nullptr;
+  const uint16_t* w_ptr_c0 = c0_ok ? (w_base_c0 + group_offset) : nullptr;
+  const uint16_t* w_ptr_c1 = c1_ok ? (w_base_c1 + group_offset) : nullptr;
 
   f32x4 acc00 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc01 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
-  size_t tile_offset = group_offset;
-  for (int k0 = 0; k0 < H; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
+  const uint16_t* x_ptr0 = row0_active
+                               ? reinterpret_cast<const uint16_t*>(
+                                     x + (size_t)batch0 * (size_t)H) +
+                                     ty * MATMUL_CHUNK_K
+                               : nullptr;
+  const uint16_t* x_ptr1 = row1_active
+                               ? reinterpret_cast<const uint16_t*>(
+                                     x + (size_t)batch1 * (size_t)H) +
+                                     ty * MATMUL_CHUNK_K
+                               : nullptr;
+
+  for (int k0 = 0; k0 < H; k0 += MATMUL_TILE_K) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
     const int rem = H - k_base;
     if (rem <= 0) {
+      if (row0_active) {
+        x_ptr0 += MATMUL_TILE_K;
+      }
+      if (row1_active) {
+        x_ptr1 += MATMUL_TILE_K;
+      }
+      if (c0_ok) {
+        w_ptr_c0 += tile_elems;
+      }
+      if (c1_ok) {
+        w_ptr_c1 += tile_elems;
+      }
       continue;
     }
 
     const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-    const uint16_t* x_src0 = (row0_active && chunk_elems > 0)
-                                 ? reinterpret_cast<const uint16_t*>(
-                                       x + (size_t)batch0 * (size_t)H +
-                                       k_base)
-                                 : nullptr;
-    const uint16_t* x_src1 = (row1_active && chunk_elems > 0)
-                                 ? reinterpret_cast<const uint16_t*>(
-                                       x + (size_t)batch1 * (size_t)H +
-                                       k_base)
-                                 : nullptr;
-
-    const s16x4 Avec_r0 = load_bf16x4_raw(x_src0, chunk_elems);
-    const s16x4 Avec_r1 = load_bf16x4_raw(x_src1, chunk_elems);
-
-    const size_t chunk_offset = tile_offset;
+    const s16x4 Avec_r0 =
+        (row0_active && chunk_elems > 0) ? load_bf16x4_raw(x_ptr0, chunk_elems)
+                                         : s16x4{0, 0, 0, 0};
+    const s16x4 Avec_r1 =
+        (row1_active && chunk_elems > 0) ? load_bf16x4_raw(x_ptr1, chunk_elems)
+                                         : s16x4{0, 0, 0, 0};
 
     const s16x4 Bvec_c0 =
-        load_bf16x4_raw((chunk_elems > 0 && c0_ok) ? w_base_c0 + chunk_offset
-                                                   : nullptr,
-                        chunk_elems);
+        (chunk_elems > 0 && c0_ok) ? load_bf16x4_raw(w_ptr_c0, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
     const s16x4 Bvec_c1 =
-        load_bf16x4_raw((chunk_elems > 0 && c1_ok) ? w_base_c1 + chunk_offset
-                                                   : nullptr,
-                        chunk_elems);
+        (chunk_elems > 0 && c1_ok) ? load_bf16x4_raw(w_ptr_c1, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
 
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
                                                        acc00, 0, 0, 0);
@@ -621,6 +785,19 @@ void mlp1_fused_gemm_kernel(
                                                        acc10, 0, 0, 0);
     acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1,
                                                        acc11, 0, 0, 0);
+
+    if (row0_active) {
+      x_ptr0 += MATMUL_TILE_K;
+    }
+    if (row1_active) {
+      x_ptr1 += MATMUL_TILE_K;
+    }
+    if (c0_ok) {
+      w_ptr_c0 += tile_elems;
+    }
+    if (c1_ok) {
+      w_ptr_c1 += tile_elems;
+    }
   }
 
   const float bias_gate = c0_ok ? bias_base[c0] : 0.0f;
@@ -773,13 +950,14 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 
   const uint16_t* w_base_c0 = c0_ok ? w_u16 + base_tile_c0 : nullptr;
   const uint16_t* w_base_c1 = c1_ok ? w_u16 + base_tile_c1 : nullptr;
+  const uint16_t* w_ptr_c0 = c0_ok ? (w_base_c0 + group_offset) : nullptr;
+  const uint16_t* w_ptr_c1 = c1_ok ? (w_base_c1 + group_offset) : nullptr;
 
   f32x4 acc00 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc01 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
-  size_t tile_offset = group_offset;
   for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K) {
     const int rem_total = IM - k0;
     if (rem_total <= 0) {
@@ -835,16 +1013,12 @@ void mlp2_bias_weighted_accum_gemm_kernel(
       }
     }
 
-    const size_t chunk_offset = tile_offset;
-
     const s16x4 Bvec_c0 =
-        load_bf16x4_raw((chunk_elems > 0 && c0_ok) ? w_base_c0 + chunk_offset
-                                                   : nullptr,
-                        chunk_elems);
+        (chunk_elems > 0 && c0_ok) ? load_bf16x4_raw(w_ptr_c0, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
     const s16x4 Bvec_c1 =
-        load_bf16x4_raw((chunk_elems > 0 && c1_ok) ? w_base_c1 + chunk_offset
-                                                   : nullptr,
-                        chunk_elems);
+        (chunk_elems > 0 && c1_ok) ? load_bf16x4_raw(w_ptr_c1, chunk_elems)
+                                   : s16x4{0, 0, 0, 0};
 
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
                                                        acc00, 0, 0, 0);
@@ -856,7 +1030,12 @@ void mlp2_bias_weighted_accum_gemm_kernel(
                                                        acc11, 0, 0, 0);
 
     __syncthreads();
-    tile_offset += tile_elems;
+    if (c0_ok) {
+      w_ptr_c0 += tile_elems;
+    }
+    if (c1_ok) {
+      w_ptr_c1 += tile_elems;
+    }
   }
 
   const float bias_c0 = c0_ok ? bias_base[c0] : 0.0f;
