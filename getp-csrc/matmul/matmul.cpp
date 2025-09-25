@@ -116,15 +116,14 @@ void matmul_bias_gemm_kernel_bf16_mfma(
     const s16x4 Avec_r1 = load_bf16x4_raw(x_src1, chunk_elems);
 
     const size_t chunk_offset = tile_offset;
-    const bool need_b = (chunk_elems > 0) && (r0_ok || r1_ok);
 
     const s16x4 Bvec_c0 =
-        load_bf16x4_raw((need_b && active_c0) ? w_base_c0 + chunk_offset
-                                              : nullptr,
+        load_bf16x4_raw((chunk_elems > 0 && active_c0) ? w_base_c0 + chunk_offset
+                                                       : nullptr,
                         chunk_elems);
     const s16x4 Bvec_c1 =
-        load_bf16x4_raw((need_b && active_c1) ? w_base_c1 + chunk_offset
-                                              : nullptr,
+        load_bf16x4_raw((chunk_elems > 0 && active_c1) ? w_base_c1 + chunk_offset
+                                                       : nullptr,
                         chunk_elems);
 
     // 4 MFMA ops (2x2 fragments)
@@ -247,9 +246,9 @@ void matmul_gemm_kernel_bf16_mfma(
 
 #pragma unroll
     for (int idx = 0; idx < 4; ++idx) {
-      const bool need_b = col_ok[idx] && (r0_ok || r1_ok) && chunk_elems > 0;
-      Bvec[idx] = need_b ? load_bf16x4_raw(w_base[idx] + chunk_offset, chunk_elems)
-                         : s16x4{0, 0, 0, 0};
+      Bvec[idx] = (col_ok[idx] && chunk_elems > 0)
+                      ? load_bf16x4_raw(w_base[idx] + chunk_offset, chunk_elems)
+                      : s16x4{0, 0, 0, 0};
     }
 
 #pragma unroll
@@ -545,7 +544,6 @@ void mlp1_fused_gemm_kernel(
   f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
-  const bool any_row_active = row0_active || row1_active;
   size_t tile_offset = group_offset;
   for (int k0 = 0; k0 < H; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
@@ -570,15 +568,14 @@ void mlp1_fused_gemm_kernel(
     const s16x4 Avec_r1 = load_bf16x4_raw(x_src1, chunk_elems);
 
     const size_t chunk_offset = tile_offset;
-    const bool need_b = any_row_active && chunk_elems > 0;
 
     const s16x4 Bvec_c0 =
-        load_bf16x4_raw((need_b && c0_ok) ? w_base_c0 + chunk_offset
-                                          : nullptr,
+        load_bf16x4_raw((chunk_elems > 0 && c0_ok) ? w_base_c0 + chunk_offset
+                                                   : nullptr,
                         chunk_elems);
     const s16x4 Bvec_c1 =
-        load_bf16x4_raw((need_b && c1_ok) ? w_base_c1 + chunk_offset
-                                          : nullptr,
+        load_bf16x4_raw((chunk_elems > 0 && c1_ok) ? w_base_c1 + chunk_offset
+                                                   : nullptr,
                         chunk_elems);
 
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
@@ -750,7 +747,6 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
-  const bool any_row_active = row0_active || row1_active;
   size_t tile_offset = group_offset;
   for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
@@ -775,15 +771,14 @@ void mlp2_bias_weighted_accum_gemm_kernel(
         pack4_bf16_from_f32_guard(gate_ptr1, 0, chunk_elems, row1_active);
 
     const size_t chunk_offset = tile_offset;
-    const bool need_b = any_row_active && chunk_elems > 0;
 
     const s16x4 Bvec_c0 =
-        load_bf16x4_raw((need_b && c0_ok) ? w_base_c0 + chunk_offset
-                                          : nullptr,
+        load_bf16x4_raw((chunk_elems > 0 && c0_ok) ? w_base_c0 + chunk_offset
+                                                   : nullptr,
                         chunk_elems);
     const s16x4 Bvec_c1 =
-        load_bf16x4_raw((need_b && c1_ok) ? w_base_c1 + chunk_offset
-                                          : nullptr,
+        load_bf16x4_raw((chunk_elems > 0 && c1_ok) ? w_base_c1 + chunk_offset
+                                                   : nullptr,
                         chunk_elems);
 
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
