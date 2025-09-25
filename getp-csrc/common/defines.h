@@ -94,6 +94,7 @@ struct GPUWeightBuffersBF16 {
 
 struct DeviceContext {
   int device_id;
+  int E_local = 0; // number of local experts owned by this device (per layer)
 
   GPUActivationBuffers gpu_activations;
   GPUWeightBuffersFP32 gpu_weights_fp32;
@@ -144,6 +145,12 @@ struct PromptCtx {
         max_steps(0), h_logits(nullptr), logits_size(0), sampler(nullptr),
         num_generated(0), start_time(0.0), end_time(0.0),
         is_context_phase(true), user_data(nullptr) {}
+};
+
+struct EPAssignHost {
+  int b;      // batch row index
+  int e;      // global expert id
+  float w;    // gate weight
 };
 
 // Utility function for PromptCtx cleanup

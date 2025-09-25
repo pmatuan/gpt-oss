@@ -68,4 +68,12 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     const int *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size, const int *pos);
+
+// Accumulate compact partials [cnt, H] into dest [B, H] using batch_ids[cnt]
+__global__ void accumulate_partials_kernel(
+    float* __restrict__ dest,           // [B, H]
+    const float* __restrict__ src,      // [cnt, H]
+    const int* __restrict__ batch_ids,  // [cnt]
+    int H,
+    int cnt);
 #endif // GETP_MATMUL_H
