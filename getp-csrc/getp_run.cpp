@@ -61,7 +61,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.gpu_activations.gate_up_workspace_bytes = 0;
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                      (D * (Hq + 2 * Hk)) * sizeof(float)));
+                      (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(bf16_t)));
 
   ctx.gpu_activations.d_key_cache = nullptr;
@@ -423,7 +423,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
     HIP_CHECK(
         hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                        (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
+                        (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
                         (size_t)B * Hq * D * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
@@ -467,7 +467,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
     }
     if (!ctx.gpu_activations.d_qkv) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                          (size_t)ctx.capacity_B * (D * (Hq + 2 * Hk)) * sizeof(float)));
+                          (size_t)ctx.capacity_B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
     }
     if (!ctx.gpu_activations.d_q) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,

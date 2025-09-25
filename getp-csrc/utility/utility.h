@@ -36,7 +36,7 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
-    const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
+    const bf16_t* __restrict__ qkv,    // [B, Hq*D + 2*Hk*D]
     const int* __restrict__ pos,       // [B]
     // model params
     int Hq, int Hk, int D,

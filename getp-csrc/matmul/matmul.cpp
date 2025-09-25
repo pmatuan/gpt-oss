@@ -29,15 +29,21 @@ __device__ __forceinline__ s16x4 load_bf16x4_raw(const uint16_t* src, int valid_
 
 
 // x:[B,n], w:[d,n], y:[B,d]
-__global__ __launch_bounds__(64, 2)
-void matmul_bias_gemm_kernel_bf16_mfma(
-    float* __restrict__ y,          // [B x d]
-    const bf16_t* __restrict__ x,   // [B x n] (bf16)
-    const bf16_t* __restrict__ w,   // [d x n] (bf16)
-    const float* __restrict__ bias, // [d] or nullptr
-    int n, int d, int B,
-    const int* __restrict__ pos)    // nullable; pos[b] < 0 -> skip row
-{
+__device__ __forceinline__ void store_output_value(float* base, int offset,
+                                                  float value) {
+  base[offset] = value;
+}
+
+__device__ __forceinline__ void store_output_value(bf16_t* base, int offset,
+                                                  float value) {
+  base[offset] = bf16_t(value);
+}
+
+template <typename OutT>
+__device__ __forceinline__ void matmul_bias_gemm_kernel_bf16_mfma_body(
+    OutT* __restrict__ y, const bf16_t* __restrict__ x,
+    const bf16_t* __restrict__ w, const float* __restrict__ bias, int n,
+    int d, int B, const int* __restrict__ pos) {
   // One wave64 per block: 16 x-threads, 4 y-threads
   const int tx = threadIdx.x; // 0..15
   const int ty = threadIdx.y; // 0..3
@@ -185,14 +191,18 @@ void matmul_bias_gemm_kernel_bf16_mfma(
     const int row_hi = row_lo + 16;
 
     if (row_lo < B && (!has_pos || pos[row_lo] >= 0)) {
-      float* y0 = y + (size_t)row_lo * d;
-      if (c0_ok) y0[c0]   = acc00[i] + b0;
-      if (c1_ok) y0[c1]   = acc01[i] + b1;
+      OutT* y0 = y + (size_t)row_lo * d;
+      if (c0_ok)
+        store_output_value(y0, c0, acc00[i] + b0);
+      if (c1_ok)
+        store_output_value(y0, c1, acc01[i] + b1);
     }
     if (row_hi < B && (!has_pos || pos[row_hi] >= 0)) {
-      float* y1 = y + (size_t)row_hi * d;
-      if (c0_ok) y1[c0]   = acc10[i] + b0;
-      if (c1_ok) y1[c1]   = acc11[i] + b1;
+      OutT* y1 = y + (size_t)row_hi * d;
+      if (c0_ok)
+        store_output_value(y1, c0, acc10[i] + b0);
+      if (c1_ok)
+        store_output_value(y1, c1, acc11[i] + b1);
     }
   }
 }
@@ -522,6 +532,22 @@ void matmul_gemm_kernel_bf16_mfma(
       }
     }
   }
+}
+
+__global__ __launch_bounds__(64, 2)
+void matmul_bias_gemm_kernel_bf16_mfma(
+    float* __restrict__ y, const bf16_t* __restrict__ x,
+    const bf16_t* __restrict__ w, const float* __restrict__ bias, int n,
+    int d, int B, const int* __restrict__ pos) {
+  matmul_bias_gemm_kernel_bf16_mfma_body<float>(y, x, w, bias, n, d, B, pos);
+}
+
+__global__ __launch_bounds__(64, 2)
+void matmul_bias_gemm_kernel_bf16_mfma(
+    bf16_t* __restrict__ y, const bf16_t* __restrict__ x,
+    const bf16_t* __restrict__ w, const float* __restrict__ bias, int n,
+    int d, int B, const int* __restrict__ pos) {
+  matmul_bias_gemm_kernel_bf16_mfma_body<bf16_t>(y, x, w, bias, n, d, B, pos);
 }
 
 /**

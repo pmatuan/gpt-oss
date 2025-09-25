@@ -92,7 +92,7 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
-    const float* __restrict__ qkv,     // [B, Hq*D + 2*Hk*D]
+    const bf16_t* __restrict__ qkv,    // [B, Hq*D + 2*Hk*D]
     const int* __restrict__ pos,       // [B]
     // model params
     int Hq, int Hk, int D,
@@ -129,7 +129,7 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     bf16_t* __restrict__ q_b      = q_out       + (size_t)b * q_size;
     bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_batch_stride;
     bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_batch_stride;
-    const float* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
+    const bf16_t* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
     // ---- compute RoPE angles for this (i, b)
     // inv_freq with scaling (khớp logic hiện tại)
@@ -157,8 +157,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // ---- Q: read from qkv, apply RoPE, write to q_out
     if (h < Hq) {
         const int q_off = h * D;
-        float x1 = qkv_b[q_off + i];
-        float x2 = qkv_b[q_off + half + i];
+        float x1 = static_cast<float>(qkv_b[q_off + i]);
+        float x2 = static_cast<float>(qkv_b[q_off + half + i]);
         // rotate
         float y1 = x1 * c - x2 * s;
         float y2 = x2 * c + x1 * s;
@@ -173,8 +173,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
         const size_t kc_idx = (size_t)layer_base + (size_t)slot * KV +
                               (size_t)h * D;
 
-        float k1 = qkv_b[k_off_qkv + i];
-        float k2 = qkv_b[k_off_qkv + half + i];
+        float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
+        float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
         float rk1 = k1 * c - k2 * s;
         float rk2 = k2 * c + k1 * s;
 
@@ -184,8 +184,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
         // ---- V: read from qkv, direct scatter (no RoPE)
         const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
         const size_t vc_idx = kc_idx;
-        float v1 = qkv_b[v_off_qkv + i];
-        float v2 = qkv_b[v_off_qkv + half + i];
+        float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
+        float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
         vcache_b[vc_idx + i]        = hip_bfloat16(v1);
         vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
     }

@@ -12,6 +12,14 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma(
     int n, int d, int B,
     const int* __restrict__ pos);
 
+__global__ void matmul_bias_gemm_kernel_bf16_mfma(
+    bf16_t* __restrict__ y,         // [B x d]
+    const bf16_t* __restrict__ x,   // [B x n] (bf16)
+    const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
+    const float* __restrict__ bias, // [d] or nullptr
+    int n, int d, int B,
+    const int* __restrict__ pos);
+
 // No-bias variant: Y = X @ W^T
 __global__ void matmul_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
