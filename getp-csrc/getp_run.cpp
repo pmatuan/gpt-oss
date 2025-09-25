@@ -568,7 +568,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
     size_t total_bytes = 0;
     HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
 
-    constexpr size_t kSafetyMargin = 512ULL << 20; // 512 MiB
+    constexpr size_t kSafetyMargin = 1024ULL << 20; // 1024 MiB
     size_t available_for_kv =
         free_bytes > kSafetyMargin ? free_bytes - kSafetyMargin : 0;
 
@@ -592,12 +592,6 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
               "Unable to allocate KV cache for batch %d: need %.2f GiB, have %.2f GiB\n",
               ctx.capacity_B, need_gib, avail_gib);
       exit(EXIT_FAILURE);
-    }
-
-    if (target_seq < seq_hint) {
-      printf("[DEVICE] %d limiting KV cache to %d tokens (requested %d) to fit"
-             " memory\n",
-             ctx.device_id, target_seq, seq_hint);
     }
 
     ctx.gpu_activations.kv_seq_limit = target_seq;
