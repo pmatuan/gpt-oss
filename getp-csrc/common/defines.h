@@ -57,9 +57,9 @@ struct GPUActivationBuffers {
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
   float *d_e_agg;
-  float *d_gate_up_workspace; // Pre-allocated workspace for MLP
+  bf16_t *d_gate_up_workspace; // Pre-allocated workspace for MLP
   size_t gate_up_workspace_bytes;
-  float *d_qkv;
+  bf16_t *d_qkv;
   bf16_t *d_q;
   bf16_t *d_key_cache, *d_value_cache;
   int kv_seq_capacity;

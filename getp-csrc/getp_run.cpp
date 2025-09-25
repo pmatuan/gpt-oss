@@ -61,7 +61,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.gpu_activations.gate_up_workspace_bytes = 0;
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                      (D * (Hq + 2 * Hk)) * sizeof(float)));
+                      (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, Hq * D * sizeof(bf16_t)));
 
   ctx.gpu_activations.d_key_cache = nullptr;
@@ -423,7 +423,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
     HIP_CHECK(
         hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                        (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(float)));
+                        (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
                         (size_t)B * Hq * D * sizeof(bf16_t)));
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
@@ -467,7 +467,7 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
     }
     if (!ctx.gpu_activations.d_qkv) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                          (size_t)ctx.capacity_B * (D * (Hq + 2 * Hk)) * sizeof(float)));
+                          (size_t)ctx.capacity_B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
     }
     if (!ctx.gpu_activations.d_q) {
       HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
@@ -484,7 +484,8 @@ static inline void ensure_device_capacity(DeviceContext &ctx, int B,
   }
 
   size_t max_assignments = (size_t)ctx.capacity_B * p->experts_per_token;
-  size_t required_gate_bytes = max_assignments * (size_t)IM * sizeof(float);
+  size_t required_gate_bytes =
+      max_assignments * (size_t)IM * sizeof(bf16_t);
   if (ctx.gpu_activations.gate_up_workspace_bytes < required_gate_bytes) {
     if (ctx.gpu_activations.d_gate_up_workspace) {
       HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
@@ -1041,7 +1042,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     // malloc/free
 
     size_t gate_up_topk_bytes = (size_t)p->experts_per_token *
-                                (size_t)batch_size * (size_t)IM * sizeof(float);
+                                (size_t)batch_size * (size_t)IM *
+                                sizeof(bf16_t);
     if (ctx.gpu_activations.gate_up_workspace_bytes < gate_up_topk_bytes) {
       if (ctx.gpu_activations.d_gate_up_workspace) {
         HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
@@ -1050,7 +1052,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
                           gate_up_topk_bytes));
       ctx.gpu_activations.gate_up_workspace_bytes = gate_up_topk_bytes;
     }
-    float *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
+    bf16_t *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
     HIP_CHECK(hipMemsetAsync(d_gate_up_topk, 0, gate_up_topk_bytes, 0));
 
     int total_pairs = batch_size * p->experts_per_token;

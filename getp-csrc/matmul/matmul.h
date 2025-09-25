@@ -12,6 +12,14 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma(
     int n, int d, int B,
     const int* __restrict__ pos);
 
+__global__ void matmul_bias_gemm_kernel_bf16_mfma(
+    bf16_t* __restrict__ y,         // [B x d]
+    const bf16_t* __restrict__ x,   // [B x n] (bf16)
+    const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
+    const float* __restrict__ bias, // [d] or nullptr
+    int n, int d, int B,
+    const int* __restrict__ pos);
+
 // No-bias variant: Y = X @ W^T
 __global__ void matmul_gemm_kernel_bf16_mfma(
     float* __restrict__ y,          // [B x d]
@@ -47,7 +55,7 @@ __global__ void build_expert_assignments_kernel(
     int E);
 
 __global__ void
-mlp1_fused_gemm_kernel(float *__restrict__ gate_up_topk,      // [K, B, IM]
+mlp1_fused_gemm_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]
                        const bf16_t *__restrict__ x,          // [B, H] (bf16)
                        const bf16_t *__restrict__ w_mlp1_all, // [L, E, 2*IM, H]
                        size_t stride_w_mlp1,
@@ -59,8 +67,8 @@ mlp1_fused_gemm_kernel(float *__restrict__ gate_up_topk,      // [K, B, IM]
                        const int *pos);
 
 __global__ void mlp2_bias_weighted_accum_gemm_kernel(
-    float *__restrict__ e_agg,              // [B, H]
-    const float *__restrict__ gate_up_topk, // [K, B, IM]
+    float *__restrict__ e_agg,             // [B, H]
+    const bf16_t *__restrict__ gate_up_topk, // [K, B, IM]
     const bf16_t *__restrict__ w_mlp2_all,  // [L, E, H, IM]
     size_t stride_w_mlp2,
     const float *__restrict__ b_mlp2_all, // [L, E, H]
