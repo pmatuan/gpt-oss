@@ -615,3 +615,21 @@ void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
     }
   }
 }
+
+// Accumulate compact partials [cnt, H] into dest [B, H] using batch_ids[cnt]
+__global__ void accumulate_partials_kernel(
+    float* __restrict__ dest,
+    const float* __restrict__ src,
+    const int* __restrict__ batch_ids,
+    int H,
+    int cnt) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int i = blockIdx.y;
+  if (i >= cnt || h >= H) return;
+  const int b = batch_ids[i];
+  if (b < 0) return;
+  const float val = src[(size_t)i * (size_t)H + h];
+  if (val != 0.0f) {
+    atomicAdd(dest + (size_t)b * (size_t)H + h, val);
+  }
+}

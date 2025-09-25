@@ -66,4 +66,13 @@ size_t matmul_packed_elems(int rows, int cols);
 void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
                               bf16_t *dst);
 
+
+// Accumulate compact partials [cnt, H] into dest [B, H] using batch_ids[cnt]
+__global__ void accumulate_partials_kernel(
+    float* __restrict__ dest,           // [B, H]
+    const float* __restrict__ src,      // [cnt, H]
+    const int* __restrict__ batch_ids,  // [cnt]
+    int H,
+    int cnt);
+
 #endif // GETP_UTILITY_H
