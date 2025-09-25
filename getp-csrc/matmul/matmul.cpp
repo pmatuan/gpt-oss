@@ -683,10 +683,6 @@ void mlp1_fused_gemm_kernel(
   const int batch0 = row0_active ? sh_batch[row_tile0] : 0;
   const int batch1 = row1_active ? sh_batch[row_tile1] : 0;
 
-  if (!row0_active && !row1_active) {
-    return;
-  }
-
   const size_t matrix_idx = (size_t)l_layer * (size_t)E + (size_t)expert_id;
   const bf16_t *__restrict__ w_matrix =
       w_mlp1_all + matrix_idx * stride_w_mlp1;
