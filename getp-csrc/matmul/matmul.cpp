@@ -663,6 +663,8 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   __shared__ int sh_slot[MLP_TILE_TOKENS];
   __shared__ int sh_valid[MLP_TILE_TOKENS];
   __shared__ float sh_weight[MLP_TILE_TOKENS];
+  __shared__ size_t sh_gate_offset[MLP_TILE_TOKENS];
+  __shared__ short sh_gate_tile[MLP_TILE_TOKENS * MATMUL_TILE_K];
 
   for (int idx = lane; idx < MLP_TILE_TOKENS;
        idx += MLP_THREAD_X * MLP_THREAD_Y) {
@@ -670,6 +672,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     int slot = -1;
     float weight = 0.0f;
     int valid = 0;
+    size_t gate_offset = 0;
     if (idx < tile_rows) {
       const int assignment_idx = start + M0 + idx;
       batch = assignment_batches[assignment_idx];
@@ -678,8 +681,11 @@ void mlp2_bias_weighted_accum_gemm_kernel(
         const bool pos_ok = (!pos) || (pos[batch] >= 0);
         if (pos_ok) {
           weight = topk_v[(size_t)batch * (size_t)EXPERT_PER_TOKEN + slot];
-          if (weight != 0.0f)
+          if (weight != 0.0f) {
             valid = 1;
+            gate_offset = ((size_t)slot * (size_t)batch_size +
+                           (size_t)batch) * (size_t)IM;
+          }
         }
       }
     }
@@ -687,6 +693,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     sh_slot[idx] = slot;
     sh_weight[idx] = weight;
     sh_valid[idx] = valid;
+    sh_gate_offset[idx] = gate_offset;
   }
   __syncthreads();
 
@@ -695,16 +702,6 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   const bool row0_active = (row_tile0 < tile_rows) && (sh_valid[row_tile0] != 0);
   const bool row1_active = (row_tile1 < tile_rows) && (sh_valid[row_tile1] != 0);
 
-  size_t gate_base0 = 0;
-  if (row0_active) {
-    gate_base0 = ((size_t)sh_slot[row_tile0] * (size_t)batch_size +
-                  (size_t)sh_batch[row_tile0]) * (size_t)IM;
-  }
-  size_t gate_base1 = 0;
-  if (row1_active) {
-    gate_base1 = ((size_t)sh_slot[row_tile1] * (size_t)batch_size +
-                  (size_t)sh_batch[row_tile1]) * (size_t)IM;
-  }
 
   const size_t matrix_idx = (size_t)l_layer * (size_t)E + (size_t)expert_id;
   const bf16_t *__restrict__ w_matrix =
@@ -748,27 +745,60 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
   size_t tile_offset = group_offset;
-  for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
-    const int k_base = k0 + ty * MATMUL_CHUNK_K;
-    const int rem = IM - k_base;
-    if (rem <= 0) {
-      continue;
+  for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K) {
+    const int rem_total = IM - k0;
+    if (rem_total <= 0) {
+      break;
     }
 
-    const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-    const float *gate_ptr0 =
-        (row0_active && chunk_elems > 0)
-            ? gate_up_topk + gate_base0 + k_base
-            : nullptr;
-    const float *gate_ptr1 =
-        (row1_active && chunk_elems > 0)
-            ? gate_up_topk + gate_base1 + k_base
-            : nullptr;
+    const int chunk_total =
+        rem_total >= MATMUL_TILE_K ? MATMUL_TILE_K : rem_total;
+    const int stage_elems = tile_rows * MATMUL_TILE_K;
+    for (int linear = lane; linear < stage_elems;
+         linear += MLP_THREAD_X * MLP_THREAD_Y) {
+      const int row = linear / MATMUL_TILE_K;
+      const int k = linear - row * MATMUL_TILE_K;
+      short val = 0;
+      if (k < chunk_total && sh_valid[row]) {
+        const size_t gate_offset = sh_gate_offset[row];
+        const float *row_ptr = gate_up_topk + gate_offset + k0;
+        const uint32_t raw = reinterpret_cast<const uint32_t *>(row_ptr)[k];
+        val = static_cast<short>(raw >> 16);
+      }
+      sh_gate_tile[row * MATMUL_TILE_K + k] = val;
+    }
+    __syncthreads();
 
-    s16x4 Avec_r0 =
-        pack4_bf16_from_f32_guard(gate_ptr0, 0, chunk_elems, row0_active);
-    s16x4 Avec_r1 =
-        pack4_bf16_from_f32_guard(gate_ptr1, 0, chunk_elems, row1_active);
+    const int k_offset = ty * MATMUL_CHUNK_K;
+    const int k_remaining = rem_total - k_offset;
+    const int chunk_elems =
+        k_remaining > MATMUL_CHUNK_K
+            ? MATMUL_CHUNK_K
+            : (k_remaining > 0 ? k_remaining : 0);
+
+    s16x4 Avec_r0 = {0, 0, 0, 0};
+    if (row0_active && chunk_elems > 0) {
+      const short *tile_row0 =
+          sh_gate_tile + row_tile0 * MATMUL_TILE_K + k_offset;
+#pragma unroll
+      for (int j = 0; j < MATMUL_CHUNK_K; ++j) {
+        if (j < chunk_elems) {
+          Avec_r0[j] = tile_row0[j];
+        }
+      }
+    }
+
+    s16x4 Avec_r1 = {0, 0, 0, 0};
+    if (row1_active && chunk_elems > 0) {
+      const short *tile_row1 =
+          sh_gate_tile + row_tile1 * MATMUL_TILE_K + k_offset;
+#pragma unroll
+      for (int j = 0; j < MATMUL_CHUNK_K; ++j) {
+        if (j < chunk_elems) {
+          Avec_r1[j] = tile_row1[j];
+        }
+      }
+    }
 
     const size_t chunk_offset = tile_offset;
 
@@ -789,6 +819,9 @@ void mlp2_bias_weighted_accum_gemm_kernel(
                                                        acc10, 0, 0, 0);
     acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1,
                                                        acc11, 0, 0, 0);
+
+    __syncthreads();
+    tile_offset += tile_elems;
   }
 
   const float bias_c0 = c0_ok ? bias_base[c0] : 0.0f;
