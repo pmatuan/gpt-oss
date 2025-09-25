@@ -3,6 +3,30 @@
 #include "matmul.h"
 #include <math.h>
 
+__device__ __forceinline__ s16x4 load_bf16x4_raw(const uint16_t* src, int valid_elems) {
+  s16x4 out = {0, 0, 0, 0};
+  if (!src || valid_elems <= 0) {
+    return out;
+  }
+
+  if (valid_elems >= MATMUL_CHUNK_K) {
+    const uint32_t* src32 = reinterpret_cast<const uint32_t*>(src);
+    const uint32_t packed0 = src32[0];
+    const uint32_t packed1 = src32[1];
+    out[0] = static_cast<short>(packed0 & 0xFFFF);
+    out[1] = static_cast<short>(packed0 >> 16);
+    out[2] = static_cast<short>(packed1 & 0xFFFF);
+    out[3] = static_cast<short>(packed1 >> 16);
+    return out;
+  }
+
+#pragma unroll
+  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
+    out[i] = (i < valid_elems) ? static_cast<short>(src[i]) : 0;
+  }
+  return out;
+}
+
 
 // x:[B,n], w:[d,n], y:[B,d]
 __global__ __launch_bounds__(64, 2)
@@ -52,11 +76,15 @@ void matmul_bias_gemm_kernel_bf16_mfma(
                    (size_t)row_in_tile1 * MATMUL_CHUNK_K;
   }
 
+  const uint16_t* w_base_c0 = active_c0 ? w_u16 + base_tile_c0 : nullptr;
+  const uint16_t* w_base_c1 = active_c1 ? w_u16 + base_tile_c1 : nullptr;
+
   // Per-lane rows (two 16-high halves)
   const int r0 = M0 + tx;
   const int r1 = M0 + tx + 16;
-  const bool r0_ok = (r0 < B) && (!(pos) || pos[r0] >= 0);
-  const bool r1_ok = (r1 < B) && (!(pos) || pos[r1] >= 0);
+  const bool has_pos = (pos != nullptr);
+  const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
+  const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
 
   // Accumulators for 4 MFMA fragments (32x32 tile = 2x2 of 16x16)
   f32x4 acc00 = {0.f,0.f,0.f,0.f};
@@ -65,47 +93,38 @@ void matmul_bias_gemm_kernel_bf16_mfma(
   f32x4 acc11 = {0.f,0.f,0.f,0.f};
 
   // K-loop in steps of 16 (bf16 depth)
-  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
+  size_t tile_offset = group_offset;
+  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
     // Each ty takes a 4-wide slice in this k-tile
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
-    const int k_rem  = max(0, min(MATMUL_CHUNK_K, n - k_base));
-
-    const bf16_t* x_r0 = r0_ok ? x + (size_t)r0 * n + k_base : nullptr;
-    const bf16_t* x_r1 = r1_ok ? x + (size_t)r1 * n + k_base : nullptr;
-    s16x4 Avec_r0 = pack4_bf16_from_bf16_guard(x_r0, 0, k_rem, r0_ok);
-    s16x4 Avec_r1 = pack4_bf16_from_bf16_guard(x_r1, 0, k_rem, r1_ok);
-
-    // B (W): packed tiles
-    const int tile_k_idx = k0 / MATMUL_TILE_K;
-    const size_t chunk_offset = (size_t)tile_k_idx * tile_elems + group_offset;
-
-    s16x4 Bvec_c0 = {0,0,0,0};
-    if (active_c0 && k_rem > 0) {
-      const uint16_t* src0 = w_u16 + base_tile_c0 + chunk_offset;
-      Bvec_c0[0] = (short)src0[0];
-      Bvec_c0[1] = (short)src0[1];
-      Bvec_c0[2] = (short)src0[2];
-      Bvec_c0[3] = (short)src0[3];
-      if (k_rem < MATMUL_CHUNK_K) {
-        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j) {
-          Bvec_c0[j] = 0;
-        }
-      }
+    const int rem = n - k_base;
+    if (rem <= 0) {
+      continue;
     }
 
-    s16x4 Bvec_c1 = {0,0,0,0};
-    if (active_c1 && k_rem > 0) {
-      const uint16_t* src1 = w_u16 + base_tile_c1 + chunk_offset;
-      Bvec_c1[0] = (short)src1[0];
-      Bvec_c1[1] = (short)src1[1];
-      Bvec_c1[2] = (short)src1[2];
-      Bvec_c1[3] = (short)src1[3];
-      if (k_rem < MATMUL_CHUNK_K) {
-        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j) {
-          Bvec_c1[j] = 0;
-        }
-      }
-    }
+    const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
+    const uint16_t* x_src0 = (r0_ok && chunk_elems > 0)
+                                 ? reinterpret_cast<const uint16_t*>(
+                                       x + (size_t)r0 * n + k_base)
+                                 : nullptr;
+    const uint16_t* x_src1 = (r1_ok && chunk_elems > 0)
+                                 ? reinterpret_cast<const uint16_t*>(
+                                       x + (size_t)r1 * n + k_base)
+                                 : nullptr;
+
+    const s16x4 Avec_r0 = load_bf16x4_raw(x_src0, chunk_elems);
+    const s16x4 Avec_r1 = load_bf16x4_raw(x_src1, chunk_elems);
+
+    const size_t chunk_offset = tile_offset;
+
+    const s16x4 Bvec_c0 =
+        load_bf16x4_raw((chunk_elems > 0 && active_c0) ? w_base_c0 + chunk_offset
+                                                       : nullptr,
+                        chunk_elems);
+    const s16x4 Bvec_c1 =
+        load_bf16x4_raw((chunk_elems > 0 && active_c1) ? w_base_c1 + chunk_offset
+                                                       : nullptr,
+                        chunk_elems);
 
     // 4 MFMA ops (2x2 fragments)
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0, acc00, 0,0,0);
@@ -123,12 +142,12 @@ void matmul_bias_gemm_kernel_bf16_mfma(
     const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
     const int row_hi = row_lo + 16;
 
-    if (row_lo < B && (!(pos) || pos[row_lo] >= 0)) {
+    if (row_lo < B && (!has_pos || pos[row_lo] >= 0)) {
       float* y0 = y + (size_t)row_lo * d;
       if (c0_ok) y0[c0]   = acc00[i] + b0;
       if (c1_ok) y0[c1]   = acc01[i] + b1;
     }
-    if (row_hi < B && (!(pos) || pos[row_hi] >= 0)) {
+    if (row_hi < B && (!has_pos || pos[row_hi] >= 0)) {
       float* y1 = y + (size_t)row_hi * d;
       if (c0_ok) y1[c0]   = acc10[i] + b0;
       if (c1_ok) y1[c1]   = acc11[i] + b1;
@@ -162,6 +181,7 @@ void matmul_gemm_kernel_bf16_mfma(
 
   bool col_ok[4];
   size_t base_tile[4] = {0, 0, 0, 0};
+  const uint16_t* w_base[4] = {nullptr, nullptr, nullptr, nullptr};
 
   const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
   const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
@@ -178,13 +198,16 @@ void matmul_gemm_kernel_bf16_mfma(
       const int row_in_tile = c % MATMUL_TILE_COLS;
       base_tile[idx] = ((size_t)tile_col * tiles_k) * tile_elems +
                        (size_t)row_in_tile * MATMUL_CHUNK_K;
+      w_base[idx] = w_u16 + base_tile[idx];
     }
   }
 
+  const bool has_pos = (pos != nullptr);
+
   const int r0 = M0 + tx;
   const int r1 = r0 + 16;
-  const bool r0_ok = (r0 < B) && (!(pos) || pos[r0] >= 0);
-  const bool r1_ok = (r1 < B) && (!(pos) || pos[r1] >= 0);
+  const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
+  const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
 
   f32x4 acc_lo[4];
   f32x4 acc_hi[4];
@@ -193,35 +216,42 @@ void matmul_gemm_kernel_bf16_mfma(
     acc_hi[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
   }
 
-  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
+  size_t tile_offset = group_offset;
+  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
-    const int k_rem = max(0, min(MATMUL_CHUNK_K, n - k_base));
-
-    const bf16_t* x_r0 = r0_ok ? x + (size_t)r0 * n + k_base : nullptr;
-    const bf16_t* x_r1 = r1_ok ? x + (size_t)r1 * n + k_base : nullptr;
-    const s16x4 Avec_r0 = pack4_bf16_from_bf16_guard(x_r0, 0, k_rem, r0_ok);
-    const s16x4 Avec_r1 = pack4_bf16_from_bf16_guard(x_r1, 0, k_rem, r1_ok);
-
-    const int tile_k_idx = k0 / MATMUL_TILE_K;
-    const size_t chunk_offset = (size_t)tile_k_idx * tile_elems + group_offset;
-
-    s16x4 Bvec[4];
-    for (int idx = 0; idx < 4; ++idx) {
-      Bvec[idx] = s16x4{0, 0, 0, 0};
-      if (col_ok[idx] && k_rem > 0) {
-        const uint16_t* src = w_u16 + base_tile[idx] + chunk_offset;
-        Bvec[idx][0] = (short)src[0];
-        Bvec[idx][1] = (short)src[1];
-        Bvec[idx][2] = (short)src[2];
-        Bvec[idx][3] = (short)src[3];
-        if (k_rem < MATMUL_CHUNK_K) {
-          for (int j = k_rem; j < MATMUL_CHUNK_K; ++j) {
-            Bvec[idx][j] = 0;
-          }
-        }
-      }
+    const int rem = n - k_base;
+    if (rem <= 0) {
+      continue;
     }
 
+    const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
+    const bf16_t* x_r0 = (r0_ok && chunk_elems > 0)
+                             ? x + (size_t)r0 * n + k_base
+                             : nullptr;
+    const bf16_t* x_r1 = (r1_ok && chunk_elems > 0)
+                             ? x + (size_t)r1 * n + k_base
+                             : nullptr;
+
+    const s16x4 Avec_r0 = r0_ok ? load_bf16x4_raw(
+                                      reinterpret_cast<const uint16_t*>(x_r0),
+                                      chunk_elems)
+                                : s16x4{0, 0, 0, 0};
+    const s16x4 Avec_r1 = r1_ok ? load_bf16x4_raw(
+                                      reinterpret_cast<const uint16_t*>(x_r1),
+                                      chunk_elems)
+                                : s16x4{0, 0, 0, 0};
+
+    const size_t chunk_offset = tile_offset;
+    s16x4 Bvec[4];
+
+#pragma unroll
+    for (int idx = 0; idx < 4; ++idx) {
+      Bvec[idx] = (col_ok[idx] && chunk_elems > 0)
+                      ? load_bf16x4_raw(w_base[idx] + chunk_offset, chunk_elems)
+                      : s16x4{0, 0, 0, 0};
+    }
+
+#pragma unroll
     for (int idx = 0; idx < 4; ++idx) {
       acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
           Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
@@ -234,14 +264,17 @@ void matmul_gemm_kernel_bf16_mfma(
     const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
     const int row_hi = row_lo + 16;
 
-    if (row_lo < B && (!(pos) || pos[row_lo] >= 0)) {
+    const bool row_lo_ok = (row_lo < B) && (!has_pos || pos[row_lo] >= 0);
+    const bool row_hi_ok = (row_hi < B) && (!has_pos || pos[row_hi] >= 0);
+
+    if (row_lo_ok) {
       float* y0 = y + (size_t)row_lo * d;
       if (col_ok[0]) y0[cols[0]] = acc_lo[0][i];
       if (col_ok[1]) y0[cols[1]] = acc_lo[1][i];
       if (col_ok[2]) y0[cols[2]] = acc_lo[2][i];
       if (col_ok[3]) y0[cols[3]] = acc_lo[3][i];
     }
-    if (row_hi < B && (!(pos) || pos[row_hi] >= 0)) {
+    if (row_hi_ok) {
       float* y1 = y + (size_t)row_hi * d;
       if (col_ok[0]) y1[cols[0]] = acc_hi[0][i];
       if (col_ok[1]) y1[cols[1]] = acc_hi[1][i];
@@ -503,54 +536,47 @@ void mlp1_fused_gemm_kernel(
                    (size_t)row_in_tile1 * MATMUL_CHUNK_K;
   }
 
+  const uint16_t* w_base_c0 = c0_ok ? w_u16 + base_tile_c0 : nullptr;
+  const uint16_t* w_base_c1 = c1_ok ? w_u16 + base_tile_c1 : nullptr;
+
   f32x4 acc00 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc01 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
-  for (int k0 = 0; k0 < H; k0 += MATMUL_TILE_K) {
+  size_t tile_offset = group_offset;
+  for (int k0 = 0; k0 < H; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
-    const int k_rem = max(0, min(MATMUL_CHUNK_K, H - k_base));
-
-    const bf16_t *x_ptr0 = row0_active
-                               ? x + (size_t)batch0 * (size_t)H + k_base
-                               : nullptr;
-    const bf16_t *x_ptr1 = row1_active
-                               ? x + (size_t)batch1 * (size_t)H + k_base
-                               : nullptr;
-
-    s16x4 Avec_r0 = pack4_bf16_from_bf16_guard(x_ptr0, 0, k_rem, row0_active);
-    s16x4 Avec_r1 = pack4_bf16_from_bf16_guard(x_ptr1, 0, k_rem, row1_active);
-
-    const int tile_k_idx = k0 / MATMUL_TILE_K;
-    const size_t chunk_offset =
-        (size_t)tile_k_idx * tile_elems + group_offset;
-
-    s16x4 Bvec_c0 = {0, 0, 0, 0};
-    if (c0_ok && k_rem > 0) {
-      const uint16_t *src0 = w_u16 + base_tile_c0 + chunk_offset;
-      Bvec_c0[0] = (short)src0[0];
-      Bvec_c0[1] = (short)src0[1];
-      Bvec_c0[2] = (short)src0[2];
-      Bvec_c0[3] = (short)src0[3];
-      if (k_rem < MATMUL_CHUNK_K) {
-        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
-          Bvec_c0[j] = 0;
-      }
+    const int rem = H - k_base;
+    if (rem <= 0) {
+      continue;
     }
 
-    s16x4 Bvec_c1 = {0, 0, 0, 0};
-    if (c1_ok && k_rem > 0) {
-      const uint16_t *src1 = w_u16 + base_tile_c1 + chunk_offset;
-      Bvec_c1[0] = (short)src1[0];
-      Bvec_c1[1] = (short)src1[1];
-      Bvec_c1[2] = (short)src1[2];
-      Bvec_c1[3] = (short)src1[3];
-      if (k_rem < MATMUL_CHUNK_K) {
-        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
-          Bvec_c1[j] = 0;
-      }
-    }
+    const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
+    const uint16_t* x_src0 = (row0_active && chunk_elems > 0)
+                                 ? reinterpret_cast<const uint16_t*>(
+                                       x + (size_t)batch0 * (size_t)H +
+                                       k_base)
+                                 : nullptr;
+    const uint16_t* x_src1 = (row1_active && chunk_elems > 0)
+                                 ? reinterpret_cast<const uint16_t*>(
+                                       x + (size_t)batch1 * (size_t)H +
+                                       k_base)
+                                 : nullptr;
+
+    const s16x4 Avec_r0 = load_bf16x4_raw(x_src0, chunk_elems);
+    const s16x4 Avec_r1 = load_bf16x4_raw(x_src1, chunk_elems);
+
+    const size_t chunk_offset = tile_offset;
+
+    const s16x4 Bvec_c0 =
+        load_bf16x4_raw((chunk_elems > 0 && c0_ok) ? w_base_c0 + chunk_offset
+                                                   : nullptr,
+                        chunk_elems);
+    const s16x4 Bvec_c1 =
+        load_bf16x4_raw((chunk_elems > 0 && c1_ok) ? w_base_c1 + chunk_offset
+                                                   : nullptr,
+                        chunk_elems);
 
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
                                                        acc00, 0, 0, 0);
@@ -713,56 +739,47 @@ void mlp2_bias_weighted_accum_gemm_kernel(
                    (size_t)row_in_tile1 * MATMUL_CHUNK_K;
   }
 
+  const uint16_t* w_base_c0 = c0_ok ? w_u16 + base_tile_c0 : nullptr;
+  const uint16_t* w_base_c1 = c1_ok ? w_u16 + base_tile_c1 : nullptr;
+
   f32x4 acc00 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc01 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc10 = {0.f, 0.f, 0.f, 0.f};
   f32x4 acc11 = {0.f, 0.f, 0.f, 0.f};
 
-  for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K) {
+  size_t tile_offset = group_offset;
+  for (int k0 = 0; k0 < IM; k0 += MATMUL_TILE_K, tile_offset += tile_elems) {
     const int k_base = k0 + ty * MATMUL_CHUNK_K;
-    const int k_rem = max(0, min(MATMUL_CHUNK_K, IM - k_base));
+    const int rem = IM - k_base;
+    if (rem <= 0) {
+      continue;
+    }
 
-    const float *gate_ptr0 = row0_active
-                                 ? gate_up_topk + gate_base0 + k_base
-                                 : gate_up_topk;
-    const float *gate_ptr1 = row1_active
-                                 ? gate_up_topk + gate_base1 + k_base
-                                 : gate_up_topk;
+    const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
+    const float *gate_ptr0 =
+        (row0_active && chunk_elems > 0)
+            ? gate_up_topk + gate_base0 + k_base
+            : nullptr;
+    const float *gate_ptr1 =
+        (row1_active && chunk_elems > 0)
+            ? gate_up_topk + gate_base1 + k_base
+            : nullptr;
 
     s16x4 Avec_r0 =
-        pack4_bf16_from_f32_guard(gate_ptr0, 0, k_rem, row0_active);
+        pack4_bf16_from_f32_guard(gate_ptr0, 0, chunk_elems, row0_active);
     s16x4 Avec_r1 =
-        pack4_bf16_from_f32_guard(gate_ptr1, 0, k_rem, row1_active);
+        pack4_bf16_from_f32_guard(gate_ptr1, 0, chunk_elems, row1_active);
 
-    const int tile_k_idx = k0 / MATMUL_TILE_K;
-    const size_t chunk_offset =
-        (size_t)tile_k_idx * tile_elems + group_offset;
+    const size_t chunk_offset = tile_offset;
 
-    s16x4 Bvec_c0 = {0, 0, 0, 0};
-    if (c0_ok && k_rem > 0) {
-      const uint16_t *src0 = w_u16 + base_tile_c0 + chunk_offset;
-      Bvec_c0[0] = (short)src0[0];
-      Bvec_c0[1] = (short)src0[1];
-      Bvec_c0[2] = (short)src0[2];
-      Bvec_c0[3] = (short)src0[3];
-      if (k_rem < MATMUL_CHUNK_K) {
-        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
-          Bvec_c0[j] = 0;
-      }
-    }
-
-    s16x4 Bvec_c1 = {0, 0, 0, 0};
-    if (c1_ok && k_rem > 0) {
-      const uint16_t *src1 = w_u16 + base_tile_c1 + chunk_offset;
-      Bvec_c1[0] = (short)src1[0];
-      Bvec_c1[1] = (short)src1[1];
-      Bvec_c1[2] = (short)src1[2];
-      Bvec_c1[3] = (short)src1[3];
-      if (k_rem < MATMUL_CHUNK_K) {
-        for (int j = k_rem; j < MATMUL_CHUNK_K; ++j)
-          Bvec_c1[j] = 0;
-      }
-    }
+    const s16x4 Bvec_c0 =
+        load_bf16x4_raw((chunk_elems > 0 && c0_ok) ? w_base_c0 + chunk_offset
+                                                   : nullptr,
+                        chunk_elems);
+    const s16x4 Bvec_c1 =
+        load_bf16x4_raw((chunk_elems > 0 && c1_ok) ? w_base_c1 + chunk_offset
+                                                   : nullptr,
+                        chunk_elems);
 
     acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0,
                                                        acc00, 0, 0, 0);
