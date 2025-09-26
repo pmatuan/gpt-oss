@@ -175,7 +175,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
     }
     // Zero-fill any unused local slots to keep indices safe
     for (; lid < ctx.E_local; ++lid) {
-      float zero = 0.0f;
       HIP_CHECK(hipMemset(ctx.gpu_expert_bias.g_b_mlp1 + ((size_t)l * ctx.E_local + (size_t)lid) * (size_t)(2 * IM_), 0, (size_t)(2 * IM_) * sizeof(float)));
       HIP_CHECK(hipMemset(ctx.gpu_expert_bias.g_b_mlp2 + ((size_t)l * ctx.E_local + (size_t)lid) * (size_t)H_, 0, (size_t)H_ * sizeof(float)));
     }
@@ -1130,41 +1129,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           to_peer[(size_t)owner].push_back({b, e, k, w, owner});
         }
       }
-
-      // Optional: exercise P2P copies of x[b,:] rows to expert owners (no-op compute)
-      // Keep transfers small and non-blocking; this is correctness scaffolding only.
-      for (int peer = 0; peer < g_num_devices; ++peer) {
-        if (peer == ctx.device_id) continue; // only remote for now
-        auto &bucket = to_peer[(size_t)peer];
-        const size_t cnt = bucket.size();
-        if (cnt == 0) continue;
-
-        // Allocate RX buffer on peer for BF16 activations [cnt, H]
-        bf16_t *peer_rx = nullptr;
-        HIP_CHECK(hipSetDevice(peer));
-        if (hipMalloc(&peer_rx, cnt * (size_t)H * sizeof(bf16_t)) != hipSuccess) {
-          // If OOM or peer busy, skip transfers for this peer
-          HIP_CHECK(hipSetDevice(ctx.device_id));
-          continue;
-        }
-        HIP_CHECK(hipSetDevice(ctx.device_id));
-
-        // Send per-assignment rows
-        for (size_t i = 0; i < cnt; ++i) {
-          const int b = bucket[i].b;
-          const bf16_t *src = ctx.gpu_activations.d_t + (size_t)b * H;
-          bf16_t *dst = peer_rx + i * (size_t)H;
-          HIP_CHECK(hipMemcpyPeerAsync(dst, peer, src, ctx.device_id,
-                                       (size_t)H * sizeof(bf16_t), 0));
-        }
-
-        // Best-effort sync and free peer buffer (since we don't compute there yet)
-        HIP_CHECK(hipDeviceSynchronize());
-        HIP_CHECK(hipSetDevice(peer));
-        HIP_CHECK(hipDeviceSynchronize());
-        HIP_CHECK(hipFree(peer_rx));
-        HIP_CHECK(hipSetDevice(ctx.device_id));
-      }
     }
 
     HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0,
@@ -1290,11 +1254,11 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         HIP_CHECK(hipMemcpy(d_topk_v_owner, h_topk_v_local.data(), (size_t)B_local * K * sizeof(float), hipMemcpyHostToDevice));
 
         // expert offsets and assignments on owner
-  int *d_expert_offsets_owner = nullptr;
+        int *d_expert_offsets_owner = nullptr;
         int *d_assignment_batches_owner = nullptr;
         int *d_assignment_slots_owner = nullptr;
-  HIP_CHECK(hipMalloc(&d_expert_offsets_owner, (size_t)(E_local_layer + 1) * sizeof(int)));
-  HIP_CHECK(hipMemcpy(d_expert_offsets_owner, expert_offsets_local.data(), (size_t)(E_local_layer + 1) * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMalloc(&d_expert_offsets_owner, (size_t)(E_local_layer + 1) * sizeof(int)));
+        HIP_CHECK(hipMemcpy(d_expert_offsets_owner, expert_offsets_local.data(), (size_t)(E_local_layer + 1) * sizeof(int), hipMemcpyHostToDevice));
         HIP_CHECK(hipMalloc(&d_assignment_batches_owner, (size_t)total_assignments_owner * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_assignment_slots_owner, (size_t)total_assignments_owner * sizeof(int)));
         HIP_CHECK(hipMemcpy(d_assignment_batches_owner, assignment_batches.data(), (size_t)total_assignments_owner * sizeof(int), hipMemcpyHostToDevice));
@@ -1315,27 +1279,29 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         {
           PROFILE_GPU_SCOPE("mlp1_owner", 0);
           dim3 block_mlp1(MLP_THREAD_X, MLP_THREAD_Y, 1);
-      const int max_tiles = (max_assign_per_expert + MLP_TILE_TOKENS - 1) / MLP_TILE_TOKENS;
-      dim3 grid_mlp1((2 * IM + MLP_TILE_COLS - 1) / MLP_TILE_COLS, max_tiles, E_local_layer);
+          const int max_tiles = (max_assign_per_expert + MLP_TILE_TOKENS - 1) / MLP_TILE_TOKENS;
+          dim3 grid_mlp1((2 * IM + MLP_TILE_COLS - 1) / MLP_TILE_COLS, max_tiles, E_local_layer);
           mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0>>>(
               d_gate_up_owner, d_x_owner,
-        g_devices[owner].gpu_weights_bf16.d_w_mlp1_bf16, g_devices[owner].stride_w_mlp1_bf16,
-        g_devices[owner].gpu_expert_bias.g_b_mlp1,
+              g_devices[owner].gpu_weights_bf16.d_w_mlp1_bf16, 
+              g_devices[owner].stride_w_mlp1_bf16,
+              g_devices[owner].gpu_expert_bias.g_b_mlp1,
               d_assignment_batches_owner, d_assignment_slots_owner, d_expert_offsets_owner,
-        l, g_devices[owner].E_local, H, IM, p->swiglu_limit, B_local, d_pos_owner);
+              l, g_devices[owner].E_local, H, IM, p->swiglu_limit, B_local, d_pos_owner);
         }
 
         {
           PROFILE_GPU_SCOPE("mlp2_owner", 0);
           dim3 block_mlp2(MLP_THREAD_X, MLP_THREAD_Y, 1);
           const int max_tiles = (max_assign_per_expert + MLP_TILE_TOKENS - 1) / MLP_TILE_TOKENS;
-    dim3 grid_mlp2((H + MLP_TILE_COLS - 1) / MLP_TILE_COLS, max_tiles, E_local_layer);
+          dim3 grid_mlp2((H + MLP_TILE_COLS - 1) / MLP_TILE_COLS, max_tiles, E_local_layer);
           mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0>>>(
               d_partial_owner, d_gate_up_owner,
-        g_devices[owner].gpu_weights_bf16.d_w_mlp2_bf16, g_devices[owner].stride_w_mlp2_bf16,
-        g_devices[owner].gpu_expert_bias.g_b_mlp2,
+              g_devices[owner].gpu_weights_bf16.d_w_mlp2_bf16, 
+              g_devices[owner].stride_w_mlp2_bf16,
+              g_devices[owner].gpu_expert_bias.g_b_mlp2,
               d_assignment_batches_owner, d_assignment_slots_owner, d_expert_offsets_owner,
-      d_topk_v_owner, l, g_devices[owner].E_local, IM, H, B_local, d_pos_owner);
+              d_topk_v_owner, l, g_devices[owner].E_local, IM, H, B_local, d_pos_owner);
         }
         HIP_CHECK(hipDeviceSynchronize());
 
