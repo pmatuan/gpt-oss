@@ -48,8 +48,8 @@ __global__ void build_expert_assignments_kernel(
     const int* __restrict__ pos,
     const int* __restrict__ expert_offsets,
     int* __restrict__ expert_counters,
-    int* __restrict__ assignment_batches,
-    int* __restrict__ assignment_slots,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
     int batch_size,
     int experts_per_token,
     int E);
@@ -59,9 +59,9 @@ mlp1_fused_gemm_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]
                        const bf16_t *__restrict__ x,          // [B, H] (bf16)
                        const bf16_t *__restrict__ w_mlp1_all, // [L, E, 2*IM, H]
                        size_t stride_w_mlp1,
-                       const float *__restrict__ b_mlp1_all, // [L, E, 2*IM]
-                       const int *__restrict__ assignment_batches,
-                       const int *__restrict__ assignment_slots,
+                       const bf16_t *__restrict__ b_mlp1_all, // [L, E, 2*IM]
+                       const uint16_t *__restrict__ assignment_batches,
+                       const uint8_t *__restrict__ assignment_slots,
                        const int *__restrict__ expert_offsets, int l_layer,
                        int E, int H, int IM, float swiglu_limit, int batch_size,
                        const int *pos);
@@ -71,9 +71,9 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     const bf16_t *__restrict__ gate_up_topk, // [K, B, IM]
     const bf16_t *__restrict__ w_mlp2_all,  // [L, E, H, IM]
     size_t stride_w_mlp2,
-    const float *__restrict__ b_mlp2_all, // [L, E, H]
-    const int *__restrict__ assignment_batches,
-    const int *__restrict__ assignment_slots,
+    const bf16_t *__restrict__ b_mlp2_all, // [L, E, H]
+    const uint16_t *__restrict__ assignment_batches,
+    const uint8_t *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size, const int *pos);
 #endif // GETP_MATMUL_H

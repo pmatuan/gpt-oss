@@ -662,8 +662,8 @@ __global__ void build_expert_assignments_kernel(
     const int* __restrict__ pos,
     const int* __restrict__ expert_offsets,
     int* __restrict__ expert_counters,
-    int* __restrict__ assignment_batches,
-    int* __restrict__ assignment_slots,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
     int batch_size,
     int experts_per_token,
     int E)
@@ -682,8 +682,8 @@ __global__ void build_expert_assignments_kernel(
   const int offset = atomicAdd(expert_counters + expert, 1);
   const int write_idx = expert_offsets[expert] + offset;
 
-  assignment_batches[write_idx] = batch_idx;
-  assignment_slots[write_idx] = slot;
+  assignment_batches[write_idx] = static_cast<uint16_t>(batch_idx);
+  assignment_slots[write_idx] = static_cast<uint8_t>(slot);
 }
 
 // ================= MLP1 (Gate & Up) : batched per expert =================
@@ -709,9 +709,9 @@ __global__ __launch_bounds__(64, 2)
 void mlp1_fused_gemm_kernel(
     bf16_t *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
-    const float *__restrict__ b_mlp1_all,
-    const int *__restrict__ assignment_batches,
-    const int *__restrict__ assignment_slots,
+    const bf16_t *__restrict__ b_mlp1_all,
+    const uint16_t *__restrict__ assignment_batches,
+    const uint8_t *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size, const int *__restrict__ pos) {
   const int expert_id = blockIdx.z;
@@ -746,8 +746,8 @@ void mlp1_fused_gemm_kernel(
     int valid = 0;
     if (idx < tile_rows) {
       const int assignment_idx = start + M0 + idx;
-      batch = assignment_batches[assignment_idx];
-      slot = assignment_slots[assignment_idx];
+      batch = static_cast<int>(assignment_batches[assignment_idx]);
+      slot = static_cast<int>(assignment_slots[assignment_idx]);
       if (batch >= 0 && slot >= 0) {
         const bool pos_ok = (!pos) || (pos[batch] >= 0);
         if (pos_ok)
@@ -772,7 +772,7 @@ void mlp1_fused_gemm_kernel(
       w_mlp1_all + matrix_idx * stride_w_mlp1;
   const uint16_t *__restrict__ w_u16 =
       reinterpret_cast<const uint16_t *>(w_matrix);
-  const float *__restrict__ bias_base =
+  const bf16_t *__restrict__ bias_base =
       b_mlp1_all + matrix_idx * (size_t)(2 * IM);
 
   const int tiles_k = (H + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
@@ -880,8 +880,10 @@ void mlp1_fused_gemm_kernel(
     }
   }
 
-  const float bias_gate = c0_ok ? bias_base[c0] : 0.0f;
-  const float bias_up = c1_ok ? bias_base[c1] : 0.0f;
+  const float bias_gate =
+      c0_ok ? static_cast<float>(bias_base[c0]) : 0.0f;
+  const float bias_up =
+      c1_ok ? static_cast<float>(bias_base[c1]) : 0.0f;
 
   for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
     const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
@@ -925,9 +927,9 @@ __global__ __launch_bounds__(64, 2)
 void mlp2_bias_weighted_accum_gemm_kernel(
     float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
-    const float *__restrict__ b_mlp2_all,
-    const int *__restrict__ assignment_batches,
-    const int *__restrict__ assignment_slots,
+    const bf16_t *__restrict__ b_mlp2_all,
+    const uint16_t *__restrict__ assignment_batches,
+    const uint8_t *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size,
     const int *__restrict__ pos) {
@@ -967,8 +969,8 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     size_t gate_offset = 0;
     if (idx < tile_rows) {
       const int assignment_idx = start + M0 + idx;
-      batch = assignment_batches[assignment_idx];
-      slot = assignment_slots[assignment_idx];
+      batch = static_cast<int>(assignment_batches[assignment_idx]);
+      slot = static_cast<int>(assignment_slots[assignment_idx]);
       if (batch >= 0 && slot >= 0) {
         const bool pos_ok = (!pos) || (pos[batch] >= 0);
         if (pos_ok) {
@@ -1000,7 +1002,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
       w_mlp2_all + matrix_idx * stride_w_mlp2;
   const uint16_t *__restrict__ w_u16 =
       reinterpret_cast<const uint16_t *>(w_matrix);
-  const float *__restrict__ bias_base =
+  const bf16_t *__restrict__ bias_base =
       b_mlp2_all + matrix_idx * (size_t)H;
 
   const int tiles_k = (IM + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
@@ -1115,8 +1117,10 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     }
   }
 
-  const float bias_c0 = c0_ok ? bias_base[c0] : 0.0f;
-  const float bias_c1 = c1_ok ? bias_base[c1] : 0.0f;
+  const float bias_c0 =
+      c0_ok ? static_cast<float>(bias_base[c0]) : 0.0f;
+  const float bias_c1 =
+      c1_ok ? static_cast<float>(bias_base[c1]) : 0.0f;
 
   for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
     const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);

@@ -132,24 +132,25 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   debug_print_gpu_memory("after small FP32 weights", device_id);
 
-  // Expert biases FP32
+  const int n_streams = 4;
+  const size_t chunk_bytes = 64ULL * 1024 * 1024;
+
+  // Expert biases (converted to BF16 on device)
   const int IM_ = model_config->intermediate_dim;
   HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp1,
-                      (size_t)L * E_ * (2 * IM_) * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp1, w->b_mlp1,
-                      (size_t)L * E_ * (2 * IM_) * sizeof(float),
-                      hipMemcpyHostToDevice));
+                      (size_t)L * E_ * (2 * IM_) * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_mlp1, (size_t)L * E_ * (2 * IM_),
+                           ctx.gpu_expert_bias.g_b_mlp1, n_streams,
+                           chunk_bytes);
   HIP_CHECK(hipMalloc(&ctx.gpu_expert_bias.g_b_mlp2,
-                      (size_t)L * E_ * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_expert_bias.g_b_mlp2, w->b_mlp2,
-                      (size_t)L * E_ * H_ * sizeof(float),
-                      hipMemcpyHostToDevice));
+                      (size_t)L * E_ * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_mlp2, (size_t)L * E_ * H_,
+                           ctx.gpu_expert_bias.g_b_mlp2, n_streams,
+                           chunk_bytes);
 
   debug_print_gpu_memory("after expert biases", device_id);
 
   // Large BF16 weights
-  const int n_streams = 4;
-  const size_t chunk_bytes = 64ULL * 1024 * 1024;
   const int V_ = model_config->vocab_size;
   const int O_N = D_ * Hq_;
 
@@ -1047,8 +1048,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     int total_pairs = batch_size * p->experts_per_token;
     int *d_expert_counts = nullptr;
     int *d_expert_offsets = nullptr;
-    int *d_assignment_batches = nullptr;
-    int *d_assignment_slots = nullptr;
+    uint16_t *d_assignment_batches = nullptr;
+    uint8_t *d_assignment_slots = nullptr;
     std::vector<int> h_counts(E, 0);
     std::vector<int> h_offsets(E + 1, 0);
     int max_assign_per_expert = 0;
@@ -1084,9 +1085,9 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
           HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, E * sizeof(int)));
           HIP_CHECK(hipMalloc(&d_assignment_batches,
-                              total_assignments * sizeof(int)));
+                              total_assignments * sizeof(uint16_t)));
           HIP_CHECK(
-              hipMalloc(&d_assignment_slots, total_assignments * sizeof(int)));
+              hipMalloc(&d_assignment_slots, total_assignments * sizeof(uint8_t)));
 
           build_expert_assignments_kernel<<<gridCount, 256, 0>>>(
               ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos,

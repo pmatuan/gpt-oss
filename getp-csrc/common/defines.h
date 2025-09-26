@@ -80,8 +80,8 @@ struct GPUWeightBuffersFP32 {
 };
 
 struct GPUExpertBiasBuffers {
-  float *g_b_mlp1;
-  float *g_b_mlp2;
+  bf16_t *g_b_mlp1;
+  bf16_t *g_b_mlp2;
 };
 
 struct GPUWeightBuffersBF16 {
