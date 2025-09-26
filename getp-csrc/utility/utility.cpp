@@ -208,6 +208,25 @@ __global__ void residual_add_batch_kernel(bf16_t *x, const float *residual,
   }
 }
 
+__global__ void residual_add_batch_kernel_bf16(bf16_t *x,
+                                               const bf16_t *residual,
+                                               int size,
+                                               int batch_size,
+                                               const int *pos) {
+  const int b = blockIdx.y;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= batch_size)
+    return;
+  if (pos && pos[b] < 0)
+    return;
+  if (i < size) {
+    const size_t offset = (size_t)b * size + i;
+    const float acc = static_cast<float>(x[offset]) +
+                      static_cast<float>(residual[offset]);
+    x[offset] = hip_bfloat16(acc);
+  }
+}
+
 __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
                                      const float *weight, int size,
                                      const int *pos) {

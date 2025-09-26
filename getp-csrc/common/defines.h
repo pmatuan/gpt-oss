@@ -53,7 +53,6 @@ struct GPUActivationBuffers {
   bf16_t *d_x;
   bf16_t *d_t;
   bf16_t *d_tb;
-  float *d_t_fp32;
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
   float *d_e_agg;
