@@ -3,15 +3,7 @@
 
 #include "../common/defines.h"
 
-
-__global__ void matmul_bias_gemm_kernel_bf16_mfma(
-    float* __restrict__ y,          // [B x d]
-    const bf16_t* __restrict__ x,   // [B x n] (bf16)
-    const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
-    const float* __restrict__ bias, // [d] or nullptr
-    int n, int d, int B,
-    const int* __restrict__ pos);
-
+// Bias variant with bf16 output: Y = X @ W^T + B
 __global__ void matmul_bias_gemm_kernel_bf16_mfma(
     bf16_t* __restrict__ y,         // [B x d]
     const bf16_t* __restrict__ x,   // [B x n] (bf16)
@@ -34,25 +26,6 @@ __global__ void matmul_bias_gemm_kernel_float(
     const float* __restrict__ w,    // [d, n] (row-major theo n)
     const float* __restrict__ bias, // [d] (có thể null)
     int n, int d, int batch_size, const int *pos);
-
-__global__ void count_expert_assignments_kernel(
-    int* __restrict__ counts,
-    const int* __restrict__ topk_i,
-    const int* __restrict__ pos,
-    int batch_size,
-    int experts_per_token,
-    int E);
-
-__global__ void build_expert_assignments_kernel(
-    const int* __restrict__ topk_i,
-    const int* __restrict__ pos,
-    const int* __restrict__ expert_offsets,
-    int* __restrict__ expert_counters,
-    uint16_t* __restrict__ assignment_batches,
-    uint8_t* __restrict__ assignment_slots,
-    int batch_size,
-    int experts_per_token,
-    int E);
 
 __global__ void
 mlp1_fused_gemm_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]

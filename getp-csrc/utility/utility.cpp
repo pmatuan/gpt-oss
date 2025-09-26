@@ -24,33 +24,6 @@ void debug_print_gpu_memory(const char *tag, int device_id) {
   fflush(stdout);
 }
 
-__device__ __forceinline__ short f32_to_bf16_bits_short(float f) {
-  union { uint32_t u; float f; } v; v.f = f;
-  return (short)(v.u >> 16);
-}
-
-__device__ __forceinline__ s16x4 pack4_bf16_from_f32_guard(
-    const float* base_f32, int k_off, int k_rem, bool row_valid) {
-  s16x4 v = {0,0,0,0};
-  if (!row_valid) return v;
-  #pragma unroll
-  for (int i=0;i<4;i++) {
-    if (i < k_rem) v[i] = f32_to_bf16_bits_short(base_f32[k_off + i]);
-  }
-  return v;
-}
-
-__device__ __forceinline__ s16x4 pack4_bf16_from_bf16_guard(
-    const bf16_t* base_bf16, int k_off, int k_rem, bool col_valid) {
-  s16x4 v = {0,0,0,0};
-  if (!col_valid) return v;
-  #pragma unroll
-  for (int i=0;i<4;i++) {
-    if (i < k_rem) v[i] = base_bf16[k_off + i].data;
-  }
-  return v;
-}
-
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1) {
   union { uint32_t u; float f; } a, b;
   a.u = (u & 0x0000FFFFu) << 16; // lower bf16 -> fp32
@@ -633,4 +606,100 @@ void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
                   tile_elems * sizeof(bf16_t));
     }
   }
+}
+
+// Matmul Helper Functions
+__device__ __forceinline__ s16x4 load_bf16x4(const uint16_t* src, int valid_elems) {
+  s16x4 out = {0, 0, 0, 0};
+  if (!src || valid_elems <= 0) {
+    return out;
+  }
+
+  if (valid_elems >= MATMUL_CHUNK_K) {
+    const uint32_t* src32 = reinterpret_cast<const uint32_t*>(src);
+    const uint32_t packed0 = src32[0];
+    const uint32_t packed1 = src32[1];
+    out[0] = static_cast<short>(packed0 & 0xFFFF);
+    out[1] = static_cast<short>(packed0 >> 16);
+    out[2] = static_cast<short>(packed1 & 0xFFFF);
+    out[3] = static_cast<short>(packed1 >> 16);
+    return out;
+  }
+
+#pragma unroll
+  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
+    out[i] = (i < valid_elems) ? static_cast<short>(src[i]) : 0;
+  }
+  return out;
+}
+
+
+// Expert Assignment Kernels
+__global__ void count_expert_assignments_kernel(
+    int* __restrict__ counts,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    int batch_size,
+    int experts_per_token,
+    int E)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * experts_per_token;
+  if (idx >= total) return;
+
+  const int batch_idx = idx / experts_per_token;
+  if (pos && pos[batch_idx] < 0) return;
+
+  const int expert = topk_i[idx];
+  if (expert < 0 || expert >= E) return;
+
+  atomicAdd(counts + expert, 1);
+}
+
+__global__ void build_expert_assignments_kernel(
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ expert_offsets,
+    int* __restrict__ expert_counters,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
+    int batch_size,
+    int experts_per_token,
+    int E)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * experts_per_token;
+  if (idx >= total) return;
+
+  const int batch_idx = idx / experts_per_token;
+  if (pos && pos[batch_idx] < 0) return;
+
+  const int expert = topk_i[idx];
+  if (expert < 0 || expert >= E) return;
+
+  const int slot = idx % experts_per_token;
+  const int offset = atomicAdd(expert_counters + expert, 1);
+  const int write_idx = expert_offsets[expert] + offset;
+
+  assignment_batches[write_idx] = static_cast<uint16_t>(batch_idx);
+  assignment_slots[write_idx] = static_cast<uint8_t>(slot);
+}
+
+// Activation Functions
+__device__ __forceinline__ float clamp_with_limit(float v, float limit) {
+  if (limit <= 0.0f)
+    return v;
+  const float inv_range = 1.0f / (2.0f * limit);
+  const float normalized = __saturatef((v + limit) * inv_range);
+  return normalized * (2.0f * limit) - limit;
+}
+
+__device__ __forceinline__ float swiglu_fused(float gate, float up,
+                                              float limit) {
+  const float gate_val = clamp_with_limit(gate, limit);
+  const float up_val = clamp_with_limit(up, limit);
+  const float alpha = 1.702f;
+  const float gate_act = gate_val *
+      __saturatef(0.5f + 0.5f * tanhf(alpha * gate_val * 0.5f));
+  return gate_act * (up_val + 1.0f);
 }
