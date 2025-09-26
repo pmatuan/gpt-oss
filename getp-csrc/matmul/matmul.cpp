@@ -12,11 +12,9 @@ void matmul_gemm_kernel_bf16_mfma(
     int n, int d, int B,
     const int* __restrict__ pos)    // nullable; pos[b] < 0 -> skip row
 {
-  constexpr int TILE_M = MATMUL_GEMM_TILE_ROWS; // rows per block (matches packing)
-  constexpr int TILE_N = MATMUL_GEMM_TILE_COLS; // expanded columns per block
-  static_assert((MATMUL_GEMM_TILE_COLS % 16) == 0,
-                "MATMUL_GEMM_TILE_COLS must be a multiple of 16");
-  constexpr int COL_GROUPS = MATMUL_GEMM_TILE_COLS / 16;
+  constexpr int TILE_M = MATMUL_LOGITS_TILE_ROWS; // rows per block (matches packing)
+  constexpr int TILE_N = MATMUL_LOGITS_TILE_COLS; // expanded columns per block
+  constexpr int COL_GROUPS = MATMUL_LOGITS_TILE_COLS / 16;
 
   const int tx = threadIdx.x; // 0..15
   const int ty = threadIdx.y; // 0..3
@@ -341,8 +339,8 @@ void matmul_bias_gemm_kernel_bf16_mfma(
   const int ty = threadIdx.y; // 0..3
 
   // 32x32 tile origin on (M=B, N=d)
-  const int M0 = blockIdx.y * 32;
-  const int N0 = blockIdx.x * 32;
+  const int M0 = blockIdx.y * MATMUL_TILE_ROWS;
+  const int N0 = blockIdx.x * MATMUL_TILE_COLS;
 
   // Per-lane columns (two 16-wide halves)
   const int c0 = N0 + tx;

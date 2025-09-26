@@ -1166,8 +1166,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("matmul_gemm_kernel_bf16_mfma", 0);
       dim3 gridV_gemm(
-          (V + MATMUL_GEMM_TILE_COLS - 1) / MATMUL_GEMM_TILE_COLS,
-          (batch_size + MATMUL_GEMM_TILE_ROWS - 1) / MATMUL_GEMM_TILE_ROWS,
+          (V + MATMUL_LOGITS_TILE_COLS - 1) / MATMUL_LOGITS_TILE_COLS,
+          (batch_size + MATMUL_LOGITS_TILE_ROWS - 1) / MATMUL_LOGITS_TILE_ROWS,
           1);
       dim3 blockV(16, 4, 1);
       matmul_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
