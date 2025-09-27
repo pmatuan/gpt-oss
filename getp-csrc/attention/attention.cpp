@@ -3,18 +3,178 @@
 #include "attention.h"
 #include <math.h>
 
-// Batched attention kernel: processes grid.y = batch dimension
-// Uses dynamic shared memory sized for (effective tokens + 1) floats
-__launch_bounds__(64, 8) __global__ void attention_batch_kernel(
-    bf16_t *__restrict__ out_tb,  // [B, Hq*D] (bf16 storage)
-    const bf16_t *__restrict__ q, // [B, Hq*D], BF16 (already rotary-applied)
-    const bf16_t *__restrict__ k_cache,
-    const bf16_t *__restrict__ v_cache,
-    const float *__restrict__ attn_sinks, // [L*Hq]
-    int layer_idx, const int *__restrict__ pos, int D, int Hq, int Hk,
+// Batched attention kernel for layers using sliding windows (even layers)
+__launch_bounds__(64, 8) __global__ void attention_batch_kernel_even(
+    bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
+    const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
+    const float *__restrict__ attn_sinks, int layer_idx,
+    const int *__restrict__ pos, int D, int Hq, int Hk,
     const uint32_t *__restrict__ layer_offsets,
     const int *__restrict__ layer_capacity, int sliding_window,
     uint32_t kv_batch_stride, int batch_size) {
+  const int b = blockIdx.y;
+  if (b >= batch_size)
+    return;
+  const int head = blockIdx.x;
+  const int lane = threadIdx.x;
+
+  const int pos_b = pos[b];
+  const int cap = layer_capacity[layer_idx];
+  if (sliding_window <= 0 || pos_b < 0 || head >= Hq || cap <= 0)
+    return;
+
+  const int kv_dim = Hk * D;
+  const int kv_mul = Hq / Hk;
+  const int kv_head = head / kv_mul;
+  const float rsqrt_D = rsqrtf((float)D);
+
+  // Base pointers for batch b and layer layer_idx
+  const bf16_t *__restrict__ q_b = q + (size_t)b * Hq * D;
+  const uint32_t layer_base = layer_offsets[layer_idx];
+  const bf16_t *__restrict__ k_layer =
+      k_cache + (size_t)b * kv_batch_stride + layer_base;
+  const bf16_t *__restrict__ v_layer =
+      v_cache + (size_t)b * kv_batch_stride + layer_base;
+  bf16_t *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
+
+  extern __shared__ float s_att[];
+
+  int start_t = pos_b + 1 - sliding_window;
+  if (start_t < 0)
+    start_t = 0;
+  const int att_tokens = pos_b - start_t + 1;
+  if (att_tokens <= 0)
+    return;
+  const int att_size = att_tokens + 1; // include sink slot
+
+  // Compute attention scores with enhanced vectorization
+  for (int local_t = lane; local_t < att_tokens; local_t += WF_SIZE) {
+    const int t = start_t + local_t;
+    const int slot = t % cap;
+    const bf16_t *k_ptr = k_layer + (size_t)slot * kv_dim + kv_head * D;
+    const bf16_t *q_ptr = q_b + head * D;
+
+    float score = 0.0f;
+    const int D4 = D >> 2;
+    const uint2 *q4 = reinterpret_cast<const uint2 *>(q_ptr);
+
+    // Unrolled vectorized dot product for better ILP
+#pragma unroll 4
+    for (int d4 = 0; d4 < D4; ++d4) {
+      float4 kv;
+      kv.x = static_cast<float>(k_ptr[d4 * 4 + 0]);
+      kv.y = static_cast<float>(k_ptr[d4 * 4 + 1]);
+      kv.z = static_cast<float>(k_ptr[d4 * 4 + 2]);
+      kv.w = static_cast<float>(k_ptr[d4 * 4 + 3]);
+
+      float4 qv = bf16quad_to_float4(q4[d4]);
+      score = fmaf(qv.x, kv.x, score);
+      score = fmaf(qv.y, kv.y, score);
+      score = fmaf(qv.z, kv.z, score);
+      score = fmaf(qv.w, kv.w, score);
+    }
+
+    // Handle remainder
+    for (int d = (D4 << 2); d < D; ++d) {
+      score = fmaf(static_cast<float>(q_ptr[d]), static_cast<float>(k_ptr[d]),
+                   score);
+    }
+
+    // Scale score
+    score *= rsqrt_D;
+    s_att[local_t] = score;
+  }
+  __syncthreads();
+
+  // Sink score at final slot
+  if (lane == 0) {
+    float sink_score = attn_sinks[layer_idx * Hq + head];
+    s_att[att_tokens] = sink_score;
+  }
+  __syncthreads();
+
+  // Softmax over local tokens + sink, reusing optimized reductions
+  float maxv = -INFINITY;
+
+  // Find max in warp-parallel fashion
+  for (int i = lane; i < att_size; i += WF_SIZE)
+    maxv = fmaxf(maxv, s_att[i]);
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+    maxv = fmaxf(maxv, __shfl_down(maxv, off, WF_SIZE));
+  maxv = __shfl(maxv, 0, WF_SIZE);
+
+  // Compute exp and sum in one pass
+  float sum = 0.0f;
+  for (int i = lane; i < att_size; i += WF_SIZE) {
+    float v = __expf(s_att[i] - maxv); // Use fast exp intrinsic
+    s_att[i] = v;
+    sum += v;
+  }
+
+  // Warp reduction for sum
+#pragma unroll
+  for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
+    sum += __shfl_down(sum, off, WF_SIZE);
+  sum = __shfl(sum, 0, WF_SIZE);
+
+  // Use fast reciprocal approximation (like Python's 1/sum)
+  float inv_sum = __frcp_rn(sum); // Fast reciprocal
+  for (int i = lane; i < att_size; i += WF_SIZE)
+    s_att[i] *= inv_sum;
+  __syncthreads();
+
+  // Weighted sum of V with improved memory access pattern
+  const int threads_per_dim = min(WF_SIZE, D);
+  if (lane < threads_per_dim) {
+    const int dims_per_thread = (D + threads_per_dim - 1) / threads_per_dim;
+    const int start_dim = lane * dims_per_thread;
+    const int end_dim = min(start_dim + dims_per_thread, D);
+
+    // Process multiple dimensions per thread for better memory coalescing
+    for (int d = start_dim; d < end_dim; ++d) {
+      float result = 0.0f;
+
+      // Tile the loop for better cache utilization
+      const int TILE = 8;
+      int local_t = 0;
+
+      // Process in tiles
+      for (; local_t <= att_tokens - TILE; local_t += TILE) {
+#pragma unroll
+        for (int ti = 0; ti < TILE; ++ti) {
+          const int t = start_t + local_t + ti;
+          const int slot = t % cap;
+          const bf16_t *v_ptr =
+              v_layer + (size_t)slot * kv_dim + kv_head * D;
+          result =
+              fmaf(s_att[local_t + ti], static_cast<float>(v_ptr[d]), result);
+        }
+      }
+
+      // Handle remainder
+      for (; local_t < att_tokens; ++local_t) {
+        const int t = start_t + local_t;
+        const int slot = t % cap;
+        const bf16_t *v_ptr =
+            v_layer + (size_t)slot * kv_dim + kv_head * D;
+        result = fmaf(s_att[local_t], static_cast<float>(v_ptr[d]), result);
+      }
+
+      out_b[head * D + d] = hip_bfloat16(result);
+    }
+  }
+}
+
+// Batched attention kernel for full-context layers (odd layers)
+__launch_bounds__(64, 8) __global__ void attention_batch_kernel_odd(
+    bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
+    const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
+    const float *__restrict__ attn_sinks, int layer_idx,
+    const int *__restrict__ pos, int D, int Hq, int Hk,
+    const uint32_t *__restrict__ layer_offsets,
+    const int *__restrict__ layer_capacity, uint32_t kv_batch_stride,
+    int batch_size) {
   const int b = blockIdx.y;
   if (b >= batch_size)
     return;
@@ -42,14 +202,10 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
 
   extern __shared__ float s_att[];
 
-  const bool use_window = (sliding_window > 0) && ((layer_idx & 1) == 0);
-  int start_t = 0;
-  if (use_window) {
-    start_t = pos_b + 1 - sliding_window;
-    if (start_t < 0)
-      start_t = 0;
-  }
+  const int start_t = 0;
   const int att_tokens = pos_b - start_t + 1;
+  if (att_tokens <= 0)
+    return;
   const int att_size = att_tokens + 1; // include sink slot
 
   // Compute attention scores with enhanced vectorization
@@ -64,26 +220,27 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     const uint2 *q4 = reinterpret_cast<const uint2 *>(q_ptr);
 
     // Unrolled vectorized dot product for better ILP
-    #pragma unroll 4
+#pragma unroll 4
     for (int d4 = 0; d4 < D4; ++d4) {
       float4 kv;
       kv.x = static_cast<float>(k_ptr[d4 * 4 + 0]);
       kv.y = static_cast<float>(k_ptr[d4 * 4 + 1]);
       kv.z = static_cast<float>(k_ptr[d4 * 4 + 2]);
       kv.w = static_cast<float>(k_ptr[d4 * 4 + 3]);
-      
+
       float4 qv = bf16quad_to_float4(q4[d4]);
       score = fmaf(qv.x, kv.x, score);
       score = fmaf(qv.y, kv.y, score);
       score = fmaf(qv.z, kv.z, score);
       score = fmaf(qv.w, kv.w, score);
     }
-    
+
     // Handle remainder
     for (int d = (D4 << 2); d < D; ++d) {
-      score = fmaf(static_cast<float>(q_ptr[d]), static_cast<float>(k_ptr[d]), score);
+      score = fmaf(static_cast<float>(q_ptr[d]), static_cast<float>(k_ptr[d]),
+                   score);
     }
-    
+
     // Scale score
     score *= rsqrt_D;
     s_att[local_t] = score;
@@ -99,7 +256,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
 
   // Softmax over local tokens + sink, reusing optimized reductions
   float maxv = -INFINITY;
-  
+
   // Find max in warp-parallel fashion
   for (int i = lane; i < att_size; i += WF_SIZE)
     maxv = fmaxf(maxv, s_att[i]);
@@ -115,7 +272,7 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     s_att[i] = v;
     sum += v;
   }
-  
+
   // Warp reduction for sum
 #pragma unroll
   for (int off = WF_SIZE >> 1; off > 0; off >>= 1)
@@ -138,31 +295,33 @@ __launch_bounds__(64, 8) __global__ void attention_batch_kernel(
     // Process multiple dimensions per thread for better memory coalescing
     for (int d = start_dim; d < end_dim; ++d) {
       float result = 0.0f;
-      
+
       // Tile the loop for better cache utilization
       const int TILE = 8;
       int local_t = 0;
-      
+
       // Process in tiles
       for (; local_t <= att_tokens - TILE; local_t += TILE) {
-        #pragma unroll
+#pragma unroll
         for (int ti = 0; ti < TILE; ++ti) {
           const int t = start_t + local_t + ti;
           const int slot = t % cap;
-          const bf16_t *v_ptr = v_layer + (size_t)slot * kv_dim + kv_head * D;
-          result = fmaf(s_att[local_t + ti], static_cast<float>(v_ptr[d]),
-                        result);
+          const bf16_t *v_ptr =
+              v_layer + (size_t)slot * kv_dim + kv_head * D;
+          result =
+              fmaf(s_att[local_t + ti], static_cast<float>(v_ptr[d]), result);
         }
       }
-      
+
       // Handle remainder
       for (; local_t < att_tokens; ++local_t) {
         const int t = start_t + local_t;
         const int slot = t % cap;
-        const bf16_t *v_ptr = v_layer + (size_t)slot * kv_dim + kv_head * D;
+        const bf16_t *v_ptr =
+            v_layer + (size_t)slot * kv_dim + kv_head * D;
         result = fmaf(s_att[local_t], static_cast<float>(v_ptr[d]), result);
       }
-      
+
       out_b[head * D + d] = hip_bfloat16(result);
     }
   }

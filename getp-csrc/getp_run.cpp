@@ -951,21 +951,31 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
     // Attention (batched)
     {
-      PROFILE_GPU_SCOPE("attention_batch_kernel", 0);
       dim3 gridAttn(Hq, batch_size, 1);
       dim3 blockA(WF_SIZE);
-      const bool layer_has_window = (p->sliding_window > 0) && ((l & 1) == 0);
-      const int att_tokens =
-          layer_has_window ? std::min(max_pos_in_batch + 1, p->sliding_window)
-                           : (max_pos_in_batch + 1);
-      size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
-      attention_batch_kernel<<<gridAttn, blockA, shmem_size>>>(
-          ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
-          ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-          ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-          Hq, Hk, ctx.d_kv_layer_offsets, ctx.d_kv_layer_capacity,
-          layer_has_window ? p->sliding_window : 0, kv_batch_stride,
-          batch_size);
+      const bool layer_has_window = (l & 1) == 0;
+      if (layer_has_window) {
+        PROFILE_GPU_SCOPE("attention_batch_kernel_even", 0);
+        const int att_tokens =
+            std::min(max_pos_in_batch + 1, p->sliding_window);
+        size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
+        attention_batch_kernel_even<<<gridAttn, blockA, shmem_size>>>(
+            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+            ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
+            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+            Hq, Hk, ctx.d_kv_layer_offsets, ctx.d_kv_layer_capacity,
+            p->sliding_window, kv_batch_stride, batch_size);
+      } else {
+        PROFILE_GPU_SCOPE("attention_batch_kernel_odd", 0);
+        const int att_tokens = max_pos_in_batch + 1;
+        size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
+        attention_batch_kernel_odd<<<gridAttn, blockA, shmem_size>>>(
+            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+            ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
+            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
+            Hq, Hk, ctx.d_kv_layer_offsets, ctx.d_kv_layer_capacity,
+            kv_batch_stride, batch_size);
+      }
     }
 
     // Output projection + residual (batched) - separate kernels
