@@ -27,12 +27,13 @@ typedef hip_bfloat16 bf16_t;
 #define MLP_TILE_COLS 32
 #define MLP_THREAD_X 16
 #define MLP_THREAD_Y 4
+#define MATMUL_TILE_ROWS 32
 #define MATMUL_TILE_COLS 32
 #define MATMUL_TILE_K 16
 #define MATMUL_CHUNK_K 4
-// Specialized tiling for logits GEMM (no-bias) where output dimension is huge
-#define MATMUL_GEMM_TILE_COLS 128
-#define MATMUL_GEMM_TILE_ROWS 32
+// Specialized tiling for logits GEMM where output dimension is huge
+#define MATMUL_LOGITS_TILE_COLS 128
+#define MATMUL_LOGITS_TILE_ROWS 32
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
@@ -53,7 +54,6 @@ struct GPUActivationBuffers {
   bf16_t *d_x;
   bf16_t *d_t;
   bf16_t *d_tb;
-  float *d_t_fp32;
   float *d_router_score, *d_topk_v;
   int *d_topk_i;
   float *d_e_agg;
@@ -81,8 +81,8 @@ struct GPUWeightBuffersFP32 {
 };
 
 struct GPUExpertBiasBuffers {
-  float *g_b_mlp1;
-  float *g_b_mlp2;
+  bf16_t *g_b_mlp1;
+  bf16_t *g_b_mlp2;
 };
 
 struct GPUWeightBuffersBF16 {

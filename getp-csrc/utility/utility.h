@@ -6,12 +6,6 @@
 // GPU Memory Debugging
 void debug_print_gpu_memory(const char *tag, int device_id = 0);
 
-// Grid Dimension Utilities (removed - using direct dim3 initialization)
-__device__ __forceinline__ short f32_to_bf16_bits_short(float f);
-__device__ __forceinline__ s16x4 pack4_bf16_from_f32_guard(
-    const float* base_f32, int k_off, int k_rem, bool row_valid);
-__device__ __forceinline__ s16x4 pack4_bf16_from_bf16_guard(
-    const bf16_t* base_bf16, int k_off, int k_rem, bool col_valid);
 __device__ __forceinline__ void bf16pair_to_float2(uint32_t u, float &f0, float &f1);
 __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u);
 __device__ __forceinline__ float warp_reduce_sum(float v);
@@ -31,6 +25,11 @@ __global__ void rmsnorm_batch_kernel(bf16_t *out, const bf16_t *x,
 __global__ void residual_add_batch_kernel(bf16_t *x, const float *residual,
                                           int dim, int batch_size,
                                           const int *pos);
+
+__global__ void residual_add_batch_kernel_bf16(bf16_t *x,
+                                               const bf16_t *residual,
+                                               int dim, int batch_size,
+                                               const int *pos);
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     bf16_t* __restrict__ q_out,
@@ -65,5 +64,32 @@ void copy_fp32_to_bf16_device(const float *src, size_t n, bf16_t *dst,
 size_t matmul_packed_elems(int rows, int cols);
 void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
                               bf16_t *dst);
+
+// Matmul Helper Functions
+__device__ __forceinline__ s16x4 load_bf16x4(const uint16_t* src, int valid_elems);
+
+// Expert Assignment Kernels
+__global__ void count_expert_assignments_kernel(
+    int* __restrict__ counts,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    int batch_size,
+    int experts_per_token,
+    int E);
+
+__global__ void build_expert_assignments_kernel(
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ expert_offsets,
+    int* __restrict__ expert_counters,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
+    int batch_size,
+    int experts_per_token,
+    int E);
+
+// Activation Functions
+__device__ __forceinline__ float clamp_with_limit(float v, float limit);
+__device__ __forceinline__ float swiglu_fused(float gate, float up, float limit);
 
 #endif // GETP_UTILITY_H
