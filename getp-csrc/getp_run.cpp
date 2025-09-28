@@ -901,7 +901,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
   }
 
   for (int l = 0; l < L; ++l) {
-    dim3 gridQKV((QKV_D + TM - 1) / TM, 1, 1);
     // Batched QKV projection (RMSNorm + MatMul + Bias) - separate kernels
     {
       // First apply RMSNorm
@@ -917,9 +916,14 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       // Then apply MatMul + Bias
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma_qkv", 0);
-        dim3 gridQKV_gemm((QKV_D + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
-        dim3 blockQKV(16, 4, 1);
-        matmul_bias_gemm_kernel_bf16_mfma<<<gridQKV_gemm, blockQKV>>>(
+        dim3 gridQKV_gemm(
+            (QKV_D + MatmulQkvConfig::BlockCols - 1) /
+                MatmulQkvConfig::BlockCols,
+            (batch_size + MatmulQkvConfig::BlockRows - 1) /
+                MatmulQkvConfig::BlockRows,
+            1);
+        dim3 blockQKV(WF_SIZE, MatmulQkvConfig::WavesPerBlock, 1);
+        matmul_bias_gemm_kernel_bf16_mfma_qkv<<<gridQKV_gemm, blockQKV>>>(
             ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * ctx.stride_w_qkv_bf16,
@@ -985,9 +989,13 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma_att", 0);
-        dim3 gridO_gemm((H + TM_MM - 1) / TM_MM, (batch_size + TN_MM - 1) / TN_MM, 1);
-        dim3 blockO(16, 4, 1);
-        matmul_bias_gemm_kernel_bf16_mfma<<<gridO_gemm, blockO>>>(
+        dim3 gridO_gemm(
+            (H + MatmulAttConfig::BlockCols - 1) / MatmulAttConfig::BlockCols,
+            (batch_size + MatmulAttConfig::BlockRows - 1) /
+                MatmulAttConfig::BlockRows,
+            1);
+        dim3 blockO(WF_SIZE, MatmulAttConfig::WavesPerBlock, 1);
+        matmul_bias_gemm_kernel_bf16_mfma_att<<<gridO_gemm, blockO>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * ctx.stride_w_o_bf16,
             ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size,
@@ -1176,10 +1184,12 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("matmul_gemm_kernel_bf16_mfma", 0);
       dim3 gridV_gemm(
-          (V + MATMUL_LOGITS_TILE_COLS - 1) / MATMUL_LOGITS_TILE_COLS,
-          (batch_size + MATMUL_LOGITS_TILE_ROWS - 1) / MATMUL_LOGITS_TILE_ROWS,
+          (V + MatmulLogitsConfig::BlockCols - 1) /
+              MatmulLogitsConfig::BlockCols,
+          (batch_size + MatmulLogitsConfig::BlockRows - 1) /
+              MatmulLogitsConfig::BlockRows,
           1);
-      dim3 blockV(16, 4, 1);
+      dim3 blockV(WF_SIZE, MatmulLogitsConfig::WavesPerBlock, 1);
       matmul_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_out_bf16, H, V, batch_size,

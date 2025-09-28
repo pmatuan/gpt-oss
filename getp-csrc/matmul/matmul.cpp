@@ -3,498 +3,226 @@
 #include "matmul.h"
 #include <math.h>
 
-// No-bias variant: x:[B,n], w:[d,n], y:[B,d]
-__global__ __launch_bounds__(64, 2)
-void matmul_gemm_kernel_bf16_mfma(
-    float* __restrict__ y,          // [B x d]
-    const bf16_t* __restrict__ x,   // [B x n] (bf16)
-    const bf16_t* __restrict__ w,   // [d x n] (bf16)
-    int n, int d, int B,
-    const int* __restrict__ pos)    // nullable; pos[b] < 0 -> skip row
-{
-  constexpr int TILE_M = MATMUL_LOGITS_TILE_ROWS; // rows per block (matches packing)
-  constexpr int TILE_N = MATMUL_LOGITS_TILE_COLS; // expanded columns per block
-  constexpr int COL_GROUPS = MATMUL_LOGITS_TILE_COLS / 16;
+namespace {
 
-  const int tx = threadIdx.x; // 0..15
-  const int ty = threadIdx.y; // 0..3
-
-  const int M0 = blockIdx.y * TILE_M;
-  const int N0 = blockIdx.x * TILE_N;
-
-  const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
-  const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
+__device__ __forceinline__ const uint16_t *packed_weight_ptr(
+    const uint16_t *base, int col, int k, int tiles_k) {
+  const int tile_col = col / MATMUL_TILE_COLS;
+  const int row_in_tile = col - tile_col * MATMUL_TILE_COLS;
+  const int tile_k = k / MATMUL_TILE_K;
+  const int k_in_tile = k - tile_k * MATMUL_TILE_K;
+  const int group = k_in_tile / MATMUL_CHUNK_K;
+  const int within = k_in_tile - group * MATMUL_CHUNK_K;
   const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
-  const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-  const size_t group_offset = (size_t)ty * group_stride;
+  const size_t tile_base =
+      ((size_t)tile_col * tiles_k + tile_k) * tile_elems;
+  const size_t group_base =
+      (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
+  return base + tile_base + group_base +
+         (size_t)row_in_tile * MATMUL_CHUNK_K + within;
+}
+
+template <typename T>
+__device__ __forceinline__ void store_output(T *dst, size_t index,
+                                             float value) {
+  if constexpr (std::is_same<T, bf16_t>::value) {
+    dst[index] = bf16_t(value);
+  } else {
+    dst[index] = value;
+  }
+}
+
+template <typename Config, typename OutType, bool WithBias>
+__device__ __forceinline__ void matmul_mfma_kernel_impl(
+    OutType *__restrict__ y, const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w, const float *__restrict__ bias, int n,
+    int d, int B, const int *__restrict__ pos) {
+  const int block_m = blockIdx.y * Config::BlockRows;
+  const int block_n = blockIdx.x * Config::BlockCols;
+  if (block_m >= B || block_n >= d)
+    return;
+
+  if (blockDim.x != WF_SIZE || blockDim.y != Config::WavesPerBlock)
+    return;
 
   const bool has_pos = (pos != nullptr);
+  const int tiles_k_total = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
 
-  const int r0 = M0 + tx;
-  const int r1 = r0 + 16;
-  const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
-  const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
+  const int wave = threadIdx.y;
+  const int lane = threadIdx.x & (WF_SIZE - 1);
+  const int tid_linear = wave * WF_SIZE + lane;
+  const int threads_per_block = blockDim.y * WF_SIZE;
 
-  if (!r0_ok && !r1_ok) {
+  const int wave_m = wave / Config::WavesN;
+  const int wave_n = wave % Config::WavesN;
+  if (wave_m >= Config::WavesM || wave_n >= Config::WavesN)
     return;
-  }
 
-  f32x4 acc_lo[COL_GROUPS];
-  f32x4 acc_hi[COL_GROUPS];
+  const int lane_row = lane & 15;
+  const int lane_col = lane & 15;
+  const int lane_group = lane >> 4;
+  const int k_group = lane_group * MATMUL_CHUNK_K;
+  const int row_lane_offset = lane_group * 4;
+
+  __shared__ __align__(16) s16x4 sh_A[Config::BlockRows * Config::LdsStride];
+  __shared__ __align__(16) s16x4 sh_B[Config::BlockCols * Config::LdsStride];
+
+  f32x4 acc[Config::SubTilesM][Config::SubTilesN];
 #pragma unroll
-  for (int idx = 0; idx < COL_GROUPS; ++idx) {
-    acc_lo[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
-    acc_hi[idx] = f32x4{0.f, 0.f, 0.f, 0.f};
-  }
-
-  const bool full_cols = (N0 + TILE_N) <= d;
-  if (full_cols) {
-    const int base_col = N0 + tx;
-    constexpr int col_stride = 16;
-
-    const uint16_t* x_ptr0 = r0_ok
-                                 ? reinterpret_cast<const uint16_t*>(
-                                       x + (size_t)r0 * n) +
-                                       ty * MATMUL_CHUNK_K
-                                 : nullptr;
-    const uint16_t* x_ptr1 = r1_ok
-                                 ? reinterpret_cast<const uint16_t*>(
-                                       x + (size_t)r1 * n) +
-                                       ty * MATMUL_CHUNK_K
-                                 : nullptr;
-
-    const uint16_t* w_ptr[COL_GROUPS];
+  for (int wm = 0; wm < Config::SubTilesM; ++wm) {
 #pragma unroll
-    for (int idx = 0; idx < COL_GROUPS; ++idx) {
-      const int col = base_col + idx * col_stride;
-      const int tile_col = col >> 5; // MATMUL_TILE_COLS == 32
-      const int row_in_tile = col & (MATMUL_TILE_COLS - 1);
-      const size_t base_offset =
-          ((size_t)tile_col * tiles_k) * tile_elems +
-          (size_t)row_in_tile * MATMUL_CHUNK_K + group_offset;
-      w_ptr[idx] = w_u16 + base_offset;
-    }
-
-    const int full_k_tiles = n / MATMUL_TILE_K;
-    const int tail_k_elems = n - full_k_tiles * MATMUL_TILE_K;
-
-    for (int tile_k = 0; tile_k < full_k_tiles; ++tile_k) {
-      s16x4 Avec_r0 = s16x4{0, 0, 0, 0};
-      s16x4 Avec_r1 = s16x4{0, 0, 0, 0};
-      if (r0_ok) {
-        Avec_r0 = load_bf16x4(x_ptr0, MATMUL_CHUNK_K);
-      }
-      if (r1_ok) {
-        Avec_r1 = load_bf16x4(x_ptr1, MATMUL_CHUNK_K);
-      }
-
-      s16x4 Bvec[COL_GROUPS];
-
-#pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        Bvec[idx] = load_bf16x4(w_ptr[idx], MATMUL_CHUNK_K);
-      }
-
-#pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-            Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
-        acc_hi[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-            Avec_r1, Bvec[idx], acc_hi[idx], 0, 0, 0);
-      }
-
-      if (r0_ok) {
-        x_ptr0 += MATMUL_TILE_K;
-      }
-      if (r1_ok) {
-        x_ptr1 += MATMUL_TILE_K;
-      }
-#pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        w_ptr[idx] += tile_elems;
-      }
-    }
-
-    if (tail_k_elems > 0) {
-      const int k_base = full_k_tiles * MATMUL_TILE_K + ty * MATMUL_CHUNK_K;
-      const int rem = n - k_base;
-      if (rem > 0) {
-        const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-        s16x4 Avec_r0 =
-            (r0_ok && chunk_elems > 0) ? load_bf16x4(x_ptr0, chunk_elems)
-                                       : s16x4{0, 0, 0, 0};
-        s16x4 Avec_r1 =
-            (r1_ok && chunk_elems > 0) ? load_bf16x4(x_ptr1, chunk_elems)
-                                       : s16x4{0, 0, 0, 0};
-
-        s16x4 Bvec[COL_GROUPS];
-
-#pragma unroll
-        for (int idx = 0; idx < COL_GROUPS; ++idx) {
-          Bvec[idx] = load_bf16x4(w_ptr[idx], chunk_elems);
-        }
-
-#pragma unroll
-        for (int idx = 0; idx < COL_GROUPS; ++idx) {
-          acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
-          acc_hi[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              Avec_r1, Bvec[idx], acc_hi[idx], 0, 0, 0);
-        }
-
-        if (r0_ok) {
-          x_ptr0 += MATMUL_TILE_K;
-        }
-        if (r1_ok) {
-          x_ptr1 += MATMUL_TILE_K;
-        }
-#pragma unroll
-        for (int idx = 0; idx < COL_GROUPS; ++idx) {
-          w_ptr[idx] += tile_elems;
-        }
-      }
-    }
-
-    for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
-      const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
-      const int row_hi = row_lo + 16;
-
-      const bool row_lo_ok = (row_lo < B) && (!has_pos || pos[row_lo] >= 0);
-      const bool row_hi_ok = (row_hi < B) && (!has_pos || pos[row_hi] >= 0);
-
-      if (row_lo_ok) {
-        float* y0 = y + (size_t)row_lo * d + base_col;
-#pragma unroll
-        for (int idx = 0; idx < COL_GROUPS; ++idx) {
-          y0[idx * col_stride] = acc_lo[idx][i];
-        }
-      }
-      if (row_hi_ok) {
-        float* y1 = y + (size_t)row_hi * d + base_col;
-#pragma unroll
-        for (int idx = 0; idx < COL_GROUPS; ++idx) {
-          y1[idx * col_stride] = acc_hi[idx][i];
-        }
-      }
-    }
-    return;
-  }
-
-  int cols_partial[COL_GROUPS];
-  bool col_ok[COL_GROUPS];
-  const uint16_t* w_ptr[COL_GROUPS];
-#pragma unroll
-  for (int idx = 0; idx < COL_GROUPS; ++idx) {
-    const int col = N0 + tx + idx * 16;
-    cols_partial[idx] = col;
-    const bool valid = (col < d);
-    col_ok[idx] = valid;
-    if (valid) {
-      const int tile_col = col >> 5;
-      const int row_in_tile = col & (MATMUL_TILE_COLS - 1);
-      const size_t base_offset =
-          ((size_t)tile_col * tiles_k) * tile_elems +
-          (size_t)row_in_tile * MATMUL_CHUNK_K + group_offset;
-      w_ptr[idx] = w_u16 + base_offset;
-    } else {
-      w_ptr[idx] = nullptr;
+    for (int wn = 0; wn < Config::SubTilesN; ++wn) {
+      acc[wm][wn] = f32x4{0.f, 0.f, 0.f, 0.f};
     }
   }
 
-  const uint16_t* x_ptr0 = r0_ok
-                               ? reinterpret_cast<const uint16_t*>(
-                                     x + (size_t)r0 * n) +
-                                     ty * MATMUL_CHUNK_K
-                               : nullptr;
-  const uint16_t* x_ptr1 = r1_ok
-                               ? reinterpret_cast<const uint16_t*>(
-                                     x + (size_t)r1 * n) +
-                                     ty * MATMUL_CHUNK_K
-                               : nullptr;
+  const uint16_t *x_u16 = reinterpret_cast<const uint16_t *>(x);
+  const uint16_t *w_u16 = reinterpret_cast<const uint16_t *>(w);
 
-  const int full_k_tiles = n / MATMUL_TILE_K;
-  const int tail_k_elems = n - full_k_tiles * MATMUL_TILE_K;
-
-  for (int tile_k = 0; tile_k < full_k_tiles; ++tile_k) {
-    s16x4 Avec_r0 = s16x4{0, 0, 0, 0};
-    s16x4 Avec_r1 = s16x4{0, 0, 0, 0};
-    if (r0_ok) {
-      Avec_r0 = load_bf16x4(x_ptr0, MATMUL_CHUNK_K);
-    }
-    if (r1_ok) {
-      Avec_r1 = load_bf16x4(x_ptr1, MATMUL_CHUNK_K);
-    }
-
-    s16x4 Bvec[COL_GROUPS];
-
+  float bias_lane[Config::SubTilesN];
 #pragma unroll
-    for (int idx = 0; idx < COL_GROUPS; ++idx) {
-      Bvec[idx] = col_ok[idx]
-                       ? load_bf16x4(w_ptr[idx], MATMUL_CHUNK_K)
-                       : s16x4{0, 0, 0, 0};
-    }
+  for (int wn = 0; wn < Config::SubTilesN; ++wn)
+    bias_lane[wn] = 0.f;
 
+  if constexpr (WithBias) {
+    if (bias != nullptr) {
 #pragma unroll
-    for (int idx = 0; idx < COL_GROUPS; ++idx) {
-      acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-          Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
-      acc_hi[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-          Avec_r1, Bvec[idx], acc_hi[idx], 0, 0, 0);
-    }
-
-    if (r0_ok) {
-      x_ptr0 += MATMUL_TILE_K;
-    }
-    if (r1_ok) {
-      x_ptr1 += MATMUL_TILE_K;
-    }
-#pragma unroll
-    for (int idx = 0; idx < COL_GROUPS; ++idx) {
-      if (col_ok[idx]) {
-        w_ptr[idx] += tile_elems;
-      }
-    }
-  }
-
-  if (tail_k_elems > 0) {
-    const int k_base = full_k_tiles * MATMUL_TILE_K + ty * MATMUL_CHUNK_K;
-    const int rem = n - k_base;
-    if (rem > 0) {
-      const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-      s16x4 Avec_r0 =
-          (r0_ok && chunk_elems > 0) ? load_bf16x4(x_ptr0, chunk_elems)
-                                     : s16x4{0, 0, 0, 0};
-      s16x4 Avec_r1 =
-          (r1_ok && chunk_elems > 0) ? load_bf16x4(x_ptr1, chunk_elems)
-                                     : s16x4{0, 0, 0, 0};
-
-      s16x4 Bvec[COL_GROUPS];
-
-#pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        Bvec[idx] = (col_ok[idx] && chunk_elems > 0)
-                        ? load_bf16x4(w_ptr[idx], chunk_elems)
-                        : s16x4{0, 0, 0, 0};
-      }
-
-#pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        acc_lo[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-            Avec_r0, Bvec[idx], acc_lo[idx], 0, 0, 0);
-        acc_hi[idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-            Avec_r1, Bvec[idx], acc_hi[idx], 0, 0, 0);
-      }
-
-      if (r0_ok) {
-        x_ptr0 += MATMUL_TILE_K;
-      }
-      if (r1_ok) {
-        x_ptr1 += MATMUL_TILE_K;
-      }
-#pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        if (col_ok[idx]) {
-          w_ptr[idx] += tile_elems;
+      for (int wn = 0; wn < Config::SubTilesN; ++wn) {
+        const int col = block_n + wave_n * Config::WarpTileN + wn * 16 + lane_col;
+        if (col < d) {
+          bias_lane[wn] = bias[col];
         }
       }
     }
   }
 
-  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
-    const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
-    const int row_hi = row_lo + 16;
+  const int total_tiles_k = (n + Config::BlockDepth - 1) / Config::BlockDepth;
+  for (int tile_idx = 0; tile_idx < total_tiles_k; ++tile_idx) {
+    const int k_base = tile_idx * Config::BlockDepth;
 
-    const bool row_lo_ok = (row_lo < B) && (!has_pos || pos[row_lo] >= 0);
-    const bool row_hi_ok = (row_hi < B) && (!has_pos || pos[row_hi] >= 0);
+    const int total_a_quads = Config::BlockRows * Config::KQuads;
+    for (int linear = tid_linear; linear < total_a_quads;
+         linear += threads_per_block) {
+      const int row = linear / Config::KQuads;
+      const int quad = linear - row * Config::KQuads;
+      const int global_row = block_m + row;
+      const int k = k_base + quad * MATMUL_CHUNK_K;
+      const int remaining = n - k;
+      const int valid =
+          remaining >= MATMUL_CHUNK_K
+              ? MATMUL_CHUNK_K
+              : (remaining > 0 ? remaining : 0);
+      const bool row_in_range = (global_row < B);
+      const bool row_active =
+          row_in_range && (!has_pos || pos[global_row] >= 0);
+      s16x4 value = {0, 0, 0, 0};
+      if (row_active && valid > 0) {
+        const uint16_t *src =
+            x_u16 + (size_t)global_row * (size_t)n + (size_t)k;
+        value = load_bf16x4(src, valid);
+      }
+      sh_A[row * Config::LdsStride + quad] = value;
+    }
 
-    if (row_lo_ok) {
-      float* y0 = y + (size_t)row_lo * d;
+    const int total_b_quads = Config::BlockCols * Config::KQuads;
+    for (int linear = tid_linear; linear < total_b_quads;
+         linear += threads_per_block) {
+      const int col = linear / Config::KQuads;
+      const int quad = linear - col * Config::KQuads;
+      const int global_col = block_n + col;
+      const int k = k_base + quad * MATMUL_CHUNK_K;
+      const int remaining = n - k;
+      const int valid =
+          remaining >= MATMUL_CHUNK_K
+              ? MATMUL_CHUNK_K
+              : (remaining > 0 ? remaining : 0);
+      s16x4 value = {0, 0, 0, 0};
+      if (global_col < d && valid > 0) {
+        const uint16_t *src =
+            packed_weight_ptr(w_u16, global_col, k, tiles_k_total);
+        value = load_bf16x4(src, valid);
+      }
+      sh_B[col * Config::LdsStride + quad] = value;
+    }
+
+    __syncthreads();
+
+    const int wave_row_base = wave_m * Config::WarpTileM + lane_row;
+    const int wave_col_base = wave_n * Config::WarpTileN + lane_col;
+
+    for (int kk = 0; kk < Config::BlockDepth; kk += 16) {
+      const int quad_idx = (k_group + kk) >> 2;
 #pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        if (col_ok[idx]) {
-          y0[cols_partial[idx]] = acc_lo[idx][i];
+      for (int wm = 0; wm < Config::SubTilesM; ++wm) {
+        const int a_row = wave_row_base + wm * 16;
+        const s16x4 avec =
+            sh_A[a_row * Config::LdsStride + quad_idx];
+#pragma unroll
+        for (int wn = 0; wn < Config::SubTilesN; ++wn) {
+          const int b_col = wave_col_base + wn * 16;
+          const s16x4 bvec =
+              sh_B[b_col * Config::LdsStride + quad_idx];
+          acc[wm][wn] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+              avec, bvec, acc[wm][wn], 0, 0, 0);
         }
       }
     }
-    if (row_hi_ok) {
-      float* y1 = y + (size_t)row_hi * d;
+
+    __syncthreads();
+  }
+
+  const int lane_bias_col = lane_col;
 #pragma unroll
-      for (int idx = 0; idx < COL_GROUPS; ++idx) {
-        if (col_ok[idx]) {
-          y1[cols_partial[idx]] = acc_hi[idx][i];
-        }
+  for (int wm = 0; wm < Config::SubTilesM; ++wm) {
+    const int row_block =
+        block_m + wave_m * Config::WarpTileM + wm * 16;
+#pragma unroll
+    for (int wn = 0; wn < Config::SubTilesN; ++wn) {
+      const int col = block_n + wave_n * Config::WarpTileN + wn * 16 +
+                      lane_bias_col;
+      if (col >= d)
+        continue;
+      const float bias_val =
+          (WithBias && bias != nullptr) ? bias_lane[wn] : 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = row_block + (i + row_lane_offset);
+        if (row >= B)
+          continue;
+        if (has_pos && pos[row] < 0)
+          continue;
+        const float value = acc[wm][wn][i] + bias_val;
+        store_output(y, (size_t)row * (size_t)d + col, value);
       }
     }
   }
 }
 
-// Bias variant with bf16 output: Y = X @ W^T + B
-__global__ __launch_bounds__(64, 2)
-void matmul_bias_gemm_kernel_bf16_mfma(
-    bf16_t* __restrict__ y, const bf16_t* __restrict__ x,
-    const bf16_t* __restrict__ w, const float* __restrict__ bias, int n,
-    int d, int B, const int* __restrict__ pos) {
-  // One wave64 per block: 16 x-threads, 4 y-threads
-  const int tx = threadIdx.x; // 0..15
-  const int ty = threadIdx.y; // 0..3
+} // namespace
 
-  // 32x32 tile origin on (M=B, N=d)
-  const int M0 = blockIdx.y * MATMUL_TILE_ROWS;
-  const int N0 = blockIdx.x * MATMUL_TILE_COLS;
+// Tuned MFMA kernels specialised per projection
+__global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv(
+    bf16_t *__restrict__ y, const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w, const float *__restrict__ bias, int n, int d,
+    int B, const int *__restrict__ pos) {
+  matmul_mfma_kernel_impl<MatmulQkvConfig, bf16_t, true>(y, x, w, bias, n, d, B,
+                                                         pos);
+}
 
-  // Per-lane columns (two 16-wide halves)
-  const int c0 = N0 + tx;
-  const int c1 = N0 + tx + 16;
+__global__ void matmul_bias_gemm_kernel_bf16_mfma_att(
+    bf16_t *__restrict__ y, const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w, const float *__restrict__ bias, int n, int d,
+    int B, const int *__restrict__ pos) {
+  matmul_mfma_kernel_impl<MatmulAttConfig, bf16_t, true>(y, x, w, bias, n, d, B,
+                                                         pos);
+}
 
-  const uint16_t* __restrict__ w_u16 = reinterpret_cast<const uint16_t*>(w);
-  const int tiles_k = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
-  const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
-  const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-  const size_t group_offset = (size_t)ty * group_stride;
-
-  // Per-lane rows (two 16-high halves)
-  const int r0 = M0 + tx;
-  const int r1 = M0 + tx + 16;
-  const bool has_pos = (pos != nullptr);
-  const bool r0_ok = (r0 < B) && (!has_pos || pos[r0] >= 0);
-  const bool r1_ok = (r1 < B) && (!has_pos || pos[r1] >= 0);
-
-  if (!r0_ok && !r1_ok) {
-    return;
-  }
-
-  const bool full_cols = (N0 + MATMUL_TILE_COLS) <= d;
-  const bool bias_ok = (bias != nullptr);
-  float bias_vals[2] = {0.f, 0.f};
-  if (bias_ok) {
-    if (full_cols) {
-      bias_vals[0] = bias[c0];
-      bias_vals[1] = bias[c1];
-    } else {
-      if (c0 < d) bias_vals[0] = bias[c0];
-      if (c1 < d) bias_vals[1] = bias[c1];
-    }
-  }
-
-  // Accumulators for 4 MFMA fragments (32x32 tile = 2x2 of 16x16)
-  f32x4 acc00 = {0.f,0.f,0.f,0.f};
-  f32x4 acc01 = {0.f,0.f,0.f,0.f};
-  f32x4 acc10 = {0.f,0.f,0.f,0.f};
-  f32x4 acc11 = {0.f,0.f,0.f,0.f};
-
-  // K-loop in steps of 16 (bf16 depth)
-  const uint16_t* x_ptr0 = r0_ok
-                               ? reinterpret_cast<const uint16_t*>(
-                                     x + (size_t)r0 * n) +
-                                     ty * MATMUL_CHUNK_K
-                               : nullptr;
-  const uint16_t* x_ptr1 = r1_ok
-                               ? reinterpret_cast<const uint16_t*>(
-                                     x + (size_t)r1 * n) +
-                                     ty * MATMUL_CHUNK_K
-                               : nullptr;
-
-  const bool full_c0 = full_cols || (c0 < d);
-  const bool full_c1 = full_cols || (c1 < d);
-
-  const uint16_t* w_ptr_c0 = full_c0
-                                 ? (w_u16 + (((size_t)(c0 >> 5) * tiles_k) *
-                                             tile_elems +
-                                             ((size_t)(c0 & (MATMUL_TILE_COLS - 1))) *
-                                                 MATMUL_CHUNK_K +
-                                             group_offset))
-                                 : nullptr;
-  const uint16_t* w_ptr_c1 = full_c1
-                                 ? (w_u16 + (((size_t)(c1 >> 5) * tiles_k) *
-                                             tile_elems +
-                                             ((size_t)(c1 & (MATMUL_TILE_COLS - 1))) *
-                                                 MATMUL_CHUNK_K +
-                                             group_offset))
-                                 : nullptr;
-
-  for (int k0 = 0; k0 < n; k0 += MATMUL_TILE_K) {
-    // Each ty takes a 4-wide slice in this k-tile
-    const int k_base = k0 + ty * MATMUL_CHUNK_K;
-    const int rem = n - k_base;
-    if (rem <= 0) {
-      if (r0_ok) {
-        x_ptr0 += MATMUL_TILE_K;
-      }
-      if (r1_ok) {
-        x_ptr1 += MATMUL_TILE_K;
-      }
-      if (full_c0) {
-        w_ptr_c0 += tile_elems;
-      }
-      if (full_c1) {
-        w_ptr_c1 += tile_elems;
-      }
-      continue;
-    }
-
-    const int chunk_elems = rem >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K : rem;
-    const s16x4 Avec_r0 =
-        (r0_ok && chunk_elems > 0) ? load_bf16x4(x_ptr0, chunk_elems)
-                                   : s16x4{0, 0, 0, 0};
-    const s16x4 Avec_r1 =
-        (r1_ok && chunk_elems > 0) ? load_bf16x4(x_ptr1, chunk_elems)
-                                   : s16x4{0, 0, 0, 0};
-
-    const s16x4 Bvec_c0 =
-        (chunk_elems > 0 && full_c0)
-            ? load_bf16x4(w_ptr_c0, chunk_elems)
-            : s16x4{0, 0, 0, 0};
-    const s16x4 Bvec_c1 =
-        (chunk_elems > 0 && full_c1)
-            ? load_bf16x4(w_ptr_c1, chunk_elems)
-            : s16x4{0, 0, 0, 0};
-
-    // 4 MFMA ops (2x2 fragments)
-    acc00 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c0, acc00, 0,0,0);
-    acc01 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r0, Bvec_c1, acc01, 0,0,0);
-    acc10 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c0, acc10, 0,0,0);
-    acc11 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Avec_r1, Bvec_c1, acc11, 0,0,0);
-
-    if (r0_ok) {
-      x_ptr0 += MATMUL_TILE_K;
-    }
-    if (r1_ok) {
-      x_ptr1 += MATMUL_TILE_K;
-    }
-    if (full_c0) {
-      w_ptr_c0 += tile_elems;
-    }
-    if (full_c1) {
-      w_ptr_c1 += tile_elems;
-    }
-  }
-
-  // Runtime bias: only read when col is valid and bias != nullptr
-  const bool c0_ok = full_c0 && (c0 < d);
-  const bool c1_ok = full_c1 && (c1 < d);
-  const float b0 = (bias_ok && c0_ok) ? bias_vals[0] : 0.f;
-  const float b1 = (bias_ok && c1_ok) ? bias_vals[1] : 0.f;
-
-  // Scatter back (each ty handles 4 row offsets within the 16x16 fragment)
-  for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
-    const int row_lo = M0 + (i + MATMUL_CHUNK_K * ty);
-    const int row_hi = row_lo + 16;
-
-    if (row_lo < B && (!has_pos || pos[row_lo] >= 0)) {
-      bf16_t* y0 = y + (size_t)row_lo * d;
-      if (c0_ok)
-        y0[c0] = bf16_t(acc00[i] + b0);
-      if (c1_ok)
-        y0[c1] = bf16_t(acc01[i] + b1);
-    }
-    if (row_hi < B && (!has_pos || pos[row_hi] >= 0)) {
-      bf16_t* y1 = y + (size_t)row_hi * d;
-      if (c0_ok)
-        y1[c0] = bf16_t(acc10[i] + b0);
-      if (c1_ok)
-        y1[c1] = bf16_t(acc11[i] + b1);
-    }
-  }
+__global__ void matmul_gemm_kernel_bf16_mfma(
+    float *__restrict__ y, const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w, int n, int d, int B,
+    const int *__restrict__ pos) {
+  matmul_mfma_kernel_impl<MatmulLogitsConfig, float, false>(y, x, w, nullptr, n,
+                                                            d, B, pos);
 }
 
 /**
