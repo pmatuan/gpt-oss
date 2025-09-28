@@ -1116,9 +1116,11 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       {
         PROFILE_GPU_SCOPE("mlp1_fused_gemm", 0);
         const int max_tiles =
-            (max_assign_per_expert + MLP_TILE_TOKENS - 1) / MLP_TILE_TOKENS;
-        dim3 block_mlp1(MLP_THREAD_X, MLP_THREAD_Y, 1);
-        dim3 grid_mlp1((2 * IM + MLP_TILE_COLS - 1) / MLP_TILE_COLS,
+            (max_assign_per_expert + MATMUL_MLP1_BLOCK_ROWS - 1) /
+            MATMUL_MLP1_BLOCK_ROWS;
+        dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
+        dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) /
+                           MATMUL_MLP1_BLOCK_COLS,
                        max_tiles, E);
         mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0>>>(
           d_gate_up_topk, ctx.gpu_activations.d_t,
@@ -1131,9 +1133,11 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       {
         PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm", 0);
         const int max_tiles =
-            (max_assign_per_expert + MLP_TILE_TOKENS - 1) / MLP_TILE_TOKENS;
-        dim3 block_mlp2(MLP_THREAD_X, MLP_THREAD_Y, 1);
-        dim3 grid_mlp2((H + MLP_TILE_COLS - 1) / MLP_TILE_COLS,
+            (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
+            MATMUL_MLP2_BLOCK_ROWS;
+        dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
+        dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
+                           MATMUL_MLP2_BLOCK_COLS,
                        max_tiles, E);
         mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0>>>(
           ctx.gpu_activations.d_e_agg, d_gate_up_topk,
