@@ -917,12 +917,10 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma_qkv", 0);
         dim3 gridQKV_gemm(
-            (QKV_D + MatmulQkvConfig::BlockCols - 1) /
-                MatmulQkvConfig::BlockCols,
-            (batch_size + MatmulQkvConfig::BlockRows - 1) /
-                MatmulQkvConfig::BlockRows,
+            (QKV_D + MATMUL_QKV_BLOCK_COLS - 1) / MATMUL_QKV_BLOCK_COLS,
+            (batch_size + MATMUL_QKV_BLOCK_ROWS - 1) / MATMUL_QKV_BLOCK_ROWS,
             1);
-        dim3 blockQKV(WF_SIZE, MatmulQkvConfig::WavesPerBlock, 1);
+        dim3 blockQKV(WF_SIZE, MATMUL_QKV_WAVES_PER_BLOCK, 1);
         matmul_bias_gemm_kernel_bf16_mfma_qkv<<<gridQKV_gemm, blockQKV>>>(
             ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_t,
@@ -990,11 +988,10 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       {
         PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma_att", 0);
         dim3 gridO_gemm(
-            (H + MatmulAttConfig::BlockCols - 1) / MatmulAttConfig::BlockCols,
-            (batch_size + MatmulAttConfig::BlockRows - 1) /
-                MatmulAttConfig::BlockRows,
+            (H + MATMUL_ATT_BLOCK_COLS - 1) / MATMUL_ATT_BLOCK_COLS,
+            (batch_size + MATMUL_ATT_BLOCK_ROWS - 1) / MATMUL_ATT_BLOCK_ROWS,
             1);
-        dim3 blockO(WF_SIZE, MatmulAttConfig::WavesPerBlock, 1);
+        dim3 blockO(WF_SIZE, MATMUL_ATT_WAVES_PER_BLOCK, 1);
         matmul_bias_gemm_kernel_bf16_mfma_att<<<gridO_gemm, blockO>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * ctx.stride_w_o_bf16,
@@ -1184,12 +1181,10 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     {
       PROFILE_GPU_SCOPE("matmul_gemm_kernel_bf16_mfma", 0);
       dim3 gridV_gemm(
-          (V + MatmulLogitsConfig::BlockCols - 1) /
-              MatmulLogitsConfig::BlockCols,
-          (batch_size + MatmulLogitsConfig::BlockRows - 1) /
-              MatmulLogitsConfig::BlockRows,
+          (V + MATMUL_LOGITS_BLOCK_COLS - 1) / MATMUL_LOGITS_BLOCK_COLS,
+          (batch_size + MATMUL_LOGITS_BLOCK_ROWS - 1) / MATMUL_LOGITS_BLOCK_ROWS,
           1);
-      dim3 blockV(WF_SIZE, MatmulLogitsConfig::WavesPerBlock, 1);
+      dim3 blockV(WF_SIZE, MATMUL_LOGITS_WAVES_PER_BLOCK, 1);
       matmul_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_out_bf16, H, V, batch_size,
