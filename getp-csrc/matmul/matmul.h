@@ -3,8 +3,16 @@
 
 #include "../common/defines.h"
 
-// Bias variant with bf16 output: Y = X @ W^T + B
-__global__ void matmul_bias_gemm_kernel_bf16_mfma(
+// Bias variants tuned for QKV and attention output projections
+__global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv(
+    bf16_t* __restrict__ y,         // [B x d]
+    const bf16_t* __restrict__ x,   // [B x n] (bf16)
+    const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
+    const float* __restrict__ bias, // [d] or nullptr
+    int n, int d, int B,
+    const int* __restrict__ pos);
+
+__global__ void matmul_bias_gemm_kernel_bf16_mfma_att(
     bf16_t* __restrict__ y,         // [B x d]
     const bf16_t* __restrict__ x,   // [B x n] (bf16)
     const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
