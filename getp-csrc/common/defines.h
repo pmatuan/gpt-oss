@@ -103,6 +103,11 @@ struct DeviceContext {
   int capacity_B = 1;
   hipStream_t *streams = nullptr;
   int n_streams = 0;
+  // Dedicated streams for MoE routing/p2p
+  hipStream_t compute_stream = nullptr;   // QKV/Attn/Res/FFN-router
+  hipStream_t pack_stream = nullptr;      // route_count + scan + route_pack
+  hipStream_t mlp_stream = nullptr;       // run MLP on owner
+  hipStream_t *comm_streams = nullptr;    // [ndev]
   size_t stride_w_qkv_bf16 = 0;
   size_t stride_w_o_bf16 = 0;
   size_t stride_w_out_bf16 = 0;
@@ -112,6 +117,39 @@ struct DeviceContext {
   std::vector<int> h_kv_layer_capacity;
   uint32_t *d_kv_layer_offsets = nullptr;
   int *d_kv_layer_capacity = nullptr;
+
+  // Routing meta on device (home needs all owners' local-id maps)
+  int *d_e2lid_allowners = nullptr; // [ndev * L * E]
+  int *d_E_local_per_owner_layer = nullptr; // [ndev * L]
+
+  // Home-side ring buffers (per peer)
+  bf16_t **send_x_peer = nullptr;        // [ndev] -> device pointers allocated on HOME
+  int **send_pos_peer = nullptr;         // [ndev] -> [B_local]
+  float **send_topk_v_peer = nullptr;    // [ndev] -> [B_local*K]
+  int **send_assignment_batches_peer = nullptr; // [ndev] -> [total_assign]
+  int **send_assignment_slots_peer = nullptr;   // [ndev] -> [total_assign]
+  int **send_expert_offsets_peer = nullptr;     // [ndev] -> [E_local+1]
+  int **d_owner_B_peer = nullptr;        // [ndev] -> [1]
+  int **d_b2local_peer = nullptr;        // [ndev]
+  int **d_local2b_peer = nullptr;        // [ndev]
+  int **d_expert_counts_peer = nullptr;  // [ndev]
+  int **d_expert_offsets_peer = nullptr; // [ndev]
+  int **d_expert_writes_peer = nullptr;  // [ndev]
+  int **d_pos_peer = nullptr;            // [ndev]
+  float **d_topk_v_peer = nullptr;       // [ndev]
+
+  // Owner-side receive buffers (per home) on this device
+  bf16_t **recv_x_from_home = nullptr;     // [ndev] -> [B_local, H]
+  int **recv_pos_from_home = nullptr;      // [ndev]
+  float **recv_topk_v_from_home = nullptr; // [ndev]
+  int **recv_assignment_batches = nullptr; // [ndev]
+  int **recv_assignment_slots = nullptr;   // [ndev]
+  int **recv_expert_offsets = nullptr;     // [ndev]
+
+  // Owner-side partials per home and home-side recv partials
+  float **partial_owner_per_home = nullptr; // [ndev] -> [B_local,H]
+  float **recv_partial_home = nullptr;      // [ndev] -> [B_local,H] (allocated on home device)
+  float **gate_up_owner_per_home = nullptr; // [ndev] -> [K, B_local, IM]
 };
 
 // Prompt Context Structure

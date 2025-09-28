@@ -633,3 +633,127 @@ __global__ void accumulate_partials_kernel(
     atomicAdd(dest + (size_t)b * (size_t)H + h, val);
   }
 }
+
+// ================= Device-side bucketization & packing (MoE routing) ================
+__global__ void route_count_owner_kernel(
+    int* __restrict__ expert_counts,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ e2lid_owner_l,
+    int B,
+    int K,
+    int E) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B) return;
+  if (pos[b] < 0) return;
+  for (int k = 0; k < K; ++k) {
+    const int e = topk_i[(size_t)b * K + k];
+    if ((unsigned)e >= (unsigned)E) continue;
+    const int lid = e2lid_owner_l[e];
+    if (lid >= 0) atomicAdd(expert_counts + lid, 1);
+  }
+}
+
+__global__ void exclusive_scan_small_kernel(
+    const int* __restrict__ counts,
+    int* __restrict__ offsets,
+    int n) {
+  // Single block scan using shared memory; n is small (<= E_local <= E)
+  extern __shared__ int s[];
+  int tid = threadIdx.x;
+  if (tid < n) s[tid] = counts[tid];
+  if (tid == 0) offsets[0] = 0;
+  __syncthreads();
+  // Inclusive scan on s -> then shift right to exclusive in offsets
+  for (int stride = 1; stride < n; stride <<= 1) {
+    int val = 0;
+    if (tid >= stride && tid < n) val = s[tid - stride];
+    __syncthreads();
+    if (tid < n) s[tid] += val;
+    __syncthreads();
+  }
+  if (tid < n) offsets[tid + 1] = s[tid];
+}
+
+__global__ void route_pack_owner_kernel(
+    int* __restrict__ b2local,
+    int* __restrict__ local2b,
+    int* __restrict__ owner_B,
+    const int* __restrict__ expert_offsets,
+    int* __restrict__ expert_writes,
+    int* __restrict__ assignment_batches,
+    int* __restrict__ assignment_slots,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ e2lid_owner_l,
+    int B,
+    int K,
+    int E) {
+  // One thread per token-row; uses atomics for local batch map and per-expert writes.
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B) return;
+  if (pos[b] < 0) return;
+
+  // Get or assign local batch id
+  int lb = atomicCAS(&b2local[b], -1, -2); // try reserve
+  if (lb == -1) {
+    // We are the first to claim; assign new local id
+    int new_id = atomicAdd(owner_B, 1);
+    local2b[new_id] = b;
+    __threadfence();
+    b2local[b] = new_id;
+    lb = new_id;
+  } else {
+    // If someone else already processing, spin-wait until resolved if needed
+    if (lb == -2) {
+      // wait until set to real id
+      int v;
+      do { v = b2local[b]; } while (v == -2);
+      lb = v;
+    }
+  }
+
+  // Write assignments
+  for (int k = 0; k < K; ++k) {
+    const int e = topk_i[(size_t)b * K + k];
+    if ((unsigned)e >= (unsigned)E) continue;
+    const int lid = e2lid_owner_l[e];
+    if (lid < 0) continue;
+    const int off = atomicAdd(expert_writes + lid, 1);
+    const int idx = expert_offsets[lid] + off;
+    assignment_batches[idx] = lb;
+    assignment_slots[idx] = k;
+  }
+}
+
+__global__ void pack_rows_owner_kernel(
+    bf16_t* __restrict__ dst,
+    const bf16_t* __restrict__ src,
+    const int* __restrict__ b2local,
+    int B,
+    int H) {
+  const int b = blockIdx.y;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B || i >= H) return;
+  const int lb = b2local[b];
+  if (lb < 0) return;
+  dst[(size_t)lb * H + i] = src[(size_t)b * H + i];
+}
+
+__global__ void pack_meta_owner_kernel(
+    int* __restrict__ pos_owner,
+    float* __restrict__ topk_v_owner,
+    const int* __restrict__ b2local,
+    const int* __restrict__ pos,
+    const float* __restrict__ topk_v,
+    int B,
+    int K) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B) return;
+  const int lb = b2local[b];
+  if (lb < 0) return;
+  pos_owner[lb] = pos[b];
+  for (int k = 0; k < K; ++k) {
+    topk_v_owner[(size_t)lb * K + k] = topk_v[(size_t)b * K + k];
+  }
+}
