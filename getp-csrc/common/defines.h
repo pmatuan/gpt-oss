@@ -51,6 +51,20 @@ typedef hip_bfloat16 bf16_t;
 #define MATMUL_LOGITS_WARP_TILE_N 32
 #define MATMUL_LOGITS_WAVES_PER_BLOCK 16
 
+#define MATMUL_MLP1_BLOCK_ROWS 256
+#define MATMUL_MLP1_BLOCK_COLS 256
+#define MATMUL_MLP1_BLOCK_DEPTH 32
+#define MATMUL_MLP1_WARP_TILE_M 128
+#define MATMUL_MLP1_WARP_TILE_N 32
+#define MATMUL_MLP1_WAVES_PER_BLOCK 16
+
+#define MATMUL_MLP2_BLOCK_ROWS 128
+#define MATMUL_MLP2_BLOCK_COLS 128
+#define MATMUL_MLP2_BLOCK_DEPTH 32
+#define MATMUL_MLP2_WARP_TILE_M 32
+#define MATMUL_MLP2_WARP_TILE_N 32
+#define MATMUL_MLP2_WAVES_PER_BLOCK 16
+
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
 
