@@ -117,6 +117,25 @@ struct GPUActivationBuffers {
   float *d_inv_rms;
 };
 
+struct DeviceExpertWorkspace {
+  int *d_expert_counts = nullptr;
+  int *d_expert_offsets = nullptr;
+  uint16_t *d_assignment_batches = nullptr;
+  uint8_t *d_assignment_slots = nullptr;
+  size_t assignment_capacity = 0;
+  size_t expert_capacity = 0;
+};
+
+struct HostPinnedBatchBuffers {
+  int *tokens = nullptr;
+  int *pos = nullptr;
+  int *next_tokens = nullptr;
+  int *expert_counts = nullptr;
+  int *expert_offsets = nullptr;
+  size_t batch_capacity = 0;
+  size_t expert_capacity = 0;
+};
+
 struct GPUWeightBuffersFP32 {
   float *d_rms_attn_w, *d_rms_ffn_w;
   float *d_b_qkv, *d_b_o, *d_attn_sinks;
@@ -155,6 +174,8 @@ struct DeviceContext {
   std::vector<int> h_kv_layer_capacity;
   uint32_t *d_kv_layer_offsets = nullptr;
   int *d_kv_layer_capacity = nullptr;
+  DeviceExpertWorkspace expert_workspace;
+  HostPinnedBatchBuffers host_pinned_batch;
 };
 
 // Prompt Context Structure

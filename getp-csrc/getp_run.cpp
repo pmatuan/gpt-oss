@@ -270,8 +270,10 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
 
   // Pre-allocate workspace for maximum expected batch size
-  size_t max_assignments = (size_t)B * model_config->experts_per_token;
-  size_t required_gate_bytes = max_assignments * (size_t)IM * sizeof(bf16_t);
+  const size_t max_assignment_pairs =
+      (size_t)B * (size_t)model_config->experts_per_token;
+  size_t required_gate_bytes =
+      max_assignment_pairs * (size_t)IM * sizeof(bf16_t);
   if (required_gate_bytes > 0) {
     HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up_workspace, required_gate_bytes));
     ctx.gpu_activations.gate_up_workspace_bytes = required_gate_bytes;
@@ -302,6 +304,44 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens, (size_t)B * sizeof(int)));
+
+  // Allocate pinned host buffers reused across batch iterations
+  HostPinnedBatchBuffers &host_ws = ctx.host_pinned_batch;
+  host_ws.batch_capacity = B;
+  host_ws.expert_capacity = E;
+  if (B > 0) {
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&host_ws.tokens),
+                            (size_t)B * sizeof(int)));
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&host_ws.pos),
+                            (size_t)B * sizeof(int)));
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&host_ws.next_tokens),
+                            (size_t)B * sizeof(int)));
+  }
+  if (E > 0) {
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&host_ws.expert_counts),
+                            (size_t)E * sizeof(int)));
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&host_ws.expert_offsets),
+                            (size_t)(E + 1) * sizeof(int)));
+  }
+
+  // Persistent device workspace for expert routing
+  DeviceExpertWorkspace &expert_ws = ctx.expert_workspace;
+  expert_ws.expert_capacity = E;
+  expert_ws.assignment_capacity = max_assignment_pairs;
+  if (E > 0) {
+    HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&expert_ws.d_expert_counts),
+                        (size_t)E * sizeof(int)));
+    HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&expert_ws.d_expert_offsets),
+                        (size_t)(E + 1) * sizeof(int)));
+  }
+  if (max_assignment_pairs > 0) {
+    HIP_CHECK(
+        hipMalloc(reinterpret_cast<void **>(&expert_ws.d_assignment_batches),
+                  max_assignment_pairs * sizeof(uint16_t)));
+    HIP_CHECK(
+        hipMalloc(reinterpret_cast<void **>(&expert_ws.d_assignment_slots),
+                  max_assignment_pairs * sizeof(uint8_t)));
+  }
 
   // Initialize streams for batch processing
   ctx.streams = (hipStream_t *)malloc(sizeof(hipStream_t) * B);
@@ -520,6 +560,28 @@ static void cleanup_device_context(DeviceContext &ctx) {
   if (ctx.gpu_activations.d_pos)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
 
+  if (ctx.expert_workspace.d_assignment_slots)
+    HIP_CHECK(hipFree(ctx.expert_workspace.d_assignment_slots));
+  if (ctx.expert_workspace.d_assignment_batches)
+    HIP_CHECK(hipFree(ctx.expert_workspace.d_assignment_batches));
+  if (ctx.expert_workspace.d_expert_offsets)
+    HIP_CHECK(hipFree(ctx.expert_workspace.d_expert_offsets));
+  if (ctx.expert_workspace.d_expert_counts)
+    HIP_CHECK(hipFree(ctx.expert_workspace.d_expert_counts));
+  ctx.expert_workspace = DeviceExpertWorkspace{};
+
+  if (ctx.host_pinned_batch.tokens)
+    HIP_CHECK(hipHostFree(ctx.host_pinned_batch.tokens));
+  if (ctx.host_pinned_batch.pos)
+    HIP_CHECK(hipHostFree(ctx.host_pinned_batch.pos));
+  if (ctx.host_pinned_batch.next_tokens)
+    HIP_CHECK(hipHostFree(ctx.host_pinned_batch.next_tokens));
+  if (ctx.host_pinned_batch.expert_counts)
+    HIP_CHECK(hipHostFree(ctx.host_pinned_batch.expert_counts));
+  if (ctx.host_pinned_batch.expert_offsets)
+    HIP_CHECK(hipHostFree(ctx.host_pinned_batch.expert_offsets));
+  ctx.host_pinned_batch = HostPinnedBatchBuffers{};
+
   if (ctx.streams) {
     for (int i = 0; i < ctx.n_streams; ++i)
       HIP_CHECK(hipStreamDestroy(ctx.streams[i]));
@@ -656,13 +718,38 @@ static int *gpu_forward_device_batch(Transformer *transformer,
   const int V = p->vocab_size;
   const int QKV_D = D * (Hq + 2 * Hk);
 
+  HostPinnedBatchBuffers &host_ws = ctx.host_pinned_batch;
+  DeviceExpertWorkspace &expert_ws = ctx.expert_workspace;
+  if (batch_size > static_cast<int>(host_ws.batch_capacity)) {
+    fprintf(stderr,
+            "Batch size %d exceeds pinned host capacity %zu on device %d\n",
+            batch_size, host_ws.batch_capacity, device_id);
+    exit(EXIT_FAILURE);
+  }
+  if (E > static_cast<int>(host_ws.expert_capacity) ||
+      E > static_cast<int>(expert_ws.expert_capacity)) {
+    fprintf(stderr,
+            "Expert count %d exceeds pre-allocated capacity on device %d\n",
+            E, device_id);
+    exit(EXIT_FAILURE);
+  }
+  const size_t required_assignments =
+      (size_t)batch_size * (size_t)p->experts_per_token;
+  if (required_assignments > expert_ws.assignment_capacity) {
+    fprintf(stderr,
+            "Assignment capacity %zu insufficient for %zu pairs on device %d\n",
+            expert_ws.assignment_capacity, required_assignments, device_id);
+    exit(EXIT_FAILURE);
+  }
+
   const uint32_t kv_batch_stride = ctx.gpu_activations.kv_batch_stride;
 
   // Copy host tokens/positions into device buffers
-  HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_tokens, tokens,
-                      (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_pos, pos,
-                      (size_t)batch_size * sizeof(int), hipMemcpyHostToDevice));
+  const size_t token_bytes = (size_t)batch_size * sizeof(int);
+  HIP_CHECK(hipMemcpyAsync(ctx.gpu_activations.d_tokens, tokens, token_bytes,
+                           hipMemcpyHostToDevice, 0));
+  HIP_CHECK(hipMemcpyAsync(ctx.gpu_activations.d_pos, pos, token_bytes,
+                           hipMemcpyHostToDevice, 0));
 
   dim3 block(BLOCK_SIZE, 1, 1);
   dim3 gridH_thread((H + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
@@ -837,28 +924,35 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     bf16_t *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
     HIP_CHECK(hipMemsetAsync(d_gate_up_topk, 0, gate_up_topk_bytes, 0));
 
-    int total_pairs = batch_size * p->experts_per_token;
-    int *d_expert_counts = nullptr;
-    int *d_expert_offsets = nullptr;
-    uint16_t *d_assignment_batches = nullptr;
-    uint8_t *d_assignment_slots = nullptr;
-    std::vector<int> h_counts(E, 0);
-    std::vector<int> h_offsets(E + 1, 0);
+    const int total_pairs = batch_size * p->experts_per_token;
     int max_assign_per_expert = 0;
     int total_assignments = 0;
     dim3 gridCount((total_pairs + 255) / 256, 1, 1);
 
-    if (total_pairs > 0) {
+    int *d_expert_counts = expert_ws.d_expert_counts;
+    int *d_expert_offsets = expert_ws.d_expert_offsets;
+    uint16_t *d_assignment_batches = expert_ws.d_assignment_batches;
+    uint8_t *d_assignment_slots = expert_ws.d_assignment_slots;
+    int *h_counts = host_ws.expert_counts;
+    int *h_offsets = host_ws.expert_offsets;
+
+    if (E > 0) {
+      std::fill_n(h_counts, E, 0);
+      std::fill_n(h_offsets, E + 1, 0);
+    }
+
+    if (total_pairs > 0 && E > 0) {
       {
         PROFILE_GPU_SCOPE("expert_counting", 0);
-        HIP_CHECK(hipMalloc(&d_expert_counts, E * sizeof(int)));
-        HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, E * sizeof(int)));
+        HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int), 0));
 
         count_expert_assignments_kernel<<<gridCount, 256, 0>>>(
             d_expert_counts, ctx.gpu_activations.d_topk_i,
             ctx.gpu_activations.d_pos, batch_size, p->experts_per_token, E);
-        HIP_CHECK(hipMemcpy(h_counts.data(), d_expert_counts, E * sizeof(int),
-                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpyAsync(h_counts, d_expert_counts,
+                                 (size_t)E * sizeof(int), hipMemcpyDeviceToHost,
+                                 0));
+        HIP_CHECK(hipStreamSynchronize(0));
 
         for (int e = 0; e < E; ++e) {
           h_offsets[e + 1] = h_offsets[e] + h_counts[e];
@@ -871,15 +965,12 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       if (total_assignments > 0) {
         {
           PROFILE_GPU_SCOPE("expert_assignment_building", 0);
-          HIP_CHECK(hipMalloc(&d_expert_offsets, (E + 1) * sizeof(int)));
-          HIP_CHECK(hipMemcpy(d_expert_offsets, h_offsets.data(),
-                              (E + 1) * sizeof(int), hipMemcpyHostToDevice));
+          HIP_CHECK(hipMemcpyAsync(d_expert_offsets, h_offsets,
+                                   (size_t)(E + 1) * sizeof(int),
+                                   hipMemcpyHostToDevice, 0));
 
-          HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, E * sizeof(int)));
-          HIP_CHECK(hipMalloc(&d_assignment_batches,
-                              total_assignments * sizeof(uint16_t)));
-          HIP_CHECK(
-              hipMalloc(&d_assignment_slots, total_assignments * sizeof(uint8_t)));
+          HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int),
+                                   0));
 
           build_expert_assignments_kernel<<<gridCount, 256, 0>>>(
               ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos,
@@ -923,17 +1014,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           d_assignment_slots, d_expert_offsets, ctx.gpu_activations.d_topk_v, l,
           E, IM, H, batch_size, ctx.gpu_activations.d_pos);
       }
-    }
-
-    {
-      if (d_assignment_slots)
-        HIP_CHECK(hipFree(d_assignment_slots));
-      if (d_assignment_batches)
-        HIP_CHECK(hipFree(d_assignment_batches));
-      if (d_expert_offsets)
-        HIP_CHECK(hipFree(d_expert_offsets));
-      if (d_expert_counts)
-        HIP_CHECK(hipFree(d_expert_counts));
     }
 
     // Keep workspace allocated in DeviceContext for reuse
@@ -988,6 +1068,7 @@ static long long run_requests_on_device(Transformer *transformer,
                                         Tokenizer *tokenizer, PromptCtx *ctxs,
                                         int num_ctxs, int device_id) {
   HIP_CHECK(hipSetDevice(device_id));
+  DeviceContext &device_ctx = g_devices[device_id];
 
   long long total_tokens = 0;
 
@@ -997,15 +1078,26 @@ static long long run_requests_on_device(Transformer *transformer,
     const int B = std::min(MAX_BATCH_SIZE, num_ctxs - batch_start);
     PromptCtx *batch_ctxs = ctxs + batch_start;
 
-    // Allocate batch helpers on host
-    std::vector<int> h_tokens(B, 0);
-    std::vector<int> h_pos(B, 0);
+    HostPinnedBatchBuffers &host_ws = device_ctx.host_pinned_batch;
+    if (B > static_cast<int>(host_ws.batch_capacity)) {
+      fprintf(stderr,
+              "Batch size %d exceeds pinned host capacity %zu on device %d\n",
+              B, host_ws.batch_capacity, device_id);
+      exit(EXIT_FAILURE);
+    }
+    int *h_tokens = host_ws.tokens;
+    int *h_pos = host_ws.pos;
+    int *h_next_tokens = host_ws.next_tokens;
     std::vector<char> h_active(B, 1);
 
-    std::transform(batch_ctxs, batch_ctxs + B, h_tokens.begin(),
-                   [](const PromptCtx &ctx) { return ctx.token; });
+    for (int i = 0; i < B; ++i) {
+      const PromptCtx &ctx = batch_ctxs[i];
+      h_tokens[i] = ctx.token;
+      h_pos[i] = ctx.pos;
+      h_next_tokens[i] = -1;
+    }
 
-    int max_seq_hint = 0;
+    [[maybe_unused]] int max_seq_hint = 0;
     const int seq_cap = transformer->config.seq_len;
     for (int i = 0; i < B; ++i) {
       const PromptCtx &ctx = batch_ctxs[i];
@@ -1016,8 +1108,6 @@ static long long run_requests_on_device(Transformer *transformer,
       if (limit > max_seq_hint)
         max_seq_hint = limit;
     }
-
-    std::vector<int> h_next_tokens(B, -1);
 
     int num_finished = 0;
     while (num_finished < B) {
@@ -1034,10 +1124,11 @@ static long long run_requests_on_device(Transformer *transformer,
       }
 
       int *d_next =
-          gpu_forward_device_batch(transformer, h_tokens.data(), h_pos.data(),
-                                   B, device_id, max_pos_in_batch);
-      HIP_CHECK(hipMemcpy(h_next_tokens.data(), d_next, (size_t)B * sizeof(int),
-                          hipMemcpyDeviceToHost));
+          gpu_forward_device_batch(transformer, h_tokens, h_pos, B, device_id,
+                                   max_pos_in_batch);
+      HIP_CHECK(hipMemcpyAsync(h_next_tokens, d_next, (size_t)B * sizeof(int),
+                               hipMemcpyDeviceToHost, 0));
+      HIP_CHECK(hipStreamSynchronize(0));
 
       // For each active context, advance one step
       for (int i = 0; i < B; ++i) {
