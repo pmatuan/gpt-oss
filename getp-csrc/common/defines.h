@@ -58,12 +58,12 @@ typedef hip_bfloat16 bf16_t;
 #define MATMUL_MLP1_WARP_TILE_N 32
 #define MATMUL_MLP1_WAVES_PER_BLOCK 16
 
-#define MATMUL_MLP1_BLOCK_ROWS_120B 64
+#define MATMUL_MLP1_BLOCK_ROWS_120B 128
 #define MATMUL_MLP1_BLOCK_COLS_120B 128
 #define MATMUL_MLP1_BLOCK_DEPTH_120B 32
 #define MATMUL_MLP1_WARP_TILE_M_120B 32
 #define MATMUL_MLP1_WARP_TILE_N_120B 32
-#define MATMUL_MLP1_WAVES_PER_BLOCK_120B 8
+#define MATMUL_MLP1_WAVES_PER_BLOCK_120B 16
 
 #define MATMUL_MLP2_BLOCK_ROWS 128
 #define MATMUL_MLP2_BLOCK_COLS 128
@@ -72,12 +72,12 @@ typedef hip_bfloat16 bf16_t;
 #define MATMUL_MLP2_WARP_TILE_N 32
 #define MATMUL_MLP2_WAVES_PER_BLOCK 16
 
-#define MATMUL_MLP2_BLOCK_ROWS_120B 64
+#define MATMUL_MLP2_BLOCK_ROWS_120B 128
 #define MATMUL_MLP2_BLOCK_COLS_120B 128
 #define MATMUL_MLP2_BLOCK_DEPTH_120B 32
 #define MATMUL_MLP2_WARP_TILE_M_120B 32
 #define MATMUL_MLP2_WARP_TILE_N_120B 32
-#define MATMUL_MLP2_WAVES_PER_BLOCK_120B 8
+#define MATMUL_MLP2_WAVES_PER_BLOCK_120B 16
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
@@ -115,6 +115,25 @@ struct GPUActivationBuffers {
   int *d_tokens;
   int *d_pos;
   float *d_inv_rms;
+};
+
+struct DeviceExpertWorkspace {
+  int *d_expert_counts = nullptr;
+  int *d_expert_offsets = nullptr;
+  uint16_t *d_assignment_batches = nullptr;
+  uint8_t *d_assignment_slots = nullptr;
+  size_t assignment_capacity = 0;
+  size_t expert_capacity = 0;
+};
+
+struct HostPinnedBatchBuffers {
+  int *tokens = nullptr;
+  int *pos = nullptr;
+  int *next_tokens = nullptr;
+  int *expert_counts = nullptr;
+  int *expert_offsets = nullptr;
+  size_t batch_capacity = 0;
+  size_t expert_capacity = 0;
 };
 
 struct GPUWeightBuffersFP32 {
@@ -155,6 +174,8 @@ struct DeviceContext {
   std::vector<int> h_kv_layer_capacity;
   uint32_t *d_kv_layer_offsets = nullptr;
   int *d_kv_layer_capacity = nullptr;
+  DeviceExpertWorkspace expert_workspace;
+  HostPinnedBatchBuffers host_pinned_batch;
 };
 
 // Prompt Context Structure
