@@ -453,8 +453,11 @@ void matmul_bias_gemm_kernel_float(
 
 // ================= MLP1 (Gate & Up) : batched per expert =================
 
-__global__ __launch_bounds__(WF_SIZE * MATMUL_MLP1_WAVES_PER_BLOCK, 1)
-void mlp1_fused_gemm_kernel(
+template <
+  int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
+  int WARP_TILE_M, int WARP_TILE_N, int WAVES_PER_BLOCK
+>
+__device__ __forceinline__ void mlp1_fused_gemm_kernel_body(
     bf16_t *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
     const bf16_t *__restrict__ b_mlp1_all,
@@ -462,41 +465,29 @@ void mlp1_fused_gemm_kernel(
     const uint8_t *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size, const int *__restrict__ pos) {
-  constexpr int BLOCK_ROWS = MATMUL_MLP1_BLOCK_ROWS;
-  constexpr int BLOCK_COLS = MATMUL_MLP1_BLOCK_COLS;
-  constexpr int BLOCK_DEPTH = MATMUL_MLP1_BLOCK_DEPTH;
-  constexpr int WARP_TILE_M = MATMUL_MLP1_WARP_TILE_M;
-  constexpr int WARP_TILE_N = MATMUL_MLP1_WARP_TILE_N;
-  constexpr int SUB_TILES_M = WARP_TILE_M / 16;
-  constexpr int SUB_TILES_N = WARP_TILE_N / 16;
-  constexpr int WAVES_M = BLOCK_ROWS / WARP_TILE_M;
-  constexpr int WAVES_N = BLOCK_COLS / WARP_TILE_N;
-  constexpr int WAVES_PER_BLOCK = MATMUL_MLP1_WAVES_PER_BLOCK;
-  constexpr int K_QUADS = BLOCK_DEPTH / MATMUL_CHUNK_K;
-  constexpr int LDS_STRIDE = K_QUADS + 3;
 
-  static_assert(WAVES_M * WAVES_N == WAVES_PER_BLOCK,
-                "Invalid MLP1 wave configuration");
+  constexpr int SUB_TILES_M   = WARP_TILE_M / 16;
+  constexpr int SUB_TILES_N   = WARP_TILE_N / 16;
+  constexpr int WAVES_M       = BLOCK_ROWS / WARP_TILE_M;
+  constexpr int WAVES_N       = BLOCK_COLS / WARP_TILE_N;
+  constexpr int K_QUADS       = BLOCK_DEPTH / MATMUL_CHUNK_K;
+  constexpr int LDS_STRIDE    = K_QUADS + 3;
 
   const int expert_id = blockIdx.z;
   const int start = expert_offsets[expert_id];
   const int end = expert_offsets[expert_id + 1];
   const int count = end - start;
-  if (count <= 0)
-    return;
+  if (count <= 0) return;
 
   const int block_m = blockIdx.y * BLOCK_ROWS;
-  if (block_m >= count)
-    return;
+  if (block_m >= count) return;
   const int tile_rows = min(BLOCK_ROWS, count - block_m);
 
   const int total_cols = 2 * IM;
   const int block_n = blockIdx.x * BLOCK_COLS;
-  if (block_n >= total_cols)
-    return;
+  if (block_n >= total_cols) return;
 
-  if (blockDim.x != WF_SIZE || blockDim.y != WAVES_PER_BLOCK)
-    return;
+  if (blockDim.x != WF_SIZE || blockDim.y != WAVES_PER_BLOCK) return;
 
   const int lane = threadIdx.x & (WF_SIZE - 1);
   const int wave = threadIdx.y;
@@ -505,14 +496,13 @@ void mlp1_fused_gemm_kernel(
 
   const int wave_m = wave / WAVES_N;
   const int wave_n = wave - wave_m * WAVES_N;
-  if (wave_m >= WAVES_M || wave_n >= WAVES_N)
-    return;
+  if (wave_m >= WAVES_M || wave_n >= WAVES_N) return;
 
-  const int lane_mod16 = lane & 15;
-  const int lane_row = lane_mod16;
-  const int lane_col = lane_mod16;
-  const int lane_group = lane >> 4;
-  const int k_group = lane_group * MATMUL_CHUNK_K;
+  const int lane_mod16      = lane & 15;
+  const int lane_row        = lane_mod16;
+  const int lane_col        = lane_mod16;
+  const int lane_group      = lane >> 4;
+  const int k_group         = lane_group * MATMUL_CHUNK_K;
   const int row_lane_offset = lane_group * 4;
 
   __shared__ int sh_batch[BLOCK_ROWS];
@@ -521,8 +511,7 @@ void mlp1_fused_gemm_kernel(
   __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
   __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
 
-  const uint16_t *__restrict__ x_u16 =
-      reinterpret_cast<const uint16_t *>(x);
+  const uint16_t *__restrict__ x_u16 = reinterpret_cast<const uint16_t *>(x);
 
   for (int idx = tid_linear; idx < BLOCK_ROWS; idx += threads_per_block) {
     int batch = -1;
@@ -534,8 +523,7 @@ void mlp1_fused_gemm_kernel(
       slot = static_cast<int>(assignment_slots[assignment_idx]);
       if (batch >= 0 && slot >= 0) {
         const bool pos_ok = (!pos) || (pos[batch] >= 0);
-        if (pos_ok)
-          valid = 1;
+        if (pos_ok) valid = 1;
       }
     }
     sh_batch[idx] = batch;
@@ -558,8 +546,7 @@ void mlp1_fused_gemm_kernel(
 
   f32x4 acc[SUB_TILES_M * SUB_TILES_N];
 #pragma unroll
-  for (int i = 0; i < SUB_TILES_M * SUB_TILES_N; ++i)
-    acc[i] = f32x4{0.f, 0.f, 0.f, 0.f};
+  for (int i = 0; i < SUB_TILES_M * SUB_TILES_N; ++i) acc[i] = f32x4{0.f,0.f,0.f,0.f};
 
   float bias_lane[SUB_TILES_N];
 #pragma unroll
@@ -574,16 +561,14 @@ void mlp1_fused_gemm_kernel(
     const int k_base = tile_idx * BLOCK_DEPTH;
 
     const int total_a_quads = BLOCK_ROWS * K_QUADS;
-    for (int linear = tid_linear; linear < total_a_quads;
-         linear += threads_per_block) {
-      const int row = linear / K_QUADS;
+    for (int linear = tid_linear; linear < total_a_quads; linear += threads_per_block) {
+      const int row  = linear / K_QUADS;
       const int quad = linear - row * K_QUADS;
-      const int k = k_base + quad * MATMUL_CHUNK_K;
+      const int k    = k_base + quad * MATMUL_CHUNK_K;
       const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K
-                             ? MATMUL_CHUNK_K
-                             : (remaining > 0 ? remaining : 0);
-      s16x4 val = {0, 0, 0, 0};
+      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
+                                                    : (remaining > 0 ? remaining : 0);
+      s16x4 val = {0,0,0,0};
       if (row < tile_rows && sh_valid[row] && valid > 0) {
         const int batch = sh_batch[row];
         const size_t offset = (size_t)batch * (size_t)n + (size_t)k;
@@ -593,32 +578,26 @@ void mlp1_fused_gemm_kernel(
     }
 
     const int total_b_quads = BLOCK_COLS * K_QUADS;
-    for (int linear = tid_linear; linear < total_b_quads;
-         linear += threads_per_block) {
-      const int col = linear / K_QUADS;
+    for (int linear = tid_linear; linear < total_b_quads; linear += threads_per_block) {
+      const int col  = linear / K_QUADS;
       const int quad = linear - col * K_QUADS;
       const int global_col = block_n + col;
-      const int k = k_base + quad * MATMUL_CHUNK_K;
+      const int k    = k_base + quad * MATMUL_CHUNK_K;
       const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K
-                             ? MATMUL_CHUNK_K
-                             : (remaining > 0 ? remaining : 0);
-      s16x4 val = {0, 0, 0, 0};
+      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
+                                                    : (remaining > 0 ? remaining : 0);
+      s16x4 val = {0,0,0,0};
       if (global_col < total_cols && valid > 0) {
-        const int tile_col = global_col / MATMUL_TILE_COLS;
-        const int row_in_tile = global_col - tile_col * MATMUL_TILE_COLS;
-        const int tile_k = k / MATMUL_TILE_K;
-        const int k_in_tile = k - tile_k * MATMUL_TILE_K;
-        const int group = k_in_tile / MATMUL_CHUNK_K;
-        const int within = k_in_tile - group * MATMUL_CHUNK_K;
-        const size_t tile_elems =
-            (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
-        const size_t tile_base =
-            ((size_t)tile_col * tiles_k_total + tile_k) * tile_elems;
-        const size_t group_base =
-            (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-        const uint16_t *src =
-            w_u16 + tile_base + group_base +
+        const int tile_col   = global_col / MATMUL_TILE_COLS;
+        const int row_in_tile= global_col - tile_col * MATMUL_TILE_COLS;
+        const int tile_k     = k / MATMUL_TILE_K;
+        const int k_in_tile  = k - tile_k * MATMUL_TILE_K;
+        const int group      = k_in_tile / MATMUL_CHUNK_K;
+        const int within     = k_in_tile - group * MATMUL_CHUNK_K;
+        const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
+        const size_t tile_base  = ((size_t)tile_col * tiles_k_total + tile_k) * tile_elems;
+        const size_t group_base = (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
+        const uint16_t *src = w_u16 + tile_base + group_base +
             (size_t)row_in_tile * MATMUL_CHUNK_K + within;
         val = load_bf16x4(src, valid);
       }
@@ -642,7 +621,7 @@ void mlp1_fused_gemm_kernel(
           const int acc_idx = wm * SUB_TILES_N + wn;
           const s16x4 bvec = sh_B[b_col * LDS_STRIDE + quad_idx];
           acc[acc_idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[acc_idx], 0, 0, 0);
+              avec, bvec, acc[acc_idx], 0,0,0);
         }
       }
     }
@@ -671,42 +650,58 @@ void mlp1_fused_gemm_kernel(
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int row = row_base + i;
-        if (row >= tile_rows)
-          continue;
-        if (!sh_valid[row])
-          continue;
+        if (row >= tile_rows) continue;
+        if (!sh_valid[row]) continue;
 
         float value = vec[i] + bias_val;
         int col_ok = (col_valid && im_valid) ? 1 : 0;
-        if (!col_ok)
-          value = 0.0f;
+        if (!col_ok) value = 0.0f;
 
         const float partner_value = __shfl_xor(value, 1, WF_SIZE);
         const int partner_ok = __shfl_xor(col_ok, 1, WF_SIZE);
 
-        if (!is_gate || !col_ok || !partner_ok)
-          continue;
+        if (!is_gate || !col_ok || !partner_ok) continue;
 
         const int batch = sh_batch[row];
         const int slot = sh_slot[row];
-        if (batch < 0 || slot < 0)
-          continue;
+        if (batch < 0 || slot < 0) continue;
 
         const float gate = value;
         const float up = partner_value;
         const float fused = swiglu_fused(gate, up, limit);
         const size_t dst_offset =
-            (((size_t)slot * (size_t)batch_size + (size_t)batch) *
-             (size_t)IM) + (size_t)im_idx;
+            (((size_t)slot * (size_t)batch_size + (size_t)batch) * (size_t)IM) +
+            (size_t)im_idx;
         gate_up_topk[dst_offset] = bf16_t(fused);
       }
     }
   }
 }
 
+__global__ void mlp1_fused_gemm_kernel(
+    bf16_t *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
+    const bf16_t *__restrict__ b_mlp1_all,
+    const uint16_t *__restrict__ assignment_batches,
+    const uint8_t *__restrict__ assignment_slots,
+    const int *__restrict__ expert_offsets, int l_layer, int E, int H, int IM,
+    float swiglu_limit, int batch_size, const int *__restrict__ pos) {
+  mlp1_fused_gemm_kernel_body<
+      MATMUL_MLP1_BLOCK_ROWS, MATMUL_MLP1_BLOCK_COLS, MATMUL_MLP1_BLOCK_DEPTH,
+      MATMUL_MLP1_WARP_TILE_M, MATMUL_MLP1_WARP_TILE_N,
+      MATMUL_MLP1_WAVES_PER_BLOCK>(
+      gate_up_topk, x, w_mlp1_all, stride_w_mlp1, b_mlp1_all,
+      assignment_batches, assignment_slots, expert_offsets,
+      l_layer, E, H, IM, swiglu_limit, batch_size, pos);
+}
+
 // ============ MLP2 (weighted accum) : batched per expert ==============
-__global__ __launch_bounds__(WF_SIZE * MATMUL_MLP2_WAVES_PER_BLOCK, 1)
-void mlp2_bias_weighted_accum_gemm_kernel(
+
+template <
+  int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
+  int WARP_TILE_M, int WARP_TILE_N, int WAVES_PER_BLOCK
+>
+__device__ __forceinline__ void mlp2_bias_weighted_accum_gemm_kernel_body(
     float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const bf16_t *__restrict__ b_mlp2_all,
@@ -715,41 +710,29 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size,
     const int *__restrict__ pos) {
-  constexpr int BLOCK_ROWS = MATMUL_MLP2_BLOCK_ROWS;
-  constexpr int BLOCK_COLS = MATMUL_MLP2_BLOCK_COLS;
-  constexpr int BLOCK_DEPTH = MATMUL_MLP2_BLOCK_DEPTH;
-  constexpr int WARP_TILE_M = MATMUL_MLP2_WARP_TILE_M;
-  constexpr int WARP_TILE_N = MATMUL_MLP2_WARP_TILE_N;
-  constexpr int SUB_TILES_M = WARP_TILE_M / 16;
-  constexpr int SUB_TILES_N = WARP_TILE_N / 16;
-  constexpr int WAVES_M = BLOCK_ROWS / WARP_TILE_M;
-  constexpr int WAVES_N = BLOCK_COLS / WARP_TILE_N;
-  constexpr int WAVES_PER_BLOCK = MATMUL_MLP2_WAVES_PER_BLOCK;
-  constexpr int K_QUADS = BLOCK_DEPTH / MATMUL_CHUNK_K;
-  constexpr int LDS_STRIDE = K_QUADS + 3;
 
-  static_assert(WAVES_M * WAVES_N == WAVES_PER_BLOCK,
-                "Invalid MLP2 wave configuration");
+  constexpr int SUB_TILES_M   = WARP_TILE_M / 16;
+  constexpr int SUB_TILES_N   = WARP_TILE_N / 16;
+  constexpr int WAVES_M       = BLOCK_ROWS / WARP_TILE_M;
+  constexpr int WAVES_N       = BLOCK_COLS / WARP_TILE_N;
+  constexpr int K_QUADS       = BLOCK_DEPTH / MATMUL_CHUNK_K;
+  constexpr int LDS_STRIDE    = K_QUADS + 3;
 
   const int expert_id = blockIdx.z;
   const int start = expert_offsets[expert_id];
   const int end = expert_offsets[expert_id + 1];
   const int count = end - start;
-  if (count <= 0)
-    return;
+  if (count <= 0) return;
 
   const int block_m = blockIdx.y * BLOCK_ROWS;
-  if (block_m >= count)
-    return;
+  if (block_m >= count) return;
   const int tile_rows = min(BLOCK_ROWS, count - block_m);
 
   const int total_cols = H;
   const int block_n = blockIdx.x * BLOCK_COLS;
-  if (block_n >= total_cols)
-    return;
+  if (block_n >= total_cols) return;
 
-  if (blockDim.x != WF_SIZE || blockDim.y != WAVES_PER_BLOCK)
-    return;
+  if (blockDim.x != WF_SIZE || blockDim.y != WAVES_PER_BLOCK) return;
 
   const int lane = threadIdx.x & (WF_SIZE - 1);
   const int wave = threadIdx.y;
@@ -758,14 +741,13 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 
   const int wave_m = wave / WAVES_N;
   const int wave_n = wave - wave_m * WAVES_N;
-  if (wave_m >= WAVES_M || wave_n >= WAVES_N)
-    return;
+  if (wave_m >= WAVES_M || wave_n >= WAVES_N) return;
 
-  const int lane_mod16 = lane & 15;
-  const int lane_row = lane_mod16;
-  const int lane_col = lane_mod16;
-  const int lane_group = lane >> 4;
-  const int k_group = lane_group * MATMUL_CHUNK_K;
+  const int lane_mod16      = lane & 15;
+  const int lane_row        = lane_mod16;
+  const int lane_col        = lane_mod16;
+  const int lane_group      = lane >> 4;
+  const int k_group         = lane_group * MATMUL_CHUNK_K;
   const int row_lane_offset = lane_group * 4;
 
   __shared__ int sh_batch[BLOCK_ROWS];
@@ -775,8 +757,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
   __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
   __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
 
-  const uint16_t *__restrict__ gate_up_u16 =
-      reinterpret_cast<const uint16_t *>(gate_up_topk);
+  const uint16_t *gate_up_u16 = reinterpret_cast<const uint16_t *>(gate_up_topk);
 
   for (int idx = tid_linear; idx < BLOCK_ROWS; idx += threads_per_block) {
     int batch = -1;
@@ -793,8 +774,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
           weight = topk_v[(size_t)batch * (size_t)EXPERT_PER_TOKEN + slot];
           if (weight != 0.0f) {
             valid = 1;
-            gate_offset = ((size_t)slot * (size_t)batch_size +
-                           (size_t)batch) * (size_t)IM;
+            gate_offset = ((size_t)slot * (size_t)batch_size + (size_t)batch) * (size_t)IM;
           }
         }
       }
@@ -820,8 +800,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 
   f32x4 acc[SUB_TILES_M * SUB_TILES_N];
 #pragma unroll
-  for (int i = 0; i < SUB_TILES_M * SUB_TILES_N; ++i)
-    acc[i] = f32x4{0.f, 0.f, 0.f, 0.f};
+  for (int i = 0; i < SUB_TILES_M * SUB_TILES_N; ++i) acc[i] = f32x4{0.f,0.f,0.f,0.f};
 
   float bias_lane[SUB_TILES_N];
 #pragma unroll
@@ -836,16 +815,14 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     const int k_base = tile_idx * BLOCK_DEPTH;
 
     const int total_a_quads = BLOCK_ROWS * K_QUADS;
-    for (int linear = tid_linear; linear < total_a_quads;
-         linear += threads_per_block) {
-      const int row = linear / K_QUADS;
+    for (int linear = tid_linear; linear < total_a_quads; linear += threads_per_block) {
+      const int row  = linear / K_QUADS;
       const int quad = linear - row * K_QUADS;
-      const int k = k_base + quad * MATMUL_CHUNK_K;
+      const int k    = k_base + quad * MATMUL_CHUNK_K;
       const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K
-                             ? MATMUL_CHUNK_K
-                             : (remaining > 0 ? remaining : 0);
-      s16x4 val = {0, 0, 0, 0};
+      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
+                                                    : (remaining > 0 ? remaining : 0);
+      s16x4 val = {0,0,0,0};
       if (row < tile_rows && sh_valid[row] && valid > 0) {
         const size_t offset = sh_gate_offset[row] + (size_t)k;
         val = load_bf16x4(gate_up_u16 + offset, valid);
@@ -854,32 +831,26 @@ void mlp2_bias_weighted_accum_gemm_kernel(
     }
 
     const int total_b_quads = BLOCK_COLS * K_QUADS;
-    for (int linear = tid_linear; linear < total_b_quads;
-         linear += threads_per_block) {
-      const int col = linear / K_QUADS;
+    for (int linear = tid_linear; linear < total_b_quads; linear += threads_per_block) {
+      const int col  = linear / K_QUADS;
       const int quad = linear - col * K_QUADS;
       const int global_col = block_n + col;
-      const int k = k_base + quad * MATMUL_CHUNK_K;
+      const int k    = k_base + quad * MATMUL_CHUNK_K;
       const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K
-                             ? MATMUL_CHUNK_K
-                             : (remaining > 0 ? remaining : 0);
-      s16x4 val = {0, 0, 0, 0};
+      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
+                                                    : (remaining > 0 ? remaining : 0);
+      s16x4 val = {0,0,0,0};
       if (global_col < total_cols && valid > 0) {
-        const int tile_col = global_col / MATMUL_TILE_COLS;
-        const int row_in_tile = global_col - tile_col * MATMUL_TILE_COLS;
-        const int tile_k = k / MATMUL_TILE_K;
-        const int k_in_tile = k - tile_k * MATMUL_TILE_K;
-        const int group = k_in_tile / MATMUL_CHUNK_K;
-        const int within = k_in_tile - group * MATMUL_CHUNK_K;
-        const size_t tile_elems =
-            (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
-        const size_t tile_base =
-            ((size_t)tile_col * tiles_k_total + tile_k) * tile_elems;
-        const size_t group_base =
-            (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-        const uint16_t *src =
-            w_u16 + tile_base + group_base +
+        const int tile_col   = global_col / MATMUL_TILE_COLS;
+        const int row_in_tile= global_col - tile_col * MATMUL_TILE_COLS;
+        const int tile_k     = k / MATMUL_TILE_K;
+        const int k_in_tile  = k - tile_k * MATMUL_TILE_K;
+        const int group      = k_in_tile / MATMUL_CHUNK_K;
+        const int within     = k_in_tile - group * MATMUL_CHUNK_K;
+        const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
+        const size_t tile_base  = ((size_t)tile_col * tiles_k_total + tile_k) * tile_elems;
+        const size_t group_base = (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
+        const uint16_t *src = w_u16 + tile_base + group_base +
             (size_t)row_in_tile * MATMUL_CHUNK_K + within;
         val = load_bf16x4(src, valid);
       }
@@ -903,7 +874,7 @@ void mlp2_bias_weighted_accum_gemm_kernel(
           const int acc_idx = wm * SUB_TILES_N + wn;
           const s16x4 bvec = sh_B[b_col * LDS_STRIDE + quad_idx];
           acc[acc_idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[acc_idx], 0, 0, 0);
+              avec, bvec, acc[acc_idx], 0,0,0);
         }
       }
     }
@@ -927,21 +898,34 @@ void mlp2_bias_weighted_accum_gemm_kernel(
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const int row = row_base + i;
-        if (row >= tile_rows)
-          continue;
-        if (!sh_valid[row])
-          continue;
-        if (!col_valid)
-          continue;
+        if (row >= tile_rows) continue;
+        if (!sh_valid[row]) continue;
+        if (!col_valid) continue;
 
         const int batch = sh_batch[row];
         const float weight = sh_weight[row];
-        if (batch < 0 || weight == 0.0f)
-          continue;
+        if (batch < 0 || weight == 0.0f) continue;
 
         const float value = (vec[i] + bias_val) * weight;
         atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)col, value);
       }
     }
   }
+}
+__global__ void mlp2_bias_weighted_accum_gemm_kernel(
+    float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
+    const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
+    const bf16_t *__restrict__ b_mlp2_all,
+    const uint16_t *__restrict__ assignment_batches,
+    const uint8_t *__restrict__ assignment_slots,
+    const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
+    int l_layer, int E, int IM, int H, int batch_size,
+    const int *__restrict__ pos) {
+  mlp2_bias_weighted_accum_gemm_kernel_body<
+      MATMUL_MLP2_BLOCK_ROWS, MATMUL_MLP2_BLOCK_COLS, MATMUL_MLP2_BLOCK_DEPTH,
+      MATMUL_MLP2_WARP_TILE_M, MATMUL_MLP2_WARP_TILE_N,
+      MATMUL_MLP2_WAVES_PER_BLOCK>(
+      e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
+      assignment_batches, assignment_slots, expert_offsets, topk_v,
+      l_layer, E, IM, H, batch_size, pos);
 }
