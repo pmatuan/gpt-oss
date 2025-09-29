@@ -157,12 +157,22 @@ struct GPUWeightBuffersBF16 {
 
 struct DeviceContext {
   int device_id;
+  int E_local = 0; // number of local experts owned by this device (per layer)
 
   GPUActivationBuffers gpu_activations;
   GPUWeightBuffersFP32 gpu_weights_fp32;
   GPUExpertBiasBuffers gpu_expert_bias;
   GPUWeightBuffersBF16 gpu_weights_bf16;
   int capacity_B = 1;
+  hipStream_t *streams = nullptr;
+  int n_streams = 0;
+
+  // Dedicated streams for MoE routing/p2p
+  hipStream_t compute_stream = nullptr;   // QKV/Attn/Res/FFN-router
+  hipStream_t pack_stream = nullptr;      // route_count + scan + route_pack
+  hipStream_t mlp_stream = nullptr;       // run MLP on owner
+  hipStream_t *comm_streams = nullptr;    // [ndev]
+
   size_t stride_w_qkv_bf16 = 0;
   size_t stride_w_o_bf16 = 0;
   size_t stride_w_out_bf16 = 0;
@@ -207,6 +217,12 @@ struct PromptCtx {
         max_steps(0), h_logits(nullptr), logits_size(0), sampler(nullptr),
         num_generated(0), start_time(0.0), end_time(0.0),
         is_context_phase(true), user_data(nullptr) {}
+};
+
+struct EPAssignHost {
+  int b;      // batch row index
+  int e;      // global expert id
+  float w;    // gate weight
 };
 
 // Utility function for PromptCtx cleanup

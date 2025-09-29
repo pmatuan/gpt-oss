@@ -65,6 +65,70 @@ size_t matmul_packed_elems(int rows, int cols);
 void pack_fp32_to_bf16_matmul(const float *src, int rows, int cols,
                               bf16_t *dst);
 
+// Accumulate compact partials [cnt, H] into dest [B, H] using batch_ids[cnt]
+__global__ void accumulate_partials_kernel(
+    float* __restrict__ dest,           // [B, H]
+    const float* __restrict__ src,      // [cnt, H]
+    const int* __restrict__ batch_ids,  // [cnt]
+    int H,
+    int cnt);
+
+// ================= Device-side bucketization & packing (MoE routing) ================
+// Count per-local-expert assignments for a specific owner at layer l.
+// e2lid_owner_l: [E] mapping global expert id -> local id on this owner for layer l, or -1.
+__global__ void route_count_owner_kernel(
+    int* __restrict__ expert_counts,   // [E_local]
+    const int* __restrict__ topk_i,    // [B*K]
+    const int* __restrict__ pos,       // [B]
+    const int* __restrict__ e2lid_owner_l, // [E]
+    int B,
+    int K,
+    int E);
+
+// Simple exclusive scan for small arrays (one block). counts -> offsets (size n+1).
+__global__ void exclusive_scan_small_kernel(
+    const int* __restrict__ counts, // [n]
+    int* __restrict__ offsets,      // [n+1]
+    int n);
+
+// Build assignments and compact batch maps per owner.
+// Produces:
+//  - b2local[B] initialized to -1; local2b filled for 0..B_local-1
+//  - owner_B (single int) final B_local
+//  - assignment_batches/slots filled using expert_offsets and per-expert write counters
+__global__ void route_pack_owner_kernel(
+    int* __restrict__ b2local,          // [B], init -1
+    int* __restrict__ local2b,          // [B]
+    int* __restrict__ owner_B,          // [1]
+    const int* __restrict__ expert_offsets, // [E_local+1]
+    int* __restrict__ expert_writes,    // [E_local], init 0
+    int* __restrict__ assignment_batches, // [total_assignments]
+    int* __restrict__ assignment_slots,   // [total_assignments]
+    const int* __restrict__ topk_i,     // [B*K]
+    const int* __restrict__ pos,        // [B]
+    const int* __restrict__ e2lid_owner_l, // [E]
+    int B,
+    int K,
+    int E);
+
+// Pack rows x[b,:] for lb=b2local[b] >=0 into dst[lb,:].
+__global__ void pack_rows_owner_kernel(
+    bf16_t* __restrict__ dst,          // [B_local, H]
+    const bf16_t* __restrict__ src,    // [B, H]
+    const int* __restrict__ b2local,   // [B]
+    int B,
+    int H);
+
+// Pack pos[B_local] and topk_v[B_local*K] using b2local map.
+__global__ void pack_meta_owner_kernel(
+    int* __restrict__ pos_owner,         // [B_local]
+    float* __restrict__ topk_v_owner,    // [B_local*K]
+    const int* __restrict__ b2local,     // [B]
+    const int* __restrict__ pos,         // [B]
+    const float* __restrict__ topk_v,    // [B*K]
+    int B,
+    int K);
+
 // Matmul Helper Functions
 __device__ __forceinline__ s16x4 load_bf16x4(const uint16_t* src, int valid_elems);
 
