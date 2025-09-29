@@ -1042,14 +1042,17 @@ static void tune_matmul_qkv(const BenchmarkSetting &setting,
     RunResult trial = run_qkv_variant(prob, d_y, d_x, d_w, d_bias, d_pos,
                                       stream, opts, cand);
     ErrStats err = compare_vectors(trial.output, base_run.output);
-    if (!accuracy_ok(err)) {
-      std::cout << "  [discard] " << cand.label << " | accuracy fail"
-                << " (max_abs=" << err.max_abs << ", max_rel=" << err.max_rel
-                << ", l2_rel=" << err.l2_rel << ")\n";
+    const bool ok = accuracy_ok(err);
+    const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
+    if (!ok) {
+      std::cout << "  [discard] " << cand.label << " | " << trial.ms
+                << " ms | " << trial.tflops << " TFLOPS | speedup x"
+                << speedup << " | accuracy fail (max_abs=" << err.max_abs
+                << ", max_rel=" << err.max_rel << ", l2_rel=" << err.l2_rel
+                << ")\n";
       continue;
     }
     if (trial.ms < base_run.ms) {
-      double speedup = base_run.ms / trial.ms;
       std::cout << "  [faster] " << cand.label << " | " << trial.ms << " ms | "
                 << trial.tflops << " TFLOPS | speedup x" << speedup << "\n";
     }
@@ -1120,14 +1123,17 @@ static void tune_matmul_att(const BenchmarkSetting &setting,
     RunResult trial = run_att_variant(prob, d_y, d_x, d_w, d_bias, d_pos,
                                       stream, opts, cand);
     ErrStats err = compare_vectors(trial.output, base_run.output);
-    if (!accuracy_ok(err)) {
-      std::cout << "  [discard] " << cand.label << " | accuracy fail"
-                << " (max_abs=" << err.max_abs << ", max_rel=" << err.max_rel
-                << ", l2_rel=" << err.l2_rel << ")\n";
+    const bool ok = accuracy_ok(err);
+    const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
+    if (!ok) {
+      std::cout << "  [discard] " << cand.label << " | " << trial.ms
+                << " ms | " << trial.tflops << " TFLOPS | speedup x"
+                << speedup << " | accuracy fail (max_abs=" << err.max_abs
+                << ", max_rel=" << err.max_rel << ", l2_rel=" << err.l2_rel
+                << ")\n";
       continue;
     }
     if (trial.ms < base_run.ms) {
-      double speedup = base_run.ms / trial.ms;
       std::cout << "  [faster] " << cand.label << " | " << trial.ms << " ms | "
                 << trial.tflops << " TFLOPS | speedup x" << speedup << "\n";
     }
@@ -1192,14 +1198,17 @@ static void tune_matmul_logits(const BenchmarkSetting &setting,
     RunResult trial =
         run_logits_variant(prob, d_y, d_x, d_w, d_pos, stream, opts, cand);
     ErrStats err = compare_vectors(trial.output, base_run.output);
-    if (!accuracy_ok(err, 5e-2, 5e-3, 5e-3)) {
-      std::cout << "  [discard] " << cand.label << " | accuracy fail"
-                << " (max_abs=" << err.max_abs << ", max_rel=" << err.max_rel
-                << ", l2_rel=" << err.l2_rel << ")\n";
+    const bool ok = accuracy_ok(err, 5e-2, 5e-3, 5e-3);
+    const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
+    if (!ok) {
+      std::cout << "  [discard] " << cand.label << " | " << trial.ms
+                << " ms | " << trial.tflops << " TFLOPS | speedup x"
+                << speedup << " | accuracy fail (max_abs=" << err.max_abs
+                << ", max_rel=" << err.max_rel << ", l2_rel=" << err.l2_rel
+                << ")\n";
       continue;
     }
     if (trial.ms < base_run.ms) {
-      double speedup = base_run.ms / trial.ms;
       std::cout << "  [faster] " << cand.label << " | " << trial.ms << " ms | "
                 << trial.tflops << " TFLOPS | speedup x" << speedup << "\n";
     }
@@ -1300,14 +1309,17 @@ static void tune_mlp1(const BenchmarkSetting &setting, const TimingOptions &opts
                                        spec.swiglu_limit, d_pos, stream, opts,
                                        cand);
     ErrStats err = compare_vectors(trial.output, base_run.output);
-    if (!accuracy_ok(err, 1e-1, 1e-2, 1e-2)) {
-      std::cout << "  [discard] " << cand.label << " | accuracy fail"
-                << " (max_abs=" << err.max_abs << ", max_rel=" << err.max_rel
-                << ", l2_rel=" << err.l2_rel << ")\n";
+    const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
+    const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
+    if (!ok) {
+      std::cout << "  [discard] " << cand.label << " | " << trial.ms
+                << " ms | " << trial.tflops << " TFLOPS | speedup x"
+                << speedup << " | accuracy fail (max_abs=" << err.max_abs
+                << ", max_rel=" << err.max_rel << ", l2_rel=" << err.l2_rel
+                << ")\n";
       continue;
     }
     if (trial.ms < base_run.ms) {
-      double speedup = base_run.ms / trial.ms;
       std::cout << "  [faster] " << cand.label << " | " << trial.ms << " ms | "
                 << trial.tflops << " TFLOPS | speedup x" << speedup << "\n";
     }
@@ -1419,14 +1431,17 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
                                        d_batches, d_slots, d_offsets, d_topk, 0,
                                        d_pos, stream, opts, cand);
     ErrStats err = compare_vectors(trial.output, base_run.output);
-    if (!accuracy_ok(err, 1e-1, 1e-2, 1e-2)) {
-      std::cout << "  [discard] " << cand.label << " | accuracy fail"
-                << " (max_abs=" << err.max_abs << ", max_rel=" << err.max_rel
-                << ", l2_rel=" << err.l2_rel << ")\n";
+    const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
+    const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
+    if (!ok) {
+      std::cout << "  [discard] " << cand.label << " | " << trial.ms
+                << " ms | " << trial.tflops << " TFLOPS | speedup x"
+                << speedup << " | accuracy fail (max_abs=" << err.max_abs
+                << ", max_rel=" << err.max_rel << ", l2_rel=" << err.l2_rel
+                << ")\n";
       continue;
     }
     if (trial.ms < base_run.ms) {
-      double speedup = base_run.ms / trial.ms;
       std::cout << "  [faster] " << cand.label << " | " << trial.ms << " ms | "
                 << trial.tflops << " TFLOPS | speedup x" << speedup << "\n";
     }
@@ -1460,8 +1475,8 @@ int main(int argc, char **argv) {
     tune_matmul_qkv(setting, opts, stream);
     tune_matmul_att(setting, opts, stream);
     tune_matmul_logits(setting, opts, stream);
-    // tune_mlp1(setting, opts, stream);
-    // tune_mlp2(setting, opts, stream);
+    tune_mlp1(setting, opts, stream);
+    tune_mlp2(setting, opts, stream);
   }
 
   return 0;
