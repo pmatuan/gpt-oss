@@ -256,6 +256,13 @@ struct EPAssignHost {
   float w;    // gate weight
 };
 
+static Config *model_config;
+
+static std::vector<DeviceContext> g_devices;
+static int g_num_devices = 0;
+
+static bool use_expert_parallelism = false;
+
 // Utility function for PromptCtx cleanup
 static inline void free_prompt_ctx_heap_buffers(PromptCtx &ctx) {
   if (ctx.h_logits) {
