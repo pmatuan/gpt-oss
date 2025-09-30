@@ -683,13 +683,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           batch_size, ctx.gpu_activations.d_pos);
     }
 
-    // Ensure router outputs computed on default stream are visible before routing on pack_stream
-    hipEvent_t router_ready_evt;
-    HIP_CHECK(hipEventCreateWithFlags(&router_ready_evt, hipEventDisableTiming));
-    HIP_CHECK(hipEventRecord(router_ready_evt, 0 /* default stream */));
-    HIP_CHECK(hipStreamWaitEvent(ctx.pack_stream, router_ready_evt, 0));
-    HIP_CHECK(hipEventDestroy(router_ready_evt));
-
     // Zero accumulation buffer before MoE compute
     HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_e_agg, 0,
           (size_t)batch_size * H * sizeof(float)));
