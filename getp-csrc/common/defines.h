@@ -155,6 +155,43 @@ struct GPUWeightBuffersBF16 {
   bf16_t *d_out_bf16;
 };
 
+struct RoutingMeta {
+  int *d_e2lid_allowners = nullptr;        // [ndev * L * E]
+  int *d_E_local_per_owner_layer = nullptr; // [ndev * L]
+};
+
+struct HomePeerBuffers {
+  bf16_t **send_x_peer = nullptr;        // [ndev] -> device pointers allocated on HOME
+  int **send_pos_peer = nullptr;         // [ndev] -> [B_local]
+  float **send_topk_v_peer = nullptr;    // [ndev] -> [B_local*K]
+  uint16_t **send_assignment_batches_peer = nullptr; // [ndev] -> [total_assign]
+  uint8_t **send_assignment_slots_peer = nullptr;   // [ndev] -> [total_assign]
+  int **send_expert_offsets_peer = nullptr;         // [ndev] -> [E_local+1]
+  int **d_owner_B_peer = nullptr;        // [ndev] -> [1]
+  int **d_b2local_peer = nullptr;        // [ndev]
+  int **d_local2b_peer = nullptr;        // [ndev]
+  int **d_expert_counts_peer = nullptr;  // [ndev]
+  int **d_expert_offsets_peer = nullptr; // [ndev]
+  int **d_expert_writes_peer = nullptr;  // [ndev]
+  int **d_pos_peer = nullptr;            // [ndev]
+  float **d_topk_v_peer = nullptr;       // [ndev]
+};
+
+struct OwnerReceiveBuffers {
+  bf16_t **recv_x_from_home = nullptr;     // [ndev] -> [B_local, H]
+  int **recv_pos_from_home = nullptr;      // [ndev]
+  float **recv_topk_v_from_home = nullptr; // [ndev]
+  uint16_t **recv_assignment_batches = nullptr; // [ndev]
+  uint8_t **recv_assignment_slots = nullptr;   // [ndev]
+  int **recv_expert_offsets = nullptr;     // [ndev]
+};
+
+struct OwnerPartialBuffers {
+  float **partial_owner_per_home = nullptr; // [ndev] -> [B_local,H]
+  float **recv_partial_home = nullptr;      // [ndev] -> [B_local,H] (allocated on home device)
+  bf16_t **gate_up_owner_per_home = nullptr; // [ndev] -> [K, B_local, IM]
+};
+
 struct DeviceContext {
   int device_id;
   int E_local = 0; // number of local experts owned by this device (per layer)
@@ -184,37 +221,13 @@ struct DeviceContext {
   HostPinnedBatchBuffers host_pinned_batch;
 
   // Routing meta on device (home needs all owners' local-id maps)
-  int *d_e2lid_allowners = nullptr; // [ndev * L * E]
-  int *d_E_local_per_owner_layer = nullptr; // [ndev * L]
-
+  RoutingMeta routing_meta;
   // Home-side ring buffers (per peer)
-  bf16_t **send_x_peer = nullptr;        // [ndev] -> device pointers allocated on HOME
-  int **send_pos_peer = nullptr;         // [ndev] -> [B_local]
-  float **send_topk_v_peer = nullptr;    // [ndev] -> [B_local*K]
-  uint16_t **send_assignment_batches_peer = nullptr; // [ndev] -> [total_assign]
-  uint8_t **send_assignment_slots_peer = nullptr;   // [ndev] -> [total_assign]
-  int **send_expert_offsets_peer = nullptr;     // [ndev] -> [E_local+1]
-  int **d_owner_B_peer = nullptr;        // [ndev] -> [1]
-  int **d_b2local_peer = nullptr;        // [ndev]
-  int **d_local2b_peer = nullptr;        // [ndev]
-  int **d_expert_counts_peer = nullptr;  // [ndev]
-  int **d_expert_offsets_peer = nullptr; // [ndev]
-  int **d_expert_writes_peer = nullptr;  // [ndev]
-  int **d_pos_peer = nullptr;            // [ndev]
-  float **d_topk_v_peer = nullptr;       // [ndev]
-
+  HomePeerBuffers home_peer_buffers;
   // Owner-side receive buffers (per home) on this device
-  bf16_t **recv_x_from_home = nullptr;     // [ndev] -> [B_local, H]
-  int **recv_pos_from_home = nullptr;      // [ndev]
-  float **recv_topk_v_from_home = nullptr; // [ndev]
-  uint16_t **recv_assignment_batches = nullptr; // [ndev]
-  uint8_t **recv_assignment_slots = nullptr;   // [ndev]
-  int **recv_expert_offsets = nullptr;     // [ndev]
-
+  OwnerReceiveBuffers owner_receive_buffers;
   // Owner-side partials per home and home-side recv partials
-  float **partial_owner_per_home = nullptr; // [ndev] -> [B_local,H]
-  float **recv_partial_home = nullptr;      // [ndev] -> [B_local,H] (allocated on home device)
-  bf16_t **gate_up_owner_per_home = nullptr; // [ndev] -> [K, B_local, IM]
+  OwnerPartialBuffers partial_buffers;
 };
 
 // Prompt Context Structure
