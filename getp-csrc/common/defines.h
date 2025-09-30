@@ -163,8 +163,6 @@ struct DeviceContext {
   GPUExpertBiasBuffers gpu_expert_bias;
   GPUWeightBuffersBF16 gpu_weights_bf16;
   int capacity_B = 1;
-  hipStream_t *streams = nullptr;
-  int n_streams = 0;
   size_t stride_w_qkv_bf16 = 0;
   size_t stride_w_o_bf16 = 0;
   size_t stride_w_out_bf16 = 0;
