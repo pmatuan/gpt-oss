@@ -250,6 +250,15 @@ static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
   exit(EXIT_FAILURE);
 }
 
+// Helper to allocate host arrays of device pointers lazily
+template <typename T>
+static void ensure_host_ptr_array(T ***arr, int ndev) {
+  if (!*arr) {
+    *arr = (T **)malloc(sizeof(T *) * ndev);
+    for (int i = 0; i < ndev; ++i) (*arr)[i] = nullptr;
+  }
+}
+
 static void init_device_context(DeviceContext &ctx, int device_id,
                                 Transformer *transformer) {
   ctx.device_id = device_id;
@@ -557,6 +566,77 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   for (int i = 0; i < g_num_devices; ++i) {
     HIP_CHECK(hipStreamCreateWithFlags(&ctx.comm_streams[i], hipStreamNonBlocking));
   }
+
+  if (g_num_devices > 1) {
+    const int K = model_config->experts_per_token;
+    const size_t B_owner_peer_cap = (size_t)MAX_BATCH_SIZE;
+
+    // Tạo mảng host chứa device pointers nếu chưa có
+    ensure_host_ptr_array(&ctx.send_x_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.send_pos_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.send_topk_v_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.send_assignment_batches_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.send_assignment_slots_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.send_expert_offsets_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_owner_B_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_b2local_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_local2b_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_expert_counts_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_expert_writes_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_expert_offsets_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_pos_peer, g_num_devices);
+    ensure_host_ptr_array(&ctx.d_topk_v_peer, g_num_devices);
+
+    ensure_host_ptr_array(&ctx.recv_x_from_home, g_num_devices);
+    ensure_host_ptr_array(&ctx.recv_pos_from_home, g_num_devices);
+    ensure_host_ptr_array(&ctx.recv_topk_v_from_home, g_num_devices);
+    ensure_host_ptr_array(&ctx.recv_assignment_batches, g_num_devices);
+    ensure_host_ptr_array(&ctx.recv_assignment_slots, g_num_devices);
+    ensure_host_ptr_array(&ctx.recv_expert_offsets, g_num_devices);
+    ensure_host_ptr_array(&ctx.partial_owner_per_home, g_num_devices);
+    ensure_host_ptr_array(&ctx.recv_partial_home, g_num_devices);
+    ensure_host_ptr_array(&ctx.gate_up_owner_per_home, g_num_devices);
+
+    auto hip_alloc = [&](void **ptr, size_t bytes) {
+      HIP_CHECK(hipMalloc(ptr, bytes));
+    };
+
+    for (int peer = 0; peer < g_num_devices; ++peer) {
+      // E_local lớn nhất của 'peer' này trên mọi layer (để sizing offsets/counts)
+      int E_local_max = 0;
+      for (int l = 0; l < L; ++l) {
+        int v = g_E_local_per_owner_layer[(size_t)peer * (size_t)L + (size_t)l];
+        if (v > E_local_max) E_local_max = v;
+      }
+
+      // HOME → OWNER
+      hip_alloc((void**)&ctx.send_x_peer[peer],                  (size_t)B * (size_t)H * sizeof(bf16_t));
+      hip_alloc((void**)&ctx.send_pos_peer[peer],                (size_t)B * sizeof(int));
+      hip_alloc((void**)&ctx.send_topk_v_peer[peer],             (size_t)B * (size_t)K * sizeof(float));
+      hip_alloc((void**)&ctx.send_assignment_batches_peer[peer], (size_t)B * (size_t)K * sizeof(uint16_t));
+      hip_alloc((void**)&ctx.send_assignment_slots_peer[peer],   (size_t)B * (size_t)K * sizeof(uint8_t));
+      hip_alloc((void**)&ctx.send_expert_offsets_peer[peer],     (size_t)(E_local_max + 1) * sizeof(int));
+      hip_alloc((void**)&ctx.d_owner_B_peer[peer],               sizeof(int));
+      hip_alloc((void**)&ctx.d_b2local_peer[peer],               (size_t)B * sizeof(int));
+      hip_alloc((void**)&ctx.d_local2b_peer[peer],               (size_t)B * sizeof(int));
+      hip_alloc((void**)&ctx.d_expert_counts_peer[peer],         (size_t)E_local_max * sizeof(int));
+      hip_alloc((void**)&ctx.d_expert_writes_peer[peer],         (size_t)E_local_max * sizeof(int));
+      hip_alloc((void**)&ctx.d_expert_offsets_peer[peer],        (size_t)(E_local_max + 1) * sizeof(int));
+      hip_alloc((void**)&ctx.d_pos_peer[peer],                   (size_t)B * sizeof(int));
+      hip_alloc((void**)&ctx.d_topk_v_peer[peer],                (size_t)B * (size_t)K * sizeof(float));
+
+      // OWNER (this ctx) nhận từ HOME=peer
+      hip_alloc((void**)&ctx.recv_x_from_home[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
+      hip_alloc((void**)&ctx.recv_pos_from_home[peer],           B_owner_peer_cap * sizeof(int));
+      hip_alloc((void**)&ctx.recv_topk_v_from_home[peer],        B_owner_peer_cap * (size_t)K * sizeof(float));
+      hip_alloc((void**)&ctx.recv_assignment_batches[peer],      B_owner_peer_cap * (size_t)K * sizeof(uint16_t));
+      hip_alloc((void**)&ctx.recv_assignment_slots[peer],        B_owner_peer_cap * (size_t)K * sizeof(uint8_t));
+      hip_alloc((void**)&ctx.recv_expert_offsets[peer],          (size_t)(E_local_max + 1) * sizeof(int));
+      hip_alloc((void**)&ctx.partial_owner_per_home[peer],       B_owner_peer_cap * (size_t)H * sizeof(float));
+      hip_alloc((void**)&ctx.recv_partial_home[peer],            B_owner_peer_cap * (size_t)H * sizeof(float));
+      hip_alloc((void**)&ctx.gate_up_owner_per_home[peer],       (size_t)K * B_owner_peer_cap * (size_t)IM * sizeof(bf16_t));
+    }
+  }
 }
 
 // Cleanup device context
@@ -629,14 +709,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   if (ctx.host_pinned_batch.expert_offsets)
     HIP_CHECK(hipHostFree(ctx.host_pinned_batch.expert_offsets));
   ctx.host_pinned_batch = HostPinnedBatchBuffers{};
-
-  if (ctx.streams) {
-    for (int i = 0; i < ctx.n_streams; ++i)
-      HIP_CHECK(hipStreamDestroy(ctx.streams[i]));
-    free(ctx.streams);
-    ctx.streams = nullptr;
-    ctx.n_streams = 0;
-  }
 
   if (ctx.compute_stream) HIP_CHECK(hipStreamDestroy(ctx.compute_stream));
   if (ctx.pack_stream) HIP_CHECK(hipStreamDestroy(ctx.pack_stream));
@@ -783,537 +855,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   }
   g_devices.clear();
   g_num_devices = 0;
-}
-
-// ============================ Forward ============================
-static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq);
-
-// Helper to allocate host arrays of device pointers lazily
-template <typename T>
-static void ensure_host_ptr_array(T ***arr, int ndev) {
-  if (!*arr) {
-    *arr = (T **)malloc(sizeof(T *) * ndev);
-    for (int i = 0; i < ndev; ++i) (*arr)[i] = nullptr;
-  }
-}
-
-// Ensure device has capacity for B batch slots (reallocates activations &
-// caches if needed)
-static inline void ensure_device_capacity(DeviceContext &ctx, int B,
-                                          int max_seq_hint = 0) {
-  HIP_CHECK(hipSetDevice(ctx.device_id));
-
-  const bool need_realloc = B > ctx.capacity_B;
-
-  const Config *p = model_config;
-  const int H = p->hidden_dim;
-  const int D = p->head_dim;
-  const int Hq = p->n_attn_heads;
-  const int Hk = p->n_kv_heads;
-  const int KV = D * Hk;
-  const int L = p->n_layers;
-  const int S = p->seq_len;
-  const int IM = p->intermediate_dim;
-  const int V = p->vocab_size;
-
-  // Free previous activations to re-alloc at batch size B
-  if (need_realloc) {
-    auto free_if = [](auto *&ptr) {
-      if (ptr) {
-        HIP_CHECK(hipFree(ptr));
-        ptr = nullptr;
-      }
-    };
-
-    free_if(ctx.gpu_activations.d_x);
-    free_if(ctx.gpu_activations.d_t);
-    free_if(ctx.gpu_activations.d_tb);
-    free_if(ctx.gpu_activations.d_router_score);
-    free_if(ctx.gpu_activations.d_topk_v);
-    free_if(ctx.gpu_activations.d_topk_i);
-    free_if(ctx.gpu_activations.d_e_agg);
-    free_if(ctx.gpu_activations.d_gate_up_workspace);
-    free_if(ctx.gpu_activations.d_qkv);
-    free_if(ctx.gpu_activations.d_q);
-    free_if(ctx.gpu_activations.d_key_cache);
-    free_if(ctx.gpu_activations.d_value_cache);
-    free_if(ctx.gpu_activations.d_logits);
-    free_if(ctx.gpu_activations.d_next_tokens);
-
-    ctx.gpu_activations.gate_up_workspace_bytes = 0;
-    ctx.gpu_activations.kv_seq_capacity = 0;
-    ctx.gpu_activations.kv_window_capacity = 0;
-    ctx.gpu_activations.kv_seq_limit = 0;
-    ctx.gpu_activations.kv_batch_stride = 0;
-    free_if(ctx.d_kv_layer_offsets);
-    free_if(ctx.d_kv_layer_capacity);
-    ctx.h_kv_layer_offsets.clear();
-    ctx.h_kv_layer_capacity.clear();
-
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_x, (size_t)B * H * sizeof(bf16_t)));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_t, (size_t)B * H * sizeof(bf16_t)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb,
-                        (size_t)B * D * Hq * sizeof(bf16_t)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
-                        (size_t)B * p->n_experts * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
-                        (size_t)B * p->experts_per_token * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_i,
-                        (size_t)B * p->experts_per_token * sizeof(int)));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_e_agg, (size_t)B * H * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                        (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
-                        (size_t)B * Hq * D * sizeof(bf16_t)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
-                        (size_t)B * V * sizeof(float)));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens,
-                        (size_t)B * sizeof(int)));
-
-    ctx.capacity_B = B;
-    if (g_num_devices > 1) {
-      const int K = p->experts_per_token;
-      ensure_host_ptr_array(&ctx.send_x_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.send_pos_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.send_topk_v_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.send_assignment_batches_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.send_assignment_slots_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.send_expert_offsets_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_owner_B_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_b2local_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_local2b_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_expert_counts_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_expert_writes_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_x_from_home, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_pos_from_home, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_topk_v_from_home, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_assignment_batches, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_assignment_slots, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_expert_offsets, g_num_devices);
-      ensure_host_ptr_array(&ctx.partial_owner_per_home, g_num_devices);
-      ensure_host_ptr_array(&ctx.recv_partial_home, g_num_devices);
-      ensure_host_ptr_array(&ctx.gate_up_owner_per_home, g_num_devices);
-      // Optional scratch
-      ensure_host_ptr_array(&ctx.d_expert_offsets_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_pos_peer, g_num_devices);
-      ensure_host_ptr_array(&ctx.d_topk_v_peer, g_num_devices);
-
-      for (int peer = 0; peer < g_num_devices; ++peer) {
-        int E_local_max = 0;
-        for (int l = 0; l < p->n_layers; ++l) {
-          int v = g_E_local_per_owner_layer[(size_t)peer * (size_t)p->n_layers + (size_t)l];
-          if (v > E_local_max) E_local_max = v;
-        }
-        auto hip_alloc_if = [&](void **ptr, size_t bytes){ if (*ptr) HIP_CHECK(hipFree(*ptr)); if (bytes) HIP_CHECK(hipMalloc(ptr, bytes)); };
-        // Home-side send buffers and scratch (bounded by this HOME's B)
-        hip_alloc_if((void**)&ctx.send_x_peer[peer], (size_t)B * (size_t)H * sizeof(bf16_t));
-        hip_alloc_if((void**)&ctx.send_pos_peer[peer], (size_t)B * sizeof(int));
-        hip_alloc_if((void**)&ctx.send_topk_v_peer[peer], (size_t)B * (size_t)K * sizeof(float));
-        hip_alloc_if((void**)&ctx.send_assignment_batches_peer[peer], (size_t)B * (size_t)K * sizeof(uint16_t));
-        hip_alloc_if((void**)&ctx.send_assignment_slots_peer[peer], (size_t)B * (size_t)K * sizeof(uint8_t));
-        hip_alloc_if((void**)&ctx.send_expert_offsets_peer[peer], (size_t)(E_local_max + 1) * sizeof(int));
-        hip_alloc_if((void**)&ctx.d_owner_B_peer[peer], sizeof(int));
-        hip_alloc_if((void**)&ctx.d_b2local_peer[peer], (size_t)B * sizeof(int));
-        hip_alloc_if((void**)&ctx.d_local2b_peer[peer], (size_t)B * sizeof(int));
-        hip_alloc_if((void**)&ctx.d_expert_counts_peer[peer], (size_t)E_local_max * sizeof(int));
-        hip_alloc_if((void**)&ctx.d_expert_writes_peer[peer], (size_t)E_local_max * sizeof(int));
-        // Optional scratch
-        hip_alloc_if((void**)&ctx.d_expert_offsets_peer[peer], (size_t)(E_local_max + 1) * sizeof(int));
-        hip_alloc_if((void**)&ctx.d_pos_peer[peer], (size_t)B * sizeof(int));
-        hip_alloc_if((void**)&ctx.d_topk_v_peer[peer], (size_t)B * (size_t)K * sizeof(float));
-        // Owner-side receive buffers must handle the SENDER's local batch size (<= MAX_BATCH_SIZE)
-        const size_t B_owner_peer_cap = (size_t)MAX_BATCH_SIZE;
-        hip_alloc_if((void**)&ctx.recv_x_from_home[peer], B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
-        hip_alloc_if((void**)&ctx.recv_pos_from_home[peer], B_owner_peer_cap * sizeof(int));
-        hip_alloc_if((void**)&ctx.recv_topk_v_from_home[peer], B_owner_peer_cap * (size_t)K * sizeof(float));
-        hip_alloc_if((void**)&ctx.recv_assignment_batches[peer], B_owner_peer_cap * (size_t)K * sizeof(uint16_t));
-        hip_alloc_if((void**)&ctx.recv_assignment_slots[peer], B_owner_peer_cap * (size_t)K * sizeof(uint8_t));
-        hip_alloc_if((void**)&ctx.recv_expert_offsets[peer], (size_t)(E_local_max + 1) * sizeof(int));
-        hip_alloc_if((void**)&ctx.partial_owner_per_home[peer], B_owner_peer_cap * (size_t)H * sizeof(float));
-        hip_alloc_if((void**)&ctx.recv_partial_home[peer], B_owner_peer_cap * (size_t)H * sizeof(float));
-        hip_alloc_if((void**)&ctx.gate_up_owner_per_home[peer], (size_t)K * B_owner_peer_cap * (size_t)IM * sizeof(bf16_t));
-      }
-    }
-  } else {
-    if (!ctx.gpu_activations.d_x) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_x,
-                          (size_t)ctx.capacity_B * H * sizeof(bf16_t)));
-    }
-    if (!ctx.gpu_activations.d_t) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_t,
-                          (size_t)ctx.capacity_B * H * sizeof(bf16_t)));
-    }
-    if (!ctx.gpu_activations.d_tb) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tb,
-                          (size_t)ctx.capacity_B * D * Hq * sizeof(bf16_t)));
-    }
-    if (!ctx.gpu_activations.d_router_score) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_router_score,
-                          (size_t)ctx.capacity_B * p->n_experts * sizeof(float)));
-    }
-    if (!ctx.gpu_activations.d_topk_v) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_v,
-                          (size_t)ctx.capacity_B * p->experts_per_token * sizeof(float)));
-    }
-    if (!ctx.gpu_activations.d_topk_i) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_topk_i,
-                          (size_t)ctx.capacity_B * p->experts_per_token * sizeof(int)));
-    }
-    if (!ctx.gpu_activations.d_e_agg) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_e_agg,
-                          (size_t)ctx.capacity_B * H * sizeof(float)));
-    }
-    if (!ctx.gpu_activations.d_qkv) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
-                          (size_t)ctx.capacity_B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
-    }
-    if (!ctx.gpu_activations.d_q) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q,
-                          (size_t)ctx.capacity_B * Hq * D * sizeof(bf16_t)));
-    }
-    if (!ctx.gpu_activations.d_logits) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits,
-                          (size_t)ctx.capacity_B * V * sizeof(float)));
-    }
-    if (!ctx.gpu_activations.d_next_tokens) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_next_tokens,
-                          (size_t)ctx.capacity_B * sizeof(int)));
-    }
-  }
-
-  // Gate-up workspace sized to capacity_B and K
-  size_t max_assignments = (size_t)ctx.capacity_B * p->experts_per_token;
-  size_t required_gate_bytes =
-      max_assignments * (size_t)IM * sizeof(bf16_t);
-  if (ctx.gpu_activations.gate_up_workspace_bytes < required_gate_bytes) {
-    if (ctx.gpu_activations.d_gate_up_workspace) {
-      HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
-    }
-    if (required_gate_bytes > 0) {
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_gate_up_workspace,
-                          required_gate_bytes));
-    }
-    ctx.gpu_activations.gate_up_workspace_bytes = required_gate_bytes;
-  }
-  // Per-sample inv_rms
-  if (need_realloc) {
-    if (ctx.gpu_activations.d_inv_rms) {
-      HIP_CHECK(hipFree(ctx.gpu_activations.d_inv_rms));
-    }
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_inv_rms, (size_t)B * sizeof(float)));
-  } else if (!ctx.gpu_activations.d_inv_rms) {
-    // First-time allocation when capacity already sufficient
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_inv_rms,
-                        (size_t)ctx.capacity_B * sizeof(float)));
-  }
-
-  // Tokens and positions
-  if (need_realloc) {
-    if (ctx.gpu_activations.d_tokens)
-      HIP_CHECK(hipFree(ctx.gpu_activations.d_tokens));
-    HIP_CHECK(
-        hipMalloc(&ctx.gpu_activations.d_tokens, (size_t)B * sizeof(int)));
-
-    if (ctx.gpu_activations.d_pos)
-      HIP_CHECK(hipFree(ctx.gpu_activations.d_pos));
-    HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos, (size_t)B * sizeof(int)));
-  } else {
-    if (!ctx.gpu_activations.d_tokens)
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_tokens,
-                          (size_t)ctx.capacity_B * sizeof(int)));
-
-    if (!ctx.gpu_activations.d_pos)
-      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_pos,
-                          (size_t)ctx.capacity_B * sizeof(int)));
-  }
-
-  // Ensure we have at least B streams
-  if (!ctx.streams) {
-    ctx.streams = (hipStream_t *)malloc(sizeof(hipStream_t) * B);
-    ctx.n_streams = 0;
-  } else if (B > ctx.n_streams) {
-    hipStream_t *new_streams = (hipStream_t *)malloc(sizeof(hipStream_t) * B);
-    memcpy(new_streams, ctx.streams, sizeof(hipStream_t) * ctx.n_streams);
-    free(ctx.streams);
-    ctx.streams = new_streams;
-  }
-  for (int i = ctx.n_streams; i < B; ++i) {
-    HIP_CHECK(hipStreamCreateWithFlags(&ctx.streams[i], hipStreamNonBlocking));
-  }
-  if (ctx.n_streams < B)
-    ctx.n_streams = B;
-  int seq_hint = max_seq_hint > 0 ? max_seq_hint : p->seq_len;
-  seq_hint = std::max(1, std::min(seq_hint, p->seq_len));
-
-  const bool need_kv_alloc =
-      !ctx.gpu_activations.d_key_cache || !ctx.gpu_activations.d_value_cache ||
-      ctx.gpu_activations.kv_seq_capacity == 0;
-
-  if (need_kv_alloc) {
-    auto kv_bytes_for_seq = [&](int seq) -> size_t {
-      seq = std::max(1, std::min(seq, p->seq_len));
-      const bool has_window = (p->sliding_window > 0);
-      const int even_layers = has_window ? (p->n_layers + 1) / 2 : 0;
-      const int odd_layers = p->n_layers - even_layers;
-      const int window_tokens = has_window ? std::min(seq, p->sliding_window)
-                                           : seq;
-      const size_t tokens_per_seq =
-          (size_t)odd_layers * seq + (size_t)even_layers * window_tokens;
-      const size_t elems_per_seq = tokens_per_seq * (size_t)KV;
-      return elems_per_seq * (size_t)ctx.capacity_B * sizeof(bf16_t);
-    };
-
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
-
-    constexpr size_t kSafetyMargin = 1024ULL << 20; // 1024 MiB
-    size_t available_for_kv =
-        free_bytes > kSafetyMargin ? free_bytes - kSafetyMargin : 0;
-
-    int target_seq = seq_hint;
-    size_t key_bytes = kv_bytes_for_seq(target_seq);
-
-    while (target_seq > 1 &&
-           (key_bytes == 0 || 2 * key_bytes > available_for_kv)) {
-      const int next_seq = std::max(1, target_seq / 2);
-      if (next_seq == target_seq)
-        break;
-      target_seq = next_seq;
-      key_bytes = kv_bytes_for_seq(target_seq);
-    }
-
-    if (key_bytes == 0 || 2 * key_bytes > available_for_kv) {
-      double need_gib = (2.0 * (double)key_bytes) / (1024.0 * 1024.0 * 1024.0);
-      double avail_gib = (double)available_for_kv /
-                         (1024.0 * 1024.0 * 1024.0);
-      fprintf(stderr,
-              "Unable to allocate KV cache for batch %d: need %.2f GiB, have %.2f GiB\n",
-              ctx.capacity_B, need_gib, avail_gib);
-      exit(EXIT_FAILURE);
-    }
-
-    ctx.gpu_activations.kv_seq_limit = target_seq;
-    int actual_seq = ensure_kv_cache_capacity(ctx, target_seq);
-    ctx.gpu_activations.kv_seq_limit = actual_seq;
-  }
-}
-
-static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
-  const Config *p = model_config;
-  if (!p)
-    return ctx.gpu_activations.kv_seq_capacity;
-
-  int seq_limit_hint = ctx.gpu_activations.kv_seq_limit;
-  if (seq_limit_hint > 0 && required_seq > seq_limit_hint)
-    required_seq = seq_limit_hint;
-
-  required_seq = std::max(1, std::min(required_seq, p->seq_len));
-
-  const bool has_window = (p->sliding_window > 0);
-  const int KV = p->head_dim * p->n_kv_heads;
-  const int L = p->n_layers;
-
-  int current_full = ctx.gpu_activations.kv_seq_capacity;
-  if (current_full >= required_seq && ctx.gpu_activations.d_key_cache &&
-      ctx.gpu_activations.d_value_cache) {
-    return current_full;
-  }
-
-  int target_full = current_full > 0 ? current_full : 1;
-  while (target_full < required_seq) {
-    int grown = target_full * 2;
-    if (grown < required_seq)
-      grown = required_seq;
-    if (seq_limit_hint > 0 && grown > seq_limit_hint)
-      grown = seq_limit_hint;
-    if (grown > p->seq_len)
-      grown = p->seq_len;
-    if (grown == target_full)
-      break;
-    target_full = grown;
-  }
-
-  if (target_full <= current_full && ctx.gpu_activations.d_key_cache &&
-      ctx.gpu_activations.d_value_cache) {
-    if (seq_limit_hint > 0) {
-      ctx.gpu_activations.kv_seq_limit =
-          std::min(seq_limit_hint, ctx.gpu_activations.kv_seq_capacity);
-    } else {
-      ctx.gpu_activations.kv_seq_limit = ctx.gpu_activations.kv_seq_capacity;
-    }
-    return ctx.gpu_activations.kv_seq_capacity;
-  }
-
-  std::vector<uint32_t> old_offsets = ctx.h_kv_layer_offsets;
-  std::vector<int> old_capacity = ctx.h_kv_layer_capacity;
-  const uint32_t old_batch_stride = ctx.gpu_activations.kv_batch_stride;
-  bf16_t *old_key_ptr = ctx.gpu_activations.d_key_cache;
-  bf16_t *old_value_ptr = ctx.gpu_activations.d_value_cache;
-
-  int attempt_full = target_full;
-  int fallback_full = current_full;
-
-  while (attempt_full > fallback_full) {
-    const int window_limit = has_window ? p->sliding_window : attempt_full;
-    const int attempt_window = has_window ? std::min(attempt_full, window_limit)
-                                          : attempt_full;
-
-    std::vector<uint32_t> new_offsets(L + 1, 0);
-    std::vector<int> new_capacity(L, 0);
-
-    size_t accum = 0;
-    for (int l = 0; l < L; ++l) {
-      const bool layer_has_window = has_window && ((l & 1) == 0);
-      const int layer_cap = layer_has_window ? attempt_window : attempt_full;
-      new_offsets[l] = static_cast<uint32_t>(accum);
-      new_capacity[l] = layer_cap;
-      accum += static_cast<size_t>(layer_cap) * KV;
-    }
-    new_offsets[L] = static_cast<uint32_t>(accum);
-
-    const size_t batch_stride_new = accum;
-    const size_t total_elems = (size_t)ctx.capacity_B * batch_stride_new;
-    const size_t total_bytes = total_elems * sizeof(bf16_t);
-
-    bf16_t *new_key = nullptr;
-    hipError_t err_key = hipMalloc(&new_key, total_bytes);
-    if (err_key == hipErrorOutOfMemory) {
-      if (attempt_full == fallback_full + 1) {
-        attempt_full = fallback_full;
-      } else {
-        attempt_full = std::max(fallback_full + 1, attempt_full / 2);
-      }
-      continue;
-    } else if (err_key != hipSuccess) {
-      HIP_CHECK(err_key);
-    }
-    hipError_t err_mem_key = hipMemsetAsync(new_key, 0, total_bytes, 0);
-    if (err_mem_key != hipSuccess) {
-      HIP_CHECK(hipFree(new_key));
-      HIP_CHECK(err_mem_key);
-    }
-
-    bf16_t *new_value = nullptr;
-    hipError_t err_value = hipMalloc(&new_value, total_bytes);
-    if (err_value == hipErrorOutOfMemory) {
-      HIP_CHECK(hipFree(new_key));
-      if (attempt_full == fallback_full + 1) {
-        attempt_full = fallback_full;
-      } else {
-        attempt_full = std::max(fallback_full + 1, attempt_full / 2);
-      }
-      continue;
-    } else if (err_value != hipSuccess) {
-      HIP_CHECK(hipFree(new_key));
-      HIP_CHECK(err_value);
-    }
-    hipError_t err_mem_value = hipMemsetAsync(new_value, 0, total_bytes, 0);
-    if (err_mem_value != hipSuccess) {
-      HIP_CHECK(hipFree(new_key));
-      HIP_CHECK(hipFree(new_value));
-      HIP_CHECK(err_mem_value);
-    }
-
-    if (old_key_ptr && !old_offsets.empty()) {
-      const size_t old_layers = old_capacity.size();
-      for (int l = 0; l < std::min(L, static_cast<int>(old_layers)); ++l) {
-        const int copy_tokens = std::min(old_capacity[l], new_capacity[l]);
-        if (copy_tokens <= 0)
-          continue;
-        const size_t bytes = static_cast<size_t>(copy_tokens) * KV *
-                             sizeof(bf16_t);
-        if (bytes == 0)
-          continue;
-        const size_t src_layer_offset = old_offsets[l];
-        const size_t dst_layer_offset = new_offsets[l];
-        for (int b = 0; b < ctx.capacity_B; ++b) {
-          const bf16_t *src_k = old_key_ptr +
-                                (size_t)b * old_batch_stride + src_layer_offset;
-          bf16_t *dst_k = new_key + (size_t)b * batch_stride_new +
-                           dst_layer_offset;
-          HIP_CHECK(hipMemcpy(dst_k, src_k, bytes, hipMemcpyDeviceToDevice));
-        }
-      }
-    }
-    if (old_value_ptr && !old_offsets.empty()) {
-      const size_t old_layers = old_capacity.size();
-      for (int l = 0; l < std::min(L, static_cast<int>(old_layers)); ++l) {
-        const int copy_tokens = std::min(old_capacity[l], new_capacity[l]);
-        if (copy_tokens <= 0)
-          continue;
-        const size_t bytes = static_cast<size_t>(copy_tokens) * KV *
-                             sizeof(bf16_t);
-        if (bytes == 0)
-          continue;
-        const size_t src_layer_offset = old_offsets[l];
-        const size_t dst_layer_offset = new_offsets[l];
-        for (int b = 0; b < ctx.capacity_B; ++b) {
-          const bf16_t *src_v = old_value_ptr +
-                                (size_t)b * old_batch_stride + src_layer_offset;
-          bf16_t *dst_v = new_value + (size_t)b * batch_stride_new +
-                           dst_layer_offset;
-          HIP_CHECK(hipMemcpy(dst_v, src_v, bytes, hipMemcpyDeviceToDevice));
-        }
-      }
-    }
-
-    if (old_key_ptr)
-      HIP_CHECK(hipFree(old_key_ptr));
-    if (old_value_ptr)
-      HIP_CHECK(hipFree(old_value_ptr));
-
-    if (ctx.d_kv_layer_offsets)
-      HIP_CHECK(hipFree(ctx.d_kv_layer_offsets));
-    if (ctx.d_kv_layer_capacity)
-      HIP_CHECK(hipFree(ctx.d_kv_layer_capacity));
-
-    ctx.h_kv_layer_offsets = new_offsets;
-    ctx.h_kv_layer_capacity = new_capacity;
-
-    const size_t offsets_bytes = ctx.h_kv_layer_offsets.size() *
-                                 sizeof(uint32_t);
-    const size_t capacity_bytes = ctx.h_kv_layer_capacity.size() *
-                                  sizeof(int);
-    HIP_CHECK(hipMalloc(&ctx.d_kv_layer_offsets, offsets_bytes));
-    HIP_CHECK(hipMemcpy(ctx.d_kv_layer_offsets,
-                        ctx.h_kv_layer_offsets.data(), offsets_bytes,
-                        hipMemcpyHostToDevice));
-    HIP_CHECK(hipMalloc(&ctx.d_kv_layer_capacity, capacity_bytes));
-    HIP_CHECK(hipMemcpy(ctx.d_kv_layer_capacity,
-                        ctx.h_kv_layer_capacity.data(), capacity_bytes,
-                        hipMemcpyHostToDevice));
-
-    ctx.gpu_activations.d_key_cache = new_key;
-    ctx.gpu_activations.d_value_cache = new_value;
-    ctx.gpu_activations.kv_seq_capacity = attempt_full;
-    ctx.gpu_activations.kv_window_capacity = attempt_window;
-    ctx.gpu_activations.kv_batch_stride =
-        static_cast<uint32_t>(batch_stride_new);
-    ctx.gpu_activations.kv_seq_limit = attempt_full;
-
-    if (attempt_full < target_full) {
-      printf("[DEVICE] %d reduced KV cache to %d tokens due to allocation limits\n",
-             ctx.device_id, attempt_full);
-    }
-
-    return attempt_full;
-  }
-
-  if (ctx.gpu_activations.d_key_cache && ctx.gpu_activations.d_value_cache) {
-    ctx.gpu_activations.kv_seq_limit =
-        ctx.gpu_activations.kv_seq_capacity;
-    return ctx.gpu_activations.kv_seq_capacity;
-  }
-
-  fprintf(stderr,
-          "Failed to allocate KV cache for device %d (batch=%d, seq=%d)\n",
-          ctx.device_id, ctx.capacity_B, required_seq);
-  exit(EXIT_FAILURE);
 }
 
 static inline void setup_prompt_ctx(PromptCtx &ctx, Requests *requests, int idx,
@@ -1670,7 +1211,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         // Pack rows and meta to contiguous send buffers
         {
           PROFILE_GPU_SCOPE("pack_rows_owner_kernel", 0);
-          dim3 gridPack((H + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, 1);
+          dim3 gridPack((H + BLOCK_SIZE - 1) / BLOCK_SIZE, h_B_local, 1);
           dim3 blockH(BLOCK_SIZE, 1, 1);
           pack_rows_owner_kernel<<<gridPack, blockH, 0, ctx.pack_stream>>>(
               ctx.send_x_peer[owner],
@@ -1735,9 +1276,9 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           // Optional: clear gate_up buffer region (mlp1 will overwrite assigned entries)
           HIP_CHECK(hipMemsetAsync(g_devices[owner].gate_up_owner_per_home[ctx.device_id], 0, (size_t)K * (size_t)h_B_local * (size_t)IM * sizeof(bf16_t), g_devices[owner].mlp_stream));
 
-          const int max_tiles = (h_B_local + MATMUL_MLP1_BLOCK_ROWS - 1) / MATMUL_MLP1_BLOCK_ROWS;
-          dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
-          dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) / MATMUL_MLP1_BLOCK_COLS, max_tiles, E);
+          const int max_tiles = (h_B_local + MATMUL_MLP1_BLOCK_ROWS_120B - 1) / MATMUL_MLP1_BLOCK_ROWS_120B;
+          dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK_120B, 1);
+          dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS_120B - 1) / MATMUL_MLP1_BLOCK_COLS_120B, max_tiles, E_local_layer);
           mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0, g_devices[owner].mlp_stream>>>(
             g_devices[owner].gate_up_owner_per_home[ctx.device_id], 
             g_devices[owner].recv_x_from_home[ctx.device_id],
@@ -1755,9 +1296,9 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         }
         {
           PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
-          const int max_tiles = (h_B_local + MATMUL_MLP2_BLOCK_ROWS - 1) / MATMUL_MLP2_BLOCK_ROWS;
-          dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
-          dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) / MATMUL_MLP2_BLOCK_COLS,
+          const int max_tiles = (h_B_local + MATMUL_MLP2_BLOCK_ROWS_120B - 1) / MATMUL_MLP2_BLOCK_ROWS_120B;
+          dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK_120B, 1);
+          dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS_120B - 1) / MATMUL_MLP2_BLOCK_COLS_120B,
                         max_tiles, E_local_layer);
           mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0, g_devices[owner].mlp_stream>>>(
             g_devices[owner].partial_owner_per_home[ctx.device_id], 
@@ -1811,35 +1352,35 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       bf16_t *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
       HIP_CHECK(hipMemsetAsync(d_gate_up_topk, 0, gate_up_topk_bytes, 0));;
 
-    const int total_pairs = batch_size * p->experts_per_token;
-    int max_assign_per_expert = 0;
-    int total_assignments = 0;
-    dim3 gridCount((total_pairs + 255) / 256, 1, 1);
+      const int total_pairs = batch_size * p->experts_per_token;
+      int max_assign_per_expert = 0;
+      int total_assignments = 0;
+      dim3 gridCount((total_pairs + 255) / 256, 1, 1);
 
-    int *d_expert_counts = expert_ws.d_expert_counts;
-    int *d_expert_offsets = expert_ws.d_expert_offsets;
-    uint16_t *d_assignment_batches = expert_ws.d_assignment_batches;
-    uint8_t *d_assignment_slots = expert_ws.d_assignment_slots;
-    int *h_counts = host_ws.expert_counts;
-    int *h_offsets = host_ws.expert_offsets;
+      int *d_expert_counts = expert_ws.d_expert_counts;
+      int *d_expert_offsets = expert_ws.d_expert_offsets;
+      uint16_t *d_assignment_batches = expert_ws.d_assignment_batches;
+      uint8_t *d_assignment_slots = expert_ws.d_assignment_slots;
+      int *h_counts = host_ws.expert_counts;
+      int *h_offsets = host_ws.expert_offsets;
 
-    if (E > 0) {
-      std::fill_n(h_counts, E, 0);
-      std::fill_n(h_offsets, E + 1, 0);
-    }
+      if (E > 0) {
+        std::fill_n(h_counts, E, 0);
+        std::fill_n(h_offsets, E + 1, 0);
+      }
 
-    if (total_pairs > 0 && E > 0) {
-      {
-        PROFILE_GPU_SCOPE("expert_counting", 0);
-        HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int), 0));
+      if (total_pairs > 0 && E > 0) {
+        {
+          PROFILE_GPU_SCOPE("expert_counting", 0);
+          HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int), 0));
 
-        count_expert_assignments_kernel<<<gridCount, 256, 0>>>(
-            d_expert_counts, ctx.gpu_activations.d_topk_i,
-            ctx.gpu_activations.d_pos, batch_size, p->experts_per_token, E);
-        HIP_CHECK(hipMemcpyAsync(h_counts, d_expert_counts,
-                                 (size_t)E * sizeof(int), hipMemcpyDeviceToHost,
-                                 0));
-        HIP_CHECK(hipStreamSynchronize(0));
+          count_expert_assignments_kernel<<<gridCount, 256, 0>>>(
+              d_expert_counts, ctx.gpu_activations.d_topk_i,
+              ctx.gpu_activations.d_pos, batch_size, p->experts_per_token, E);
+          HIP_CHECK(hipMemcpyAsync(h_counts, d_expert_counts,
+                                  (size_t)E * sizeof(int), hipMemcpyDeviceToHost,
+                                  0));
+          HIP_CHECK(hipStreamSynchronize(0));
 
           for (int e = 0; e < E; ++e) {
             h_offsets[e + 1] = h_offsets[e] + h_counts[e];
@@ -1849,15 +1390,15 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           total_assignments = h_offsets[E];
         }
 
-      if (total_assignments > 0) {
-        {
-          PROFILE_GPU_SCOPE("expert_assignment_building", 0);
-          HIP_CHECK(hipMemcpyAsync(d_expert_offsets, h_offsets,
-                                   (size_t)(E + 1) * sizeof(int),
-                                   hipMemcpyHostToDevice, 0));
+        if (total_assignments > 0) {
+          {
+            PROFILE_GPU_SCOPE("expert_assignment_building", 0);
+            HIP_CHECK(hipMemcpyAsync(d_expert_offsets, h_offsets,
+                                    (size_t)(E + 1) * sizeof(int),
+                                    hipMemcpyHostToDevice, 0));
 
-          HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int),
-                                   0));
+            HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int),
+                                    0));
 
             build_expert_assignments_kernel<<<gridCount, 256, 0>>>(
                 ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos,
@@ -1865,46 +1406,45 @@ static int *gpu_forward_device_batch(Transformer *transformer,
                 d_assignment_slots, batch_size, p->experts_per_token, E);
           }
         }
-      }
 
-      if (total_assignments > 0) {
-        {
-          PROFILE_GPU_SCOPE("mlp1_fused_gemm", 0);
-          const int max_tiles =
-              (max_assign_per_expert + MATMUL_MLP1_BLOCK_ROWS - 1) /
-              MATMUL_MLP1_BLOCK_ROWS;
-          dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
-          dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) /
-                            MATMUL_MLP1_BLOCK_COLS,
-                        max_tiles, E);
-          mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0>>>(
-            d_gate_up_topk, ctx.gpu_activations.d_t,
-            ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.stride_w_mlp1_bf16,
-            ctx.gpu_expert_bias.g_b_mlp1, d_assignment_batches,
-            d_assignment_slots, d_expert_offsets, l, E, H, IM, p->swiglu_limit,
-            batch_size, ctx.gpu_activations.d_pos);
+        if (total_assignments > 0) {
+          {
+            PROFILE_GPU_SCOPE("mlp1_fused_gemm", 0);
+            const int max_tiles =
+                (max_assign_per_expert + MATMUL_MLP1_BLOCK_ROWS - 1) /
+                MATMUL_MLP1_BLOCK_ROWS;
+            dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
+            dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) /
+                              MATMUL_MLP1_BLOCK_COLS,
+                          max_tiles, E);
+            mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0>>>(
+              d_gate_up_topk, ctx.gpu_activations.d_t,
+              ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.stride_w_mlp1_bf16,
+              ctx.gpu_expert_bias.g_b_mlp1, d_assignment_batches,
+              d_assignment_slots, d_expert_offsets, l, E, H, IM, p->swiglu_limit,
+              batch_size, ctx.gpu_activations.d_pos);
+          }
+
+          {
+            PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm", 0);
+            const int max_tiles =
+                (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
+                MATMUL_MLP2_BLOCK_ROWS;
+            dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
+            dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
+                              MATMUL_MLP2_BLOCK_COLS,
+                          max_tiles, E);
+            mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0>>>(
+              ctx.gpu_activations.d_e_agg, d_gate_up_topk,
+              ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.stride_w_mlp2_bf16,
+              ctx.gpu_expert_bias.g_b_mlp2, d_assignment_batches,
+              d_assignment_slots, d_expert_offsets, ctx.gpu_activations.d_topk_v, l,
+              E, IM, H, batch_size, ctx.gpu_activations.d_pos);
+          }
         }
+      } // End of if total_pairs > 0 && E > 0
 
-      {
-        PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm", 0);
-        const int max_tiles =
-            (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
-            MATMUL_MLP2_BLOCK_ROWS;
-        dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
-        dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
-                           MATMUL_MLP2_BLOCK_COLS,
-                       max_tiles, E);
-        mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0>>>(
-          ctx.gpu_activations.d_e_agg, d_gate_up_topk,
-          ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.stride_w_mlp2_bf16,
-          ctx.gpu_expert_bias.g_b_mlp2, d_assignment_batches,
-          d_assignment_slots, d_expert_offsets, ctx.gpu_activations.d_topk_v, l,
-          E, IM, H, batch_size, ctx.gpu_activations.d_pos);
-      }
-    }
-
-    // Keep workspace allocated in DeviceContext for reuse
-
+    } // End of local MoE compute
     {
       PROFILE_GPU_SCOPE("residual_add_batch_kernel", 0);
       dim3 gridH_batch(gridH_thread.x, batch_size, 1);
@@ -1912,7 +1452,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg, H, batch_size,
           ctx.gpu_activations.d_pos);
     }
-
   // Close per-layer loop
   }
 
