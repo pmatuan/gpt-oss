@@ -301,7 +301,7 @@ static float benchmark_kernel(const std::function<void()> &launch, int warmup,
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
-__global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv_variant(
+__global__ void matmul_bias_qkv_kernel_variant(
     bf16_t *y, const bf16_t *x, const bf16_t *w, const float *bias, int n,
     int d, int B, const int *pos) {
   matmul_bias_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
@@ -321,7 +321,7 @@ static float launch_qkv_kernel(bf16_t *y, const bf16_t *x, const bf16_t *w,
   dim3 grid((d + BLOCK_COLS - 1) / BLOCK_COLS,
             (B + BLOCK_ROWS - 1) / BLOCK_ROWS, 1);
   dim3 block(WF_SIZE, WAVES_PER_BLOCK, 1);
-  hipLaunchKernelGGL((matmul_bias_gemm_kernel_bf16_mfma_qkv_variant<
+  hipLaunchKernelGGL((matmul_bias_qkv_kernel_variant<
                           BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                           WARP_TILE_N>),
                      grid, block, 0, stream, y, x, w, bias, n, d, B, pos);
@@ -351,7 +351,7 @@ static MatmulQKVCandidate make_qkv_candidate_default() {
     dim3 grid((d + MATMUL_QKV_BLOCK_COLS - 1) / MATMUL_QKV_BLOCK_COLS,
               (B + MATMUL_QKV_BLOCK_ROWS - 1) / MATMUL_QKV_BLOCK_ROWS, 1);
     dim3 block(WF_SIZE, MATMUL_QKV_WAVES_PER_BLOCK, 1);
-    hipLaunchKernelGGL(matmul_bias_gemm_kernel_bf16_mfma_qkv, grid, block, 0,
+    hipLaunchKernelGGL(matmul_bias_qkv_kernel, grid, block, 0,
                        stream, y, x, w, bias, n, d, B, pos);
     return 0.0f;
   };
@@ -375,7 +375,7 @@ MatmulQKVCandidate make_qkv_candidate(const char *prefix) {
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
-__global__ void matmul_bias_gemm_kernel_bf16_mfma_att_variant(
+__global__ void matmul_bias_att_kernel_variant(
     bf16_t *y, const bf16_t *x, const bf16_t *w, const float *bias, int n,
     int d, int B, const int *pos) {
   matmul_bias_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
@@ -395,7 +395,7 @@ static float launch_att_kernel(bf16_t *y, const bf16_t *x, const bf16_t *w,
   dim3 grid((d + BLOCK_COLS - 1) / BLOCK_COLS,
             (B + BLOCK_ROWS - 1) / BLOCK_ROWS, 1);
   dim3 block(WF_SIZE, WAVES_PER_BLOCK, 1);
-  hipLaunchKernelGGL((matmul_bias_gemm_kernel_bf16_mfma_att_variant<
+  hipLaunchKernelGGL((matmul_bias_att_kernel_variant<
                           BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                           WARP_TILE_N>),
                      grid, block, 0, stream, y, x, w, bias, n, d, B, pos);
@@ -417,7 +417,7 @@ static MatmulATTCandidate make_att_candidate_default() {
     dim3 grid((d + MATMUL_ATT_BLOCK_COLS - 1) / MATMUL_ATT_BLOCK_COLS,
               (B + MATMUL_ATT_BLOCK_ROWS - 1) / MATMUL_ATT_BLOCK_ROWS, 1);
     dim3 block(WF_SIZE, MATMUL_ATT_WAVES_PER_BLOCK, 1);
-    hipLaunchKernelGGL(matmul_bias_gemm_kernel_bf16_mfma_att, grid, block, 0,
+    hipLaunchKernelGGL(matmul_bias_att_kernel, grid, block, 0,
                        stream, y, x, w, bias, n, d, B, pos);
     return 0.0f;
   };
@@ -441,7 +441,7 @@ MatmulATTCandidate make_att_candidate(const char *prefix) {
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
-__global__ void matmul_gemm_kernel_bf16_mfma_variant(float *y,
+__global__ void matmul_logits_kernel_variant(float *y,
                                                      const bf16_t *x,
                                                      const bf16_t *w, int n,
                                                      int d, int B,
@@ -465,7 +465,7 @@ static float launch_logits_kernel(float *y, const bf16_t *x, const bf16_t *w,
   dim3 grid((d + BLOCK_COLS - 1) / BLOCK_COLS,
             (B + BLOCK_ROWS - 1) / BLOCK_ROWS, 1);
   dim3 block(WF_SIZE, WAVES_PER_BLOCK, 1);
-  hipLaunchKernelGGL((matmul_gemm_kernel_bf16_mfma_variant<
+  hipLaunchKernelGGL((matmul_logits_kernel_variant<
                           BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                           WARP_TILE_N>),
                      grid, block, 0, stream, y, x, w, n, d, B, pos);
@@ -487,7 +487,7 @@ static MatmulLogitsCandidate make_logits_candidate_default() {
               (B + MATMUL_LOGITS_BLOCK_ROWS - 1) / MATMUL_LOGITS_BLOCK_ROWS,
               1);
     dim3 block(WF_SIZE, MATMUL_LOGITS_WAVES_PER_BLOCK, 1);
-    hipLaunchKernelGGL(matmul_gemm_kernel_bf16_mfma, grid, block, 0, stream, y,
+    hipLaunchKernelGGL(matmul_logits_kernel, grid, block, 0, stream, y,
                        x, w, n, d, B, pos);
     return 0.0f;
   };
@@ -553,13 +553,13 @@ static MoeAssignments build_moe_assignments(int B, int experts,
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N, int WAVES_PER_BLOCK>
-__global__ void mlp1_fused_gemm_kernel_variant(
+__global__ void mlp1_kernel_variant(
     bf16_t *gate_up_topk, const bf16_t *x, const bf16_t *w_mlp1_all,
     size_t stride_w_mlp1, const bf16_t *b_mlp1_all,
     const uint16_t *assignment_batches, const uint8_t *assignment_slots,
     const int *expert_offsets, int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size, const int *pos) {
-  mlp1_fused_gemm_kernel_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH,
+  mlp1_kernel_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH,
                               WARP_TILE_M, WARP_TILE_N, WAVES_PER_BLOCK>(
       gate_up_topk, x, w_mlp1_all, stride_w_mlp1, b_mlp1_all,
       assignment_batches, assignment_slots, expert_offsets, l_layer, E, H, IM,
@@ -587,7 +587,7 @@ static float launch_mlp1_kernel(
       (max_assign_per_expert + BLOCK_ROWS - 1) / BLOCK_ROWS;
   dim3 grid((2 * IM + BLOCK_COLS - 1) / BLOCK_COLS, max_tiles, E);
   dim3 block(WF_SIZE, WAVES_PER_BLOCK, 1);
-  hipLaunchKernelGGL((mlp1_fused_gemm_kernel_variant<
+  hipLaunchKernelGGL((mlp1_kernel_variant<
                           BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                           WARP_TILE_N, WAVES_PER_BLOCK>),
                      grid, block, 0, stream, gate_up_topk, x, w_mlp1_all,
@@ -622,7 +622,7 @@ static MLP1Candidate make_mlp1_candidate_default() {
                   MATMUL_MLP1_BLOCK_COLS,
               max_tiles, E);
     dim3 block(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
-    hipLaunchKernelGGL(mlp1_fused_gemm_kernel, grid, block, 0, stream,
+    hipLaunchKernelGGL(mlp1_kernel, grid, block, 0, stream,
                        gate_up_topk, x, w_mlp1_all, stride_w_mlp1, b_mlp1_all,
                        assignment_batches, assignment_slots, expert_offsets,
                        l_layer, E, H, IM, swiglu_limit, batch_size, pos);
@@ -657,13 +657,13 @@ MLP1Candidate make_mlp1_candidate(const char *prefix) {
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N, int WAVES_PER_BLOCK>
-__global__ void mlp2_bias_weighted_accum_gemm_kernel_variant(
+__global__ void mlp2_kernel_variant(
     float *e_agg, const bf16_t *gate_up_topk, const bf16_t *w_mlp2_all,
     size_t stride_w_mlp2, const bf16_t *b_mlp2_all,
     const uint16_t *assignment_batches, const uint8_t *assignment_slots,
     const int *expert_offsets, const float *topk_v, int l_layer, int E, int IM,
     int H, int batch_size, const int *pos) {
-  mlp2_bias_weighted_accum_gemm_kernel_body<
+  mlp2_kernel_body<
       BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M, WARP_TILE_N,
       WAVES_PER_BLOCK>(e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2,
                        b_mlp2_all, assignment_batches, assignment_slots,
@@ -692,7 +692,7 @@ static float launch_mlp2_kernel(
       (max_assign_per_expert + BLOCK_ROWS - 1) / BLOCK_ROWS;
   dim3 grid((H + BLOCK_COLS - 1) / BLOCK_COLS, max_tiles, E);
   dim3 block(WF_SIZE, WAVES_PER_BLOCK, 1);
-  hipLaunchKernelGGL((mlp2_bias_weighted_accum_gemm_kernel_variant<
+  hipLaunchKernelGGL((mlp2_kernel_variant<
                           BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                           WARP_TILE_N, WAVES_PER_BLOCK>),
                      grid, block, 0, stream, e_agg, gate_up_topk, w_mlp2_all,
@@ -727,7 +727,7 @@ static MLP2Candidate make_mlp2_candidate_default() {
     dim3 grid((H + MATMUL_MLP2_BLOCK_COLS - 1) / MATMUL_MLP2_BLOCK_COLS,
               max_tiles, E);
     dim3 block(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
-    hipLaunchKernelGGL(mlp2_bias_weighted_accum_gemm_kernel, grid, block, 0,
+    hipLaunchKernelGGL(mlp2_kernel, grid, block, 0,
                        stream, e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2,
                        b_mlp2_all, assignment_batches, assignment_slots,
                        expert_offsets, topk_v, l_layer, E, IM, H, batch_size,

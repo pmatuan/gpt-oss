@@ -4,7 +4,7 @@
 #include "../common/defines.h"
 
 // Bias variants tuned for QKV and attention output projections
-__global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv(
+__global__ void matmul_bias_qkv_kernel(
     bf16_t* __restrict__ y,         // [B x d]
     const bf16_t* __restrict__ x,   // [B x n] (bf16)
     const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
@@ -12,7 +12,7 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv(
     int n, int d, int B,
     const int* __restrict__ pos);
 
-__global__ void matmul_bias_gemm_kernel_bf16_mfma_att(
+__global__ void matmul_bias_att_kernel(
     bf16_t* __restrict__ y,         // [B x d]
     const bf16_t* __restrict__ x,   // [B x n] (bf16)
     const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
@@ -21,14 +21,14 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma_att(
     const int* __restrict__ pos);
 
 // No-bias variant: Y = X @ W^T
-__global__ void matmul_gemm_kernel_bf16_mfma(
+__global__ void matmul_logits_kernel(
     float* __restrict__ y,          // [B x d]
     const bf16_t* __restrict__ x,   // [B x n] (bf16)
     const bf16_t* __restrict__ w,   // [d x n] (bf16 packed)
     int n, int d, int B,
     const int* __restrict__ pos);
 
-__global__ void matmul_bias_gemm_kernel_float(
+__global__ void matmul_router_kernel(
     float* __restrict__ y,          // [B, d]
     const bf16_t* __restrict__ x,   // [B, n] (bf16)
     const float* __restrict__ w,    // [d, n] (row-major theo n)
@@ -36,7 +36,7 @@ __global__ void matmul_bias_gemm_kernel_float(
     int n, int d, int batch_size, const int *pos);
 
 __global__ void
-mlp1_fused_gemm_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]
+mlp1_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]
                        const bf16_t *__restrict__ x,          // [B, H] (bf16)
                        const bf16_t *__restrict__ w_mlp1_all, // [L, E, 2*IM, H]
                        size_t stride_w_mlp1,
@@ -47,7 +47,7 @@ mlp1_fused_gemm_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]
                        int E, int H, int IM, float swiglu_limit, int batch_size,
                        const int *pos);
 
-__global__ void mlp2_bias_weighted_accum_gemm_kernel(
+__global__ void mlp2_kernel(
     float *__restrict__ e_agg,             // [B, H]
     const bf16_t *__restrict__ gate_up_topk, // [K, B, IM]
     const bf16_t *__restrict__ w_mlp2_all,  // [L, E, H, IM]
