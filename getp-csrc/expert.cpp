@@ -735,6 +735,12 @@ static void cleanup_device_context_ep(DeviceContext &ctx) {
 }
 
 static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_limit, const int H, const int IM, const int E, const int L, const int K, int batch_size, int layer) {
+  // Ensure router outputs computed on default stream are visible before routing on pack_stream
+  hipEvent_t router_ready_evt;
+  HIP_CHECK(hipEventCreateWithFlags(&router_ready_evt, hipEventDisableTiming));
+  HIP_CHECK(hipEventRecord(router_ready_evt, 0 /* default stream */));
+  HIP_CHECK(hipStreamWaitEvent(ctx.pack_stream, router_ready_evt, 0));
+  HIP_CHECK(hipEventDestroy(router_ready_evt));
   // For each owner, count -> scan -> pack -> bulk copy
   dim3 blockB(256, 1, 1);
   dim3 gridB((batch_size + 255) / 256, 1, 1);
