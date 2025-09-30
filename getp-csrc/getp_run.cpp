@@ -343,13 +343,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
                   max_assignment_pairs * sizeof(uint8_t)));
   }
 
-  // Initialize streams for batch processing
-  ctx.streams = (hipStream_t *)malloc(sizeof(hipStream_t) * B);
-  ctx.n_streams = B;
-  for (int i = 0; i < B; ++i) {
-    HIP_CHECK(hipStreamCreateWithFlags(&ctx.streams[i], hipStreamNonBlocking));
-  }
-
   debug_print_gpu_memory("after activations", device_id);
 
   // Weights (small FP32)
@@ -581,14 +574,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
   if (ctx.host_pinned_batch.expert_offsets)
     HIP_CHECK(hipHostFree(ctx.host_pinned_batch.expert_offsets));
   ctx.host_pinned_batch = HostPinnedBatchBuffers{};
-
-  if (ctx.streams) {
-    for (int i = 0; i < ctx.n_streams; ++i)
-      HIP_CHECK(hipStreamDestroy(ctx.streams[i]));
-    free(ctx.streams);
-    ctx.streams = nullptr;
-    ctx.n_streams = 0;
-  }
 
   HIP_CHECK(hipFree(ctx.gpu_weights_fp32.d_rms_attn_w));
   HIP_CHECK(hipFree(ctx.gpu_weights_fp32.d_rms_ffn_w));
