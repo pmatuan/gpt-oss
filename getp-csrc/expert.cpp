@@ -879,7 +879,7 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
 
     // Launch MLP on owner after the copies complete (enqueue on owner's mlp_stream)
     {
-      PROFILE_GPU_SCOPE("mlp1_fused_gemm_kernel", 0);
+      PROFILE_GPU_SCOPE("mlp1_kernel", 0);
       // For simplicity, reuse counts buffer by copying from offsets diff
       int *d_owner_offsets = g_devices[owner].owner_receive_buffers.recv_expert_offsets[ctx.device_id];
       // Clear owner-side buffers before compute to avoid stale data
@@ -890,7 +890,7 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
       const int max_tiles = (h_B_local + MATMUL_MLP1_BLOCK_ROWS_120B - 1) / MATMUL_MLP1_BLOCK_ROWS_120B;
       dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK_120B, 1);
       dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS_120B - 1) / MATMUL_MLP1_BLOCK_COLS_120B, max_tiles, E_local_layer);
-      mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0, g_devices[owner].mlp_stream>>>(
+      mlp1_kernel<<<grid_mlp1, block_mlp1, 0, g_devices[owner].mlp_stream>>>(
         g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id], 
         g_devices[owner].owner_receive_buffers.recv_x_from_home[ctx.device_id],
         g_devices[owner].gpu_weights_bf16.d_w_mlp1_bf16, 
@@ -906,12 +906,12 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
         g_devices[owner].owner_receive_buffers.recv_pos_from_home[ctx.device_id]);
     }
     {
-      PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm_kernel", 0);
+      PROFILE_GPU_SCOPE("mlp2_kernel", 0);
       const int max_tiles = (h_B_local + MATMUL_MLP2_BLOCK_ROWS_120B - 1) / MATMUL_MLP2_BLOCK_ROWS_120B;
       dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK_120B, 1);
       dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS_120B - 1) / MATMUL_MLP2_BLOCK_COLS_120B,
                     max_tiles, E_local_layer);
-      mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0, g_devices[owner].mlp_stream>>>(
+      mlp2_kernel<<<grid_mlp2, block_mlp2, 0, g_devices[owner].mlp_stream>>>(
         g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id], 
         g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id],
         g_devices[owner].gpu_weights_bf16.d_w_mlp2_bf16, 

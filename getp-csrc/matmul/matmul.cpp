@@ -334,7 +334,7 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
   }
 }
 
-__global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv(
+__global__ void matmul_bias_qkv_kernel(
     bf16_t *__restrict__ y, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w, const float *__restrict__ bias,
     int n, int d, int B, const int *__restrict__ pos) {
@@ -344,7 +344,7 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma_qkv(
       y, x, w, bias, n, d, B, pos);
 }
 
-__global__ void matmul_bias_gemm_kernel_bf16_mfma_att(
+__global__ void matmul_bias_att_kernel(
     bf16_t *__restrict__ y, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w, const float *__restrict__ bias,
     int n, int d, int B, const int *__restrict__ pos) {
@@ -354,7 +354,7 @@ __global__ void matmul_bias_gemm_kernel_bf16_mfma_att(
       y, x, w, bias, n, d, B, pos);
 }
 
-__global__ void matmul_gemm_kernel_bf16_mfma(
+__global__ void matmul_logits_kernel(
     float *__restrict__ y, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w, int n, int d, int B,
     const int *__restrict__ pos) {
@@ -371,7 +371,7 @@ __global__ void matmul_gemm_kernel_bf16_mfma(
  * Grid: (ceil(d/TM), B)
  */
  __global__ __launch_bounds__(BLOCK_SIZE, 1)
-void matmul_bias_gemm_kernel_float(
+void matmul_router_kernel(
     float* __restrict__ y,          // [B, d]
     const bf16_t* __restrict__ x,   // [B, n] (bf16)
      const float* __restrict__ w,    // [d, n] (row-major theo n)
@@ -457,7 +457,7 @@ template <
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
   int WARP_TILE_M, int WARP_TILE_N, int WAVES_PER_BLOCK
 >
-__device__ __forceinline__ void mlp1_fused_gemm_kernel_body(
+__device__ __forceinline__ void mlp1_kernel_body(
     bf16_t *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
     const bf16_t *__restrict__ b_mlp1_all,
@@ -678,7 +678,7 @@ __device__ __forceinline__ void mlp1_fused_gemm_kernel_body(
   }
 }
 
-__global__ void mlp1_fused_gemm_kernel(
+__global__ void mlp1_kernel(
     bf16_t *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
     const bf16_t *__restrict__ b_mlp1_all,
@@ -686,7 +686,7 @@ __global__ void mlp1_fused_gemm_kernel(
     const uint8_t *__restrict__ assignment_slots,
     const int *__restrict__ expert_offsets, int l_layer, int E, int H, int IM,
     float swiglu_limit, int batch_size, const int *__restrict__ pos) {
-  mlp1_fused_gemm_kernel_body<
+  mlp1_kernel_body<
       MATMUL_MLP1_BLOCK_ROWS, MATMUL_MLP1_BLOCK_COLS, MATMUL_MLP1_BLOCK_DEPTH,
       MATMUL_MLP1_WARP_TILE_M, MATMUL_MLP1_WARP_TILE_N,
       MATMUL_MLP1_WAVES_PER_BLOCK>(
@@ -701,7 +701,7 @@ template <
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
   int WARP_TILE_M, int WARP_TILE_N, int WAVES_PER_BLOCK
 >
-__device__ __forceinline__ void mlp2_bias_weighted_accum_gemm_kernel_body(
+__device__ __forceinline__ void mlp2_kernel_body(
     float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const bf16_t *__restrict__ b_mlp2_all,
@@ -912,7 +912,7 @@ __device__ __forceinline__ void mlp2_bias_weighted_accum_gemm_kernel_body(
     }
   }
 }
-__global__ void mlp2_bias_weighted_accum_gemm_kernel(
+__global__ void mlp2_kernel(
     float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const bf16_t *__restrict__ b_mlp2_all,
@@ -921,7 +921,7 @@ __global__ void mlp2_bias_weighted_accum_gemm_kernel(
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size,
     const int *__restrict__ pos) {
-  mlp2_bias_weighted_accum_gemm_kernel_body<
+  mlp2_kernel_body<
       MATMUL_MLP2_BLOCK_ROWS, MATMUL_MLP2_BLOCK_COLS, MATMUL_MLP2_BLOCK_DEPTH,
       MATMUL_MLP2_WARP_TILE_M, MATMUL_MLP2_WARP_TILE_N,
       MATMUL_MLP2_WAVES_PER_BLOCK>(

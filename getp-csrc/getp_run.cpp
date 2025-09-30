@@ -558,13 +558,13 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
       // Then apply MatMul + Bias
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma_qkv", 0);
+        PROFILE_GPU_SCOPE("matmul_bias_qkv_kernel", 0);
         dim3 gridQKV_gemm(
             (QKV_D + MATMUL_QKV_BLOCK_COLS - 1) / MATMUL_QKV_BLOCK_COLS,
             (batch_size + MATMUL_QKV_BLOCK_ROWS - 1) / MATMUL_QKV_BLOCK_ROWS,
             1);
         dim3 blockQKV(WF_SIZE, MATMUL_QKV_WAVES_PER_BLOCK, 1);
-        matmul_bias_gemm_kernel_bf16_mfma_qkv<<<gridQKV_gemm, blockQKV>>>(
+        matmul_bias_qkv_kernel<<<gridQKV_gemm, blockQKV>>>(
             ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_t,
             ctx.gpu_weights_bf16.d_w_qkv_bf16 + (size_t)l * ctx.stride_w_qkv_bf16,
@@ -629,13 +629,13 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
-        PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_bf16_mfma_att", 0);
+        PROFILE_GPU_SCOPE("matmul_bias_att_kernel", 0);
         dim3 gridO_gemm(
             (H + MATMUL_ATT_BLOCK_COLS - 1) / MATMUL_ATT_BLOCK_COLS,
             (batch_size + MATMUL_ATT_BLOCK_ROWS - 1) / MATMUL_ATT_BLOCK_ROWS,
             1);
         dim3 blockO(WF_SIZE, MATMUL_ATT_WAVES_PER_BLOCK, 1);
-        matmul_bias_gemm_kernel_bf16_mfma_att<<<gridO_gemm, blockO>>>(
+        matmul_bias_att_kernel<<<gridO_gemm, blockO>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_tb,
             ctx.gpu_weights_bf16.d_w_o_bf16 + (size_t)l * ctx.stride_w_o_bf16,
             ctx.gpu_weights_fp32.d_b_o + l * H, O_N, H, batch_size,
@@ -663,9 +663,9 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     }
 
     {
-      PROFILE_GPU_SCOPE("matmul_bias_gemm_kernel_float", 0);
+      PROFILE_GPU_SCOPE("matmul_router_kernel", 0);
       dim3 gridE_gemm((E + TM - 1) / TM, batch_size, 1);
-      matmul_bias_gemm_kernel_float<<<gridE_gemm, block, 0>>>(
+      matmul_router_kernel<<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
           ctx.gpu_weights_fp32.d_w_router + (size_t)l * H * E,
           ctx.gpu_weights_fp32.d_b_router + l * E, H, E, batch_size,
@@ -771,7 +771,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
             dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) /
                               MATMUL_MLP1_BLOCK_COLS,
                           max_tiles, E);
-            mlp1_fused_gemm_kernel<<<grid_mlp1, block_mlp1, 0>>>(
+            mlp1_kernel<<<grid_mlp1, block_mlp1, 0>>>(
               d_gate_up_topk, ctx.gpu_activations.d_t,
               ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.stride_w_mlp1_bf16,
               ctx.gpu_expert_bias.g_b_mlp1, d_assignment_batches,
@@ -788,7 +788,7 @@ static int *gpu_forward_device_batch(Transformer *transformer,
             dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
                               MATMUL_MLP2_BLOCK_COLS,
                           max_tiles, E);
-            mlp2_bias_weighted_accum_gemm_kernel<<<grid_mlp2, block_mlp2, 0>>>(
+            mlp2_kernel<<<grid_mlp2, block_mlp2, 0>>>(
               ctx.gpu_activations.d_e_agg, d_gate_up_topk,
               ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.stride_w_mlp2_bf16,
               ctx.gpu_expert_bias.g_b_mlp2, d_assignment_batches,
@@ -822,13 +822,13 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
     // 2) MatMul for logits - separate GEMM version (no bias)
     {
-      PROFILE_GPU_SCOPE("matmul_gemm_kernel_bf16_mfma", 0);
+      PROFILE_GPU_SCOPE("matmul_logits_kernel", 0);
       dim3 gridV_gemm(
           (V + MATMUL_LOGITS_BLOCK_COLS - 1) / MATMUL_LOGITS_BLOCK_COLS,
           (batch_size + MATMUL_LOGITS_BLOCK_ROWS - 1) / MATMUL_LOGITS_BLOCK_ROWS,
           1);
       dim3 blockV(WF_SIZE, MATMUL_LOGITS_WAVES_PER_BLOCK, 1);
-      matmul_gemm_kernel_bf16_mfma<<<gridV_gemm, blockV>>>(
+      matmul_logits_kernel<<<gridV_gemm, blockV>>>(
           ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
           ctx.gpu_weights_bf16.d_out_bf16, H, V, batch_size,
           ctx.gpu_activations.d_pos);
