@@ -695,6 +695,23 @@ __global__ void mlp1_kernel(
       l_layer, E, H, IM, swiglu_limit, batch_size, pos);
 }
 
+__global__ void mlp1_120b_kernel(
+  bf16_t *__restrict__ gate_up_topk, const bf16_t *__restrict__ x,
+  const bf16_t *__restrict__ w_mlp1_all, size_t stride_w_mlp1,
+  const bf16_t *__restrict__ b_mlp1_all,
+  const uint16_t *__restrict__ assignment_batches,
+  const uint8_t *__restrict__ assignment_slots,
+  const int *__restrict__ expert_offsets, int l_layer, int E, int H, int IM,
+  float swiglu_limit, int batch_size, const int *__restrict__ pos) {
+mlp1_kernel_body<
+    MATMUL_MLP1_BLOCK_ROWS_120B, MATMUL_MLP1_BLOCK_COLS_120B, MATMUL_MLP1_BLOCK_DEPTH_120B,
+    MATMUL_MLP1_WARP_TILE_M_120B, MATMUL_MLP1_WARP_TILE_N_120B,
+    MATMUL_MLP1_WAVES_PER_BLOCK_120B>(
+    gate_up_topk, x, w_mlp1_all, stride_w_mlp1, b_mlp1_all,
+    assignment_batches, assignment_slots, expert_offsets,
+    l_layer, E, H, IM, swiglu_limit, batch_size, pos);
+}
+
 // ============ MLP2 (weighted accum) : batched per expert ==============
 
 template <
@@ -928,4 +945,22 @@ __global__ void mlp2_kernel(
       e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
       assignment_batches, assignment_slots, expert_offsets, topk_v,
       l_layer, E, IM, H, batch_size, pos);
+}
+
+__global__ void mlp2_120b_kernel(
+  float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
+  const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
+  const bf16_t *__restrict__ b_mlp2_all,
+  const uint16_t *__restrict__ assignment_batches,
+  const uint8_t *__restrict__ assignment_slots,
+  const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
+  int l_layer, int E, int IM, int H, int batch_size,
+  const int *__restrict__ pos) {
+mlp2_kernel_body<
+    MATMUL_MLP2_BLOCK_ROWS_120B, MATMUL_MLP2_BLOCK_COLS_120B, MATMUL_MLP2_BLOCK_DEPTH_120B,
+    MATMUL_MLP2_WARP_TILE_M_120B, MATMUL_MLP2_WARP_TILE_N_120B,
+    MATMUL_MLP2_WAVES_PER_BLOCK_120B>(
+    e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
+    assignment_batches, assignment_slots, expert_offsets, topk_v,
+    l_layer, E, IM, H, batch_size, pos);
 }
