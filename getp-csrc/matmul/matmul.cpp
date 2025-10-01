@@ -223,6 +223,10 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
 
   __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
   __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
+  __shared__ size_t sh_row_offsets[BLOCK_ROWS];
+  __shared__ uint8_t sh_row_active[BLOCK_ROWS];
+  __shared__ size_t sh_col_offsets[BLOCK_COLS];
+  __shared__ uint8_t sh_col_active[BLOCK_COLS];
 
   f32x4 acc[SUB_TILES_M * SUB_TILES_N];
 #pragma unroll
@@ -233,24 +237,67 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
 
   const int tiles_k_total = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
   const int total_tiles_k = (n + BLOCK_DEPTH - 1) / BLOCK_DEPTH;
+  const size_t weight_tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
+  const size_t group_stride = (size_t)MATMUL_TILE_COLS * MATMUL_CHUNK_K;
+
+  for (int row = tid_linear; row < BLOCK_ROWS; row += threads_per_block) {
+    const int global_row = block_m + row;
+    bool active = (global_row < B);
+    if (active && has_pos) active = (pos[global_row] >= 0);
+    sh_row_active[row] = static_cast<uint8_t>(active);
+    sh_row_offsets[row] = active ? (size_t)global_row * (size_t)n : 0;
+  }
+
+  for (int col = tid_linear; col < BLOCK_COLS; col += threads_per_block) {
+    const int global_col = block_n + col;
+    const bool active = (global_col < d);
+    sh_col_active[col] = static_cast<uint8_t>(active);
+    size_t offset = 0;
+    if (active) {
+      const int tile_col = global_col / MATMUL_TILE_COLS;
+      const int row_in_tile = global_col - tile_col * MATMUL_TILE_COLS;
+      offset = ((size_t)tile_col * (size_t)tiles_k_total) * weight_tile_elems +
+               (size_t)row_in_tile * MATMUL_CHUNK_K;
+    }
+    sh_col_offsets[col] = offset;
+  }
+
+  __syncthreads();
 
   for (int tile_idx = 0; tile_idx < total_tiles_k; ++tile_idx) {
     const int k_base = tile_idx * BLOCK_DEPTH;
+
+    int k_lut[K_QUADS];
+    int tile_k_lut[K_QUADS];
+    int group_lut[K_QUADS];
+    int within_lut[K_QUADS];
+    int valid_lut[K_QUADS];
+#pragma unroll
+    for (int quad = 0; quad < K_QUADS; ++quad) {
+      const int k_local = k_base + quad * MATMUL_CHUNK_K;
+      k_lut[quad] = k_local;
+      const int tile_k = k_local / MATMUL_TILE_K;
+      tile_k_lut[quad] = tile_k;
+      const int k_in_tile = k_local - tile_k * MATMUL_TILE_K;
+      const int group = k_in_tile / MATMUL_CHUNK_K;
+      group_lut[quad] = group;
+      within_lut[quad] = k_in_tile - group * MATMUL_CHUNK_K;
+      const int remaining = n - k_local;
+      valid_lut[quad] = remaining >= MATMUL_CHUNK_K
+                            ? MATMUL_CHUNK_K
+                            : (remaining > 0 ? remaining : 0);
+    }
 
     const int total_a_quads = BLOCK_ROWS * K_QUADS;
     for (int linear = tid_linear; linear < total_a_quads; linear += threads_per_block) {
       const int row  = linear / K_QUADS;
       const int quad = linear - row * K_QUADS;
-      const int global_row = block_m + row;
-      const int k   = k_base + quad * MATMUL_CHUNK_K;
-      const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
-                                                    : (remaining > 0 ? remaining : 0);
-      const bool row_in_range = (global_row < B);
-      const bool row_active = row_in_range && (!has_pos || pos[global_row] >= 0);
+      const int valid = valid_lut[quad];
+      const bool row_active = sh_row_active[row];
       s16x4 val = {0,0,0,0};
       if (row_active && valid > 0) {
-        const uint16_t *src = x_u16 + (size_t)global_row * (size_t)n + (size_t)k;
+        const size_t row_offset = sh_row_offsets[row];
+        const uint16_t *src = x_u16 + row_offset + (size_t)k_lut[quad];
         val = load_bf16x4(src, valid);
       }
       sh_A[row * LDS_STRIDE + quad] = val;
@@ -260,26 +307,14 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
     for (int linear = tid_linear; linear < total_b_quads; linear += threads_per_block) {
       const int col  = linear / K_QUADS;
       const int quad = linear - col * K_QUADS;
-      const int global_col = block_n + col;
-      const int k   = k_base + quad * MATMUL_CHUNK_K;
-      const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
-                                                    : (remaining > 0 ? remaining : 0);
+      const int valid = valid_lut[quad];
       s16x4 val = {0,0,0,0};
-      if (global_col < d && valid > 0) {
-        const int tile_col   = global_col / MATMUL_TILE_COLS;
-        const int row_in_tile= global_col - tile_col * MATMUL_TILE_COLS;
-        const int tile_k     = k / MATMUL_TILE_K;
-        const int k_in_tile  = k - tile_k * MATMUL_TILE_K;
-        const int group      = k_in_tile / MATMUL_CHUNK_K;
-        const int within     = k_in_tile - group * MATMUL_CHUNK_K;
-
-        const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
-        const size_t tile_base  = ((size_t)tile_col * tiles_k_total + tile_k) * tile_elems;
-        const size_t group_base = (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-
-        const uint16_t *src_u16 = w_u16 + tile_base + group_base +
-            (size_t)row_in_tile * MATMUL_CHUNK_K + within;
+      if (sh_col_active[col] && valid > 0) {
+        const size_t col_offset = sh_col_offsets[col];
+        const size_t tile_k_base = (size_t)tile_k_lut[quad] * weight_tile_elems;
+        const size_t group_base = (size_t)group_lut[quad] * group_stride;
+        const uint16_t *src_u16 = w_u16 + col_offset + tile_k_base +
+                                  group_base + (size_t)within_lut[quad];
 
         val = load_bf16x4(src_u16, valid);
       }

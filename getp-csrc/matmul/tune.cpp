@@ -82,7 +82,11 @@ std::string format_config_label(const char *prefix) {
   MACRO(192, 192, 64, 64, 64)                                                   \
   MACRO(256, 64, 64, 32, 32)                                                    \
   MACRO(256, 128, 64, 32, 64)                                                   \
-  MACRO(64, 256, 64, 32, 64)
+  MACRO(64, 256, 64, 32, 64)                                                    \
+  MACRO(64, 320, 64, 32, 64)   /* Waves=2*5=10  */                              \
+  MACRO(64, 288, 64, 32, 96)   /* Waves=2*3=6   */                              \
+  MACRO(96, 288, 64, 32, 96)   /* Waves=3*3=9   */                              \
+  MACRO(96, 192, 96, 32, 64)   /* Waves=3*3=9   */                              
 
 using bf16_t = hip_bfloat16;
 
