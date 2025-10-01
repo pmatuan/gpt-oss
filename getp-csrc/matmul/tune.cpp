@@ -784,7 +784,16 @@ static RunResult run_qkv_variant(const MatmulQKVProblem &prob,
     cand.launcher(d_y, d_x, d_w, d_bias, prob.n, prob.d, prob.B, d_pos, stream);
   };
 
-  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
+  // Try a warmup launch to check if kernel is valid
+  launch();
+  hipError_t err = hipStreamSynchronize(stream);
+  if (err != hipSuccess) {
+    RunResult out;
+    out.ms = -1.0f;  // Signal error
+    return out;
+  }
+
+  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -814,7 +823,16 @@ static RunResult run_att_variant(const MatmulATTProblem &prob, bf16_t *d_y,
     cand.launcher(d_y, d_x, d_w, d_bias, prob.n, prob.d, prob.B, d_pos, stream);
   };
 
-  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
+  // Try a warmup launch to check if kernel is valid
+  launch();
+  hipError_t err = hipStreamSynchronize(stream);
+  if (err != hipSuccess) {
+    RunResult out;
+    out.ms = -1.0f;  // Signal error
+    return out;
+  }
+
+  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -844,7 +862,16 @@ static RunResult run_logits_variant(const MatmulLogitsProblem &prob, float *d_y,
     cand.launcher(d_y, d_x, d_w, prob.n, prob.d, prob.B, d_pos, stream);
   };
 
-  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
+  // Try a warmup launch to check if kernel is valid
+  launch();
+  hipError_t err = hipStreamSynchronize(stream);
+  if (err != hipSuccess) {
+    RunResult out;
+    out.ms = -1.0f;  // Signal error
+    return out;
+  }
+
+  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -881,7 +908,16 @@ static RunResult run_mlp1_variant(
                   prob.B, d_pos, prob.max_assign, stream);
   };
 
-  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
+  // Try a warmup launch to check if kernel is valid
+  launch();
+  hipError_t err = hipStreamSynchronize(stream);
+  if (err != hipSuccess) {
+    RunResult out;
+    out.ms = -1.0f;  // Signal error
+    return out;
+  }
+
+  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -918,7 +954,16 @@ static RunResult run_mlp2_variant(
                   prob.B, d_pos, prob.max_assign, stream);
   };
 
-  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
+  // Try a warmup launch to check if kernel is valid
+  launch();
+  hipError_t err = hipStreamSynchronize(stream);
+  if (err != hipSuccess) {
+    RunResult out;
+    out.ms = -1.0f;  // Signal error
+    return out;
+  }
+
+  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -1047,6 +1092,10 @@ static void tune_matmul_qkv(const BenchmarkSetting &setting,
   for (const auto &cand : candidates) {
     RunResult trial = run_qkv_variant(prob, d_y, d_x, d_w, d_bias, d_pos,
                                       stream, opts, cand);
+    if (trial.ms < 0.0f) {
+      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
+      continue;
+    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1131,6 +1180,10 @@ static void tune_matmul_att(const BenchmarkSetting &setting,
   for (const auto &cand : candidates) {
     RunResult trial = run_att_variant(prob, d_y, d_x, d_w, d_bias, d_pos,
                                       stream, opts, cand);
+    if (trial.ms < 0.0f) {
+      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
+      continue;
+    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1209,6 +1262,10 @@ static void tune_matmul_logits(const BenchmarkSetting &setting,
   for (const auto &cand : candidates) {
     RunResult trial =
         run_logits_variant(prob, d_y, d_x, d_w, d_pos, stream, opts, cand);
+    if (trial.ms < 0.0f) {
+      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
+      continue;
+    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 5e-2, 5e-3, 5e-3);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1323,6 +1380,10 @@ static void tune_mlp1(const BenchmarkSetting &setting, const TimingOptions &opts
                                        d_batches, d_slots, d_offsets, 0,
                                        spec.swiglu_limit, d_pos, stream, opts,
                                        cand);
+    if (trial.ms < 0.0f) {
+      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
+      continue;
+    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1448,6 +1509,10 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
     RunResult trial = run_mlp2_variant(prob, d_out, d_gate, d_w, stride, d_bias,
                                        d_batches, d_slots, d_offsets, d_topk, 0,
                                        d_pos, stream, opts, cand);
+    if (trial.ms < 0.0f) {
+      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
+      continue;
+    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
