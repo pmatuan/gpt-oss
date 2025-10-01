@@ -36,49 +36,49 @@ typedef hip_bfloat16 bf16_t;
 #define MATMUL_QKV_BLOCK_DEPTH 32
 #define MATMUL_QKV_WARP_TILE_M 32
 #define MATMUL_QKV_WARP_TILE_N 32
-#define MATMUL_QKV_WAVES_PER_BLOCK 16
+#define MATMUL_QKV_WAVES_PER_BLOCK (MATMUL_QKV_BLOCK_ROWS / MATMUL_QKV_WARP_TILE_M) * (MATMUL_QKV_BLOCK_COLS / MATMUL_QKV_WARP_TILE_N)
 
 #define MATMUL_ATT_BLOCK_ROWS 192
 #define MATMUL_ATT_BLOCK_COLS 128
 #define MATMUL_ATT_BLOCK_DEPTH 32
 #define MATMUL_ATT_WARP_TILE_M 32
 #define MATMUL_ATT_WARP_TILE_N 64
-#define MATMUL_ATT_WAVES_PER_BLOCK 12
+#define MATMUL_ATT_WAVES_PER_BLOCK (MATMUL_ATT_BLOCK_ROWS / MATMUL_ATT_WARP_TILE_M) * (MATMUL_ATT_BLOCK_COLS / MATMUL_ATT_WARP_TILE_N)
 
 #define MATMUL_LOGITS_BLOCK_ROWS 192
 #define MATMUL_LOGITS_BLOCK_COLS 128
 #define MATMUL_LOGITS_BLOCK_DEPTH 32
 #define MATMUL_LOGITS_WARP_TILE_M 32
 #define MATMUL_LOGITS_WARP_TILE_N 64
-#define MATMUL_LOGITS_WAVES_PER_BLOCK 12
+#define MATMUL_LOGITS_WAVES_PER_BLOCK (MATMUL_LOGITS_BLOCK_ROWS / MATMUL_LOGITS_WARP_TILE_M) * (MATMUL_LOGITS_BLOCK_COLS / MATMUL_LOGITS_WARP_TILE_N)
 
 #define MATMUL_MLP1_BLOCK_ROWS 192
 #define MATMUL_MLP1_BLOCK_COLS 96
 #define MATMUL_MLP1_BLOCK_DEPTH 32
 #define MATMUL_MLP1_WARP_TILE_M 32
 #define MATMUL_MLP1_WARP_TILE_N 48
-#define MATMUL_MLP1_WAVES_PER_BLOCK 12
+#define MATMUL_MLP1_WAVES_PER_BLOCK (MATMUL_MLP1_BLOCK_ROWS / MATMUL_MLP1_WARP_TILE_M) * (MATMUL_MLP1_BLOCK_COLS / MATMUL_MLP1_WARP_TILE_N)
 
-#define MATMUL_MLP1_BLOCK_ROWS_120B 192
-#define MATMUL_MLP1_BLOCK_COLS_120B 96
+#define MATMUL_MLP1_BLOCK_ROWS_120B 64
+#define MATMUL_MLP1_BLOCK_COLS_120B 128
 #define MATMUL_MLP1_BLOCK_DEPTH_120B 32
 #define MATMUL_MLP1_WARP_TILE_M_120B 32
-#define MATMUL_MLP1_WARP_TILE_N_120B 48
-#define MATMUL_MLP1_WAVES_PER_BLOCK_120B 12
+#define MATMUL_MLP1_WARP_TILE_N_120B 32
+#define MATMUL_MLP1_WAVES_PER_BLOCK_120B (MATMUL_MLP1_BLOCK_ROWS_120B / MATMUL_MLP1_WARP_TILE_M_120B) * (MATMUL_MLP1_BLOCK_COLS_120B / MATMUL_MLP1_WARP_TILE_N_120B)
 
 #define MATMUL_MLP2_BLOCK_ROWS 192
 #define MATMUL_MLP2_BLOCK_COLS 96
 #define MATMUL_MLP2_BLOCK_DEPTH 32
 #define MATMUL_MLP2_WARP_TILE_M 32
 #define MATMUL_MLP2_WARP_TILE_N 48
-#define MATMUL_MLP2_WAVES_PER_BLOCK 12
+#define MATMUL_MLP2_WAVES_PER_BLOCK (MATMUL_MLP2_BLOCK_ROWS / MATMUL_MLP2_WARP_TILE_M) * (MATMUL_MLP2_BLOCK_COLS / MATMUL_MLP2_WARP_TILE_N)
 
-#define MATMUL_MLP2_BLOCK_ROWS_120B 192
-#define MATMUL_MLP2_BLOCK_COLS_120B 96
+#define MATMUL_MLP2_BLOCK_ROWS_120B 64
+#define MATMUL_MLP2_BLOCK_COLS_120B 128
 #define MATMUL_MLP2_BLOCK_DEPTH_120B 32
 #define MATMUL_MLP2_WARP_TILE_M_120B 32
-#define MATMUL_MLP2_WARP_TILE_N_120B 48
-#define MATMUL_MLP2_WAVES_PER_BLOCK_120B 12
+#define MATMUL_MLP2_WARP_TILE_N_120B 32
+#define MATMUL_MLP2_WAVES_PER_BLOCK_120B (MATMUL_MLP2_BLOCK_ROWS_120B / MATMUL_MLP2_WARP_TILE_M_120B) * (MATMUL_MLP2_BLOCK_COLS_120B / MATMUL_MLP2_WARP_TILE_N_120B)
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using s16x4 = short __attribute__((ext_vector_type(4)));
@@ -238,7 +238,6 @@ struct PromptCtx {
   int *prompt_tokens;     // tokenized prompt buffer
   int num_prompt_tokens;  // number of prompt tokens
   int *output_tokens;     // output token buffer (caller provided)
-  std::string output_str; // output text (raw)
   int pos;                // current decode step (position in sequence)
   int token;              // current token being processed
   bool finished;          // EOS reached or step limit
@@ -258,7 +257,7 @@ struct PromptCtx {
 
   PromptCtx()
       : idx(0), input_seq(""), prompt_tokens(nullptr), num_prompt_tokens(0),
-        output_tokens(nullptr), output_str(""), pos(0), token(0), finished(false),
+        output_tokens(nullptr), pos(0), token(0), finished(false),
         max_steps(0), h_logits(nullptr), logits_size(0), sampler(nullptr),
         num_generated(0), start_time(0.0), end_time(0.0),
         is_context_phase(true), user_data(nullptr) {}
@@ -287,7 +286,6 @@ static inline void free_prompt_ctx_heap_buffers(PromptCtx &ctx) {
     free(ctx.prompt_tokens);
     ctx.prompt_tokens = nullptr;
   }
-  ctx.output_str.clear();
 }
 
 #endif // GETP_COMMON_DEFINES_H
