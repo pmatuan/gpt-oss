@@ -50,6 +50,62 @@ struct MatmulConfig {
   static_assert(WavesPerWg <= 16, "Too many waves per workgroup (max 16)");
 };
 
+constexpr std::size_t kSharedMemLimitBytes = 64ull * 1024ull;
+
+template <typename Config>
+constexpr int matmul_k_quads() {
+  static_assert(Config::BK % MATMUL_CHUNK_K == 0,
+                "BLOCK_DEPTH must be divisible by MATMUL_CHUNK_K");
+  return Config::BK / MATMUL_CHUNK_K;
+}
+
+template <typename Config>
+constexpr std::size_t shared_mem_bytes_matmul_double_buffer() {
+  constexpr int k_quads = matmul_k_quads<Config>();
+  constexpr int lds_stride = k_quads + 4;
+  return 2ull * static_cast<std::size_t>(lds_stride) * sizeof(s16x4) *
+         (static_cast<std::size_t>(Config::BM) +
+          static_cast<std::size_t>(Config::BN));
+}
+
+template <typename Config>
+constexpr std::size_t shared_mem_bytes_matmul_logits() {
+  constexpr std::size_t base = shared_mem_bytes_matmul_double_buffer<Config>();
+  constexpr std::size_t rows_extra = static_cast<std::size_t>(Config::BM) *
+                                     (sizeof(std::size_t) + sizeof(uint8_t));
+  constexpr std::size_t cols_extra = static_cast<std::size_t>(Config::BN) *
+                                     (sizeof(std::size_t) + sizeof(uint8_t));
+  return base + rows_extra + cols_extra;
+}
+
+template <typename Config>
+constexpr std::size_t shared_mem_bytes_mlp1() {
+  constexpr int k_quads = matmul_k_quads<Config>();
+  constexpr int lds_stride = k_quads + 3;
+  constexpr std::size_t base = static_cast<std::size_t>(lds_stride) *
+                               sizeof(s16x4) *
+                               (static_cast<std::size_t>(Config::BM) +
+                                static_cast<std::size_t>(Config::BN));
+  constexpr std::size_t extras = static_cast<std::size_t>(Config::BM) *
+                                 (sizeof(int) + sizeof(int) +
+                                  sizeof(uint8_t));
+  return base + extras;
+}
+
+template <typename Config>
+constexpr std::size_t shared_mem_bytes_mlp2() {
+  constexpr int k_quads = matmul_k_quads<Config>();
+  constexpr int lds_stride = k_quads + 3;
+  constexpr std::size_t base = static_cast<std::size_t>(lds_stride) *
+                               sizeof(s16x4) *
+                               (static_cast<std::size_t>(Config::BM) +
+                                static_cast<std::size_t>(Config::BN));
+  constexpr std::size_t extras = static_cast<std::size_t>(Config::BM) *
+                                 (sizeof(int) + sizeof(float) +
+                                  sizeof(uint8_t) + sizeof(std::size_t));
+  return base + extras;
+}
+
 template <typename Config>
 std::string format_config_label(const char *prefix) {
   std::string label(prefix);
@@ -184,7 +240,7 @@ static const ModelSpec MODEL_120B{
 
 static const std::array<BenchmarkSetting, 2> g_settings = {
     BenchmarkSetting{MODEL_20B, 1536},
-    BenchmarkSetting{MODEL_120B, 1024},
+    BenchmarkSetting{MODEL_120B, 1536},
 };
 
 static inline std::vector<float> copy_device_float(float *d_ptr, size_t elems) {
@@ -784,16 +840,7 @@ static RunResult run_qkv_variant(const MatmulQKVProblem &prob,
     cand.launcher(d_y, d_x, d_w, d_bias, prob.n, prob.d, prob.B, d_pos, stream);
   };
 
-  // Try a warmup launch to check if kernel is valid
-  launch();
-  hipError_t err = hipStreamSynchronize(stream);
-  if (err != hipSuccess) {
-    RunResult out;
-    out.ms = -1.0f;  // Signal error
-    return out;
-  }
-
-  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
+  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -823,16 +870,7 @@ static RunResult run_att_variant(const MatmulATTProblem &prob, bf16_t *d_y,
     cand.launcher(d_y, d_x, d_w, d_bias, prob.n, prob.d, prob.B, d_pos, stream);
   };
 
-  // Try a warmup launch to check if kernel is valid
-  launch();
-  hipError_t err = hipStreamSynchronize(stream);
-  if (err != hipSuccess) {
-    RunResult out;
-    out.ms = -1.0f;  // Signal error
-    return out;
-  }
-
-  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
+  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -862,16 +900,7 @@ static RunResult run_logits_variant(const MatmulLogitsProblem &prob, float *d_y,
     cand.launcher(d_y, d_x, d_w, prob.n, prob.d, prob.B, d_pos, stream);
   };
 
-  // Try a warmup launch to check if kernel is valid
-  launch();
-  hipError_t err = hipStreamSynchronize(stream);
-  if (err != hipSuccess) {
-    RunResult out;
-    out.ms = -1.0f;  // Signal error
-    return out;
-  }
-
-  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
+  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -908,16 +937,7 @@ static RunResult run_mlp1_variant(
                   prob.B, d_pos, prob.max_assign, stream);
   };
 
-  // Try a warmup launch to check if kernel is valid
-  launch();
-  hipError_t err = hipStreamSynchronize(stream);
-  if (err != hipSuccess) {
-    RunResult out;
-    out.ms = -1.0f;  // Signal error
-    return out;
-  }
-
-  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
+  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -954,16 +974,7 @@ static RunResult run_mlp2_variant(
                   prob.B, d_pos, prob.max_assign, stream);
   };
 
-  // Try a warmup launch to check if kernel is valid
-  launch();
-  hipError_t err = hipStreamSynchronize(stream);
-  if (err != hipSuccess) {
-    RunResult out;
-    out.ms = -1.0f;  // Signal error
-    return out;
-  }
-
-  float ms = benchmark_kernel(launch, opts.warmup - 1, opts.iters, stream);
+  float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -977,8 +988,16 @@ static std::vector<MatmulQKVCandidate> build_qkv_candidates() {
   std::vector<MatmulQKVCandidate> out;
   out.reserve(24);
 #define ADD_QKV_CONFIG(BM, BN, BK, WM, WN)                                      \
-  out.emplace_back(                                                            \
-      make_qkv_candidate<MatmulConfig<BM, BN, BK, WM, WN, 16, 16>>("QKV"));
+  do {                                                                          \
+    using ConfigT = MatmulConfig<BM, BN, BK, WM, WN, 16, 16>;                  \
+    constexpr std::size_t shared_bytes =                                         \
+        shared_mem_bytes_matmul_double_buffer<ConfigT>();                      \
+    if constexpr (shared_bytes <= kSharedMemLimitBytes) {                      \
+      out.emplace_back(make_qkv_candidate<ConfigT>("QKV"));                   \
+    } else {                                                                   \
+      auto label = format_config_label<ConfigT>("QKV");                       \
+    }                                                                          \
+  } while (false);
   MATMUL_CONFIG_LIST(ADD_QKV_CONFIG)
 #undef ADD_QKV_CONFIG
   return out;
@@ -988,8 +1007,16 @@ static std::vector<MatmulATTCandidate> build_att_candidates() {
   std::vector<MatmulATTCandidate> out;
   out.reserve(24);
 #define ADD_ATT_CONFIG(BM, BN, BK, WM, WN)                                      \
-  out.emplace_back(                                                            \
-      make_att_candidate<MatmulConfig<BM, BN, BK, WM, WN, 16, 16>>("ATT"));
+  do {                                                                          \
+    using ConfigT = MatmulConfig<BM, BN, BK, WM, WN, 16, 16>;                  \
+    constexpr std::size_t shared_bytes =                                         \
+        shared_mem_bytes_matmul_double_buffer<ConfigT>();                      \
+    if constexpr (shared_bytes <= kSharedMemLimitBytes) {                      \
+      out.emplace_back(make_att_candidate<ConfigT>("ATT"));                   \
+    } else {                                                                   \
+      auto label = format_config_label<ConfigT>("ATT");                       \
+    }                                                                          \
+  } while (false);
   MATMUL_CONFIG_LIST(ADD_ATT_CONFIG)
 #undef ADD_ATT_CONFIG
   return out;
@@ -999,8 +1026,15 @@ static std::vector<MatmulLogitsCandidate> build_logits_candidates() {
   std::vector<MatmulLogitsCandidate> out;
   out.reserve(24);
 #define ADD_LOGITS_CONFIG(BM, BN, BK, WM, WN)                                   \
-  out.emplace_back(make_logits_candidate<MatmulConfig<BM, BN, BK, WM, WN, 16,   \
-                                           16>>("LOGITS"));
+  do {                                                                          \
+    using ConfigT = MatmulConfig<BM, BN, BK, WM, WN, 16, 16>;                  \
+    constexpr std::size_t shared_bytes = shared_mem_bytes_matmul_logits<ConfigT>(); \
+    if constexpr (shared_bytes <= kSharedMemLimitBytes) {                      \
+      out.emplace_back(make_logits_candidate<ConfigT>("LOGITS"));             \
+    } else {                                                                   \
+      auto label = format_config_label<ConfigT>("LOGITS");                    \
+    }                                                                          \
+  } while (false);
   MATMUL_CONFIG_LIST(ADD_LOGITS_CONFIG)
 #undef ADD_LOGITS_CONFIG
   return out;
@@ -1010,8 +1044,15 @@ static std::vector<MLP1Candidate> build_mlp1_candidates() {
   std::vector<MLP1Candidate> out;
   out.reserve(24);
 #define ADD_MLP1_CONFIG(BM, BN, BK, WM, WN)                                     \
-  out.emplace_back(                                                            \
-      make_mlp1_candidate<MatmulConfig<BM, BN, BK, WM, WN, 16, 16>>("MLP1"));
+  do {                                                                          \
+    using ConfigT = MatmulConfig<BM, BN, BK, WM, WN, 16, 16>;                  \
+    constexpr std::size_t shared_bytes = shared_mem_bytes_mlp1<ConfigT>();     \
+    if constexpr (shared_bytes <= kSharedMemLimitBytes) {                      \
+      out.emplace_back(make_mlp1_candidate<ConfigT>("MLP1"));                 \
+    } else {                                                                   \
+      auto label = format_config_label<ConfigT>("MLP1");                      \
+    }                                                                          \
+  } while (false);
   MATMUL_CONFIG_LIST(ADD_MLP1_CONFIG)
 #undef ADD_MLP1_CONFIG
   return out;
@@ -1021,8 +1062,15 @@ static std::vector<MLP2Candidate> build_mlp2_candidates() {
   std::vector<MLP2Candidate> out;
   out.reserve(24);
 #define ADD_MLP2_CONFIG(BM, BN, BK, WM, WN)                                     \
-  out.emplace_back(                                                            \
-      make_mlp2_candidate<MatmulConfig<BM, BN, BK, WM, WN, 16, 16>>("MLP2"));
+  do {                                                                          \
+    using ConfigT = MatmulConfig<BM, BN, BK, WM, WN, 16, 16>;                  \
+    constexpr std::size_t shared_bytes = shared_mem_bytes_mlp2<ConfigT>();     \
+    if constexpr (shared_bytes <= kSharedMemLimitBytes) {                      \
+      out.emplace_back(make_mlp2_candidate<ConfigT>("MLP2"));                 \
+    } else {                                                                   \
+      auto label = format_config_label<ConfigT>("MLP2");                      \
+    }                                                                          \
+  } while (false);
   MATMUL_CONFIG_LIST(ADD_MLP2_CONFIG)
 #undef ADD_MLP2_CONFIG
   return out;
@@ -1092,10 +1140,6 @@ static void tune_matmul_qkv(const BenchmarkSetting &setting,
   for (const auto &cand : candidates) {
     RunResult trial = run_qkv_variant(prob, d_y, d_x, d_w, d_bias, d_pos,
                                       stream, opts, cand);
-    if (trial.ms < 0.0f) {
-      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
-      continue;
-    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1180,10 +1224,6 @@ static void tune_matmul_att(const BenchmarkSetting &setting,
   for (const auto &cand : candidates) {
     RunResult trial = run_att_variant(prob, d_y, d_x, d_w, d_bias, d_pos,
                                       stream, opts, cand);
-    if (trial.ms < 0.0f) {
-      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
-      continue;
-    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1262,10 +1302,6 @@ static void tune_matmul_logits(const BenchmarkSetting &setting,
   for (const auto &cand : candidates) {
     RunResult trial =
         run_logits_variant(prob, d_y, d_x, d_w, d_pos, stream, opts, cand);
-    if (trial.ms < 0.0f) {
-      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
-      continue;
-    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 5e-2, 5e-3, 5e-3);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1380,10 +1416,6 @@ static void tune_mlp1(const BenchmarkSetting &setting, const TimingOptions &opts
                                        d_batches, d_slots, d_offsets, 0,
                                        spec.swiglu_limit, d_pos, stream, opts,
                                        cand);
-    if (trial.ms < 0.0f) {
-      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
-      continue;
-    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1509,10 +1541,6 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
     RunResult trial = run_mlp2_variant(prob, d_out, d_gate, d_w, stride, d_bias,
                                        d_batches, d_slots, d_offsets, d_topk, 0,
                                        d_pos, stream, opts, cand);
-    if (trial.ms < 0.0f) {
-      std::cout << "  [skip] " << cand.label << " (kernel launch failed)\n";
-      continue;
-    }
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
