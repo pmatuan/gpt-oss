@@ -263,7 +263,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   const int Hq = model_config->n_attn_heads;
   const int Hk = model_config->n_kv_heads;
   const int IM = model_config->intermediate_dim;
-  const int B = MAX_BATCH_SIZE;  // Allocate for max batch size upfront
+  const int B = MAX_BATCH_SIZE_120B;  // Allocate for max batch size upfront
 
   printf("Initializing device %d for batch size %d...\n", device_id, B);
   debug_print_gpu_memory("before allocations", device_id);

@@ -1,4 +1,5 @@
 #include "attention/attention.cpp"
+#include "common/defines.h"
 #include "getp_eval.cpp"
 #include "expert.cpp"
 #include <algorithm>
@@ -853,11 +854,12 @@ static long long run_requests_on_device(Transformer *transformer,
   DeviceContext &device_ctx = g_devices[device_id];
 
   long long total_tokens = 0;
+  const int BATCH = use_expert_parallelism ? MAX_BATCH_SIZE_120B : MAX_BATCH_SIZE;
 
-  // Process requests in batches of MAX_BATCH_SIZE
+  // Process requests in batches of BATCH
   for (int batch_start = 0; batch_start < num_ctxs;
-       batch_start += MAX_BATCH_SIZE) {
-    const int B = std::min(MAX_BATCH_SIZE, num_ctxs - batch_start);
+       batch_start += BATCH) {
+    const int B = std::min(BATCH, num_ctxs - batch_start);
     PromptCtx *batch_ctxs = ctxs + batch_start;
 
     HostPinnedBatchBuffers &host_ws = device_ctx.host_pinned_batch;
