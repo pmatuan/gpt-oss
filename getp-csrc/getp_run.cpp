@@ -593,13 +593,15 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     // Attention (batched)
     {
       dim3 gridAttn(Hq, batch_size, 1);
-      dim3 blockA(WF_SIZE);
+      dim3 blockA(ATTN_THREADS_PER_BLOCK);
       const bool layer_has_window = (l & 1) == 0;
       if (layer_has_window) {
         PROFILE_GPU_SCOPE("attention_batch_kernel_even", 0);
         const int att_tokens =
             std::min(max_pos_in_batch + 1, p->sliding_window);
-        size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
+        const size_t att_shared = (size_t)(att_tokens + 1);
+        const size_t shmem_size =
+            (att_shared + 4 + (size_t)D) * sizeof(float);
         attention_batch_kernel_even<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
@@ -609,7 +611,9 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       } else {
         PROFILE_GPU_SCOPE("attention_batch_kernel_odd", 0);
         const int att_tokens = max_pos_in_batch + 1;
-        size_t shmem_size = (size_t)(att_tokens + 1) * sizeof(float);
+        const size_t att_shared = (size_t)(att_tokens + 1);
+        const size_t shmem_size =
+            (att_shared + 4 + (size_t)D) * sizeof(float);
         attention_batch_kernel_odd<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
