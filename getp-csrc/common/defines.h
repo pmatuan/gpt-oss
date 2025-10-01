@@ -14,6 +14,8 @@ typedef hip_bfloat16 bf16_t;
 #define WF_SIZE 64
 #define TM 8  
 #define BLOCK_SIZE (WF_SIZE * TM)
+#define ATTN_WARPS_PER_BLOCK 2
+#define ATTN_THREADS_PER_BLOCK (WF_SIZE * ATTN_WARPS_PER_BLOCK)
 #define TK 512
 #define LDS_PAD 16
 #define K_STEP_MATMUL_FLOAT 4
