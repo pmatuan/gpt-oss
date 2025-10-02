@@ -68,7 +68,7 @@ __device__ __forceinline__ void matmul_bias_bf16_mfma_body(
 #pragma unroll
     for (int wn = 0; wn < SUB_TILES_N; ++wn) {
       const int col = block_n + wave_n * WARP_TILE_N + wn * 16 + lane_col;
-      if (col < d) bias_lane[wn] = static_cast<float>(bias[col]);
+      if (col < d) bias_lane[wn] = float(bias[col]);
     }
   }
 
@@ -447,7 +447,7 @@ void matmul_router_kernel(
     }
 
     for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
-      lds_x[k] = static_cast<float>(xb[k]);
+      lds_x[k] = float(xb[k]);
     }
     __syncthreads();
 
@@ -470,7 +470,7 @@ void matmul_router_kernel(
     }
 
     for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-      acc = fmaf(static_cast<float>(w_row[k]), lds_x[k], acc);
+      acc = fmaf(float(w_row[k]), lds_x[k], acc);
     }
     __syncthreads();
   }
@@ -478,7 +478,7 @@ void matmul_router_kernel(
   float result = warp_reduce_sum(acc);
   if (lane == 0) {
     float* __restrict__ yb = y + (size_t)batch_idx * d;
-    const float bias_val = bias ? static_cast<float>(bias[row]) : 0.0f;
+    const float bias_val = bias ? float(bias[row]) : 0.0f;
     yb[row] = result + bias_val;
   }
 }
@@ -585,7 +585,7 @@ __device__ __forceinline__ void mlp1_kernel_body(
   for (int wn = 0; wn < SUB_TILES_N; ++wn) {
     const int col = block_n + wave_n * WARP_TILE_N + wn * 16 + lane_col;
     bias_lane[wn] = (col < total_cols)
-                        ? static_cast<float>(bias_base[col])
+                        ? float(bias_base[col])
                         : 0.0f;
   }
 
@@ -856,7 +856,7 @@ __device__ __forceinline__ void mlp2_kernel_body(
   for (int wn = 0; wn < SUB_TILES_N; ++wn) {
     const int col = block_n + wave_n * WARP_TILE_N + wn * 16 + lane_col;
     bias_lane[wn] = (col < total_cols)
-                        ? static_cast<float>(bias_base[col])
+                        ? float(bias_base[col])
                         : 0.0f;
   }
 

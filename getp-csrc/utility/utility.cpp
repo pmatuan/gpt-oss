@@ -215,9 +215,20 @@ __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
   const bf16_t *x_b = x + (size_t)b * size;
   bf16_t *o_b = o + (size_t)b * size;
 
+  const int pair_elems = size >> 1;
+  const int tail_start = pair_elems << 1;
+  const uint32_t *x_pairs = reinterpret_cast<const uint32_t *>(x_b);
+  const uint32_t *w_pairs = reinterpret_cast<const uint32_t *>(weight);
+
   float sum = 0.0f;
-  for (int idx = tid; idx < size; idx += blockDim.x) {
-    float v = static_cast<float>(x_b[idx]);
+  for (int idx = tid; idx < pair_elems; idx += blockDim.x) {
+    float v0, v1;
+    bf16pair_to_float2(x_pairs[idx], v0, v1);
+    sum = fmaf(v0, v0, sum);
+    sum = fmaf(v1, v1, sum);
+  }
+  for (int idx = tail_start + tid; idx < size; idx += blockDim.x) {
+    float v = float(x_b[idx]);
     sum = fmaf(v, v, sum);
   }
 
@@ -249,11 +260,22 @@ __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
   const float mean_sq = warp_sums[0] / (float)size;
   const float inv_rms = rsqrtf(mean_sq + 1e-5f);
 
-  for (int idx = tid; idx < size; idx += blockDim.x) {
-    float v = static_cast<float>(x_b[idx]);
-    float w = static_cast<float>(weight[idx]);
-    float result = w * (v * inv_rms);
-    o_b[idx] = hip_bfloat16(result);
+  for (int idx = tid; idx < pair_elems; idx += blockDim.x) {
+    float v0, v1;
+    bf16pair_to_float2(x_pairs[idx], v0, v1);
+    float w0, w1;
+    bf16pair_to_float2(w_pairs[idx], w0, w1);
+
+    const float base = inv_rms;
+    const int out_idx = idx << 1;
+    o_b[out_idx] = bf16_t(w0 * (v0 * base));
+    o_b[out_idx + 1] = bf16_t(w1 * (v1 * base));
+  }
+
+  for (int idx = tail_start + tid; idx < size; idx += blockDim.x) {
+    float v = float(x_b[idx]);
+    float w = float(weight[idx]);
+    o_b[idx] = bf16_t(w * (v * inv_rms));
   }
 }
 
