@@ -232,6 +232,9 @@ static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
     if (attempt_full < target_full) {
       printf("[DEVICE] %d reduced KV cache to %d tokens due to allocation limits\n",
              ctx.device_id, attempt_full);
+    } else {
+      printf("[DEVICE] %d allocated KV cache full %d tokens\n",
+             ctx.device_id, attempt_full);
     }
 
     return attempt_full;
