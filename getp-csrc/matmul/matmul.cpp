@@ -11,7 +11,7 @@ __device__ __forceinline__ void matmul_bias_bf16_mfma_body(
     bf16_t *__restrict__ y,             // [B x d]
     const bf16_t *__restrict__ x,       // [B x n] (bf16)
     const bf16_t *__restrict__ w,       // [d x n] (bf16, packed theo tile)
-    const float *__restrict__ bias,     // [d] (có thể null)
+    const bf16_t *__restrict__ bias,    // [d] (có thể null)
     int n, int d, int B,
     const int *__restrict__ pos) {
 
@@ -68,7 +68,7 @@ __device__ __forceinline__ void matmul_bias_bf16_mfma_body(
 #pragma unroll
     for (int wn = 0; wn < SUB_TILES_N; ++wn) {
       const int col = block_n + wave_n * WARP_TILE_N + wn * 16 + lane_col;
-      if (col < d) bias_lane[wn] = bias[col];
+      if (col < d) bias_lane[wn] = static_cast<float>(bias[col]);
     }
   }
 
@@ -371,7 +371,7 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
 
 __global__ void matmul_bias_qkv_kernel(
     bf16_t *__restrict__ y, const bf16_t *__restrict__ x,
-    const bf16_t *__restrict__ w, const float *__restrict__ bias,
+    const bf16_t *__restrict__ w, const bf16_t *__restrict__ bias,
     int n, int d, int B, const int *__restrict__ pos) {
   matmul_bias_bf16_mfma_body<
       MATMUL_QKV_BLOCK_ROWS, MATMUL_QKV_BLOCK_COLS, MATMUL_QKV_BLOCK_DEPTH,
@@ -381,7 +381,7 @@ __global__ void matmul_bias_qkv_kernel(
 
 __global__ void matmul_bias_att_kernel(
     bf16_t *__restrict__ y, const bf16_t *__restrict__ x,
-    const bf16_t *__restrict__ w, const float *__restrict__ bias,
+    const bf16_t *__restrict__ w, const bf16_t *__restrict__ bias,
     int n, int d, int B, const int *__restrict__ pos) {
   matmul_bias_bf16_mfma_body<
       MATMUL_ATT_BLOCK_ROWS, MATMUL_ATT_BLOCK_COLS, MATMUL_ATT_BLOCK_DEPTH,
@@ -401,42 +401,43 @@ __global__ void matmul_logits_kernel(
 }
 
 /**
- * Y = X @ W^T + B (float version)
- * x: [B, n], w: [d, n], y: [B, d]
+ * Y = X @ W^T + B
+ * x: [B, n]  (bf16)
+ * w: [d, n]  (bf16, row-major)
+ * y: [B, d]  (fp32 accumulator)
  * Grid: (ceil(d/TM), B)
  */
  __global__ __launch_bounds__(BLOCK_SIZE, 1)
 void matmul_router_kernel(
     float* __restrict__ y,          // [B, d]
     const bf16_t* __restrict__ x,   // [B, n] (bf16)
-     const float* __restrict__ w,    // [d, n] (row-major theo n)
-     const float* __restrict__ bias, // [d] (có thể null)
-     int n, int d, int batch_size, const int *pos)
- {
-   const int batch_idx = blockIdx.y;
-   if (batch_idx >= batch_size) return;
-   if (pos && pos[batch_idx] < 0) return;
- 
-   __shared__ __align__(16) float lds_x[TK + LDS_PAD];
- 
-   const int tid = threadIdx.x;
-   const int lane = tid & (WF_SIZE - 1);
-   const int wid = tid >> 6;                 // warp id trong block (0..TM-1)
- 
-   const int row = blockIdx.x * TM + wid;    // hàng output (0..d-1)
- 
-   if (wid >= TM || row >= d) return;
- 
-   float acc = 0.f;
- 
-   // Vòng K - optimized with vectorized loads and computation
-   for (int k_base = 0; k_base < n; k_base += TK) {
-     const int k_size = min(TK, n - k_base);
- 
-     // 1) Optimized vectorized load of X columns for current batch
+    const bf16_t* __restrict__ w,   // [d, n] (row-major theo n)
+    const bf16_t* __restrict__ bias,// [d] (có thể null)
+    int n, int d, int batch_size, const int *pos)
+{
+  const int batch_idx = blockIdx.y;
+  if (batch_idx >= batch_size) return;
+  if (pos && pos[batch_idx] < 0) return;
+
+  __shared__ __align__(16) float lds_x[TK + LDS_PAD];
+
+  const int tid = threadIdx.x;
+  const int lane = tid & (WF_SIZE - 1);
+  const int wid = tid >> 6;                 // warp id trong block (0..TM-1)
+
+  const int row = blockIdx.x * TM + wid;    // hàng output (0..d-1)
+
+  if (wid >= TM || row >= d) return;
+
+  float acc = 0.f;
+
+  // Vòng K - optimized with vectorized loads and computation
+  for (int k_base = 0; k_base < n; k_base += TK) {
+    const int k_size = min(TK, n - k_base);
+
+    // 1) Optimized vectorized load of X columns for current batch
     const bf16_t* __restrict__ xb = x + (size_t)batch_idx * n + k_base;
 
-    // Load using vectorized operations
     const int vec4_k = (k_size >> 2);
     float4* __restrict__ lds_x4 = reinterpret_cast<float4*>(lds_x);
     const uint2* __restrict__ xb4 = reinterpret_cast<const uint2*>(xb);
@@ -444,47 +445,43 @@ void matmul_router_kernel(
     for (int v = tid; v < vec4_k; v += BLOCK_SIZE) {
       lds_x4[v] = bf16quad_to_float4(xb4[v]);
     }
-    
-    // Handle remainder elements
+
     for (int k = (vec4_k << 2) + tid; k < k_size; k += BLOCK_SIZE) {
       lds_x[k] = static_cast<float>(xb[k]);
-     }
-     __syncthreads();
- 
-     // 2) Optimized computation with weight row for current batch
-     const float* __restrict__ w_row = w + (size_t)row * n + k_base;
-     
-     // Vectorized computation - process 4 elements at a time
-     const int vec_k = (k_size / K_STEP_MATMUL_FLOAT) * K_STEP_MATMUL_FLOAT;
- 
-     for (int k = lane * K_STEP_MATMUL_FLOAT; k < vec_k; k += WF_SIZE * K_STEP_MATMUL_FLOAT) {
-       if (k + K_STEP_MATMUL_FLOAT <= vec_k) {
-         // Load 4 consecutive elements as vectors
-         const float4 w_vec = *reinterpret_cast<const float4*>(&w_row[k]);
-         const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);
-         
-         // Perform dot product using fused multiply-add
-         acc = fmaf(w_vec.x, x_vec.x, acc);
-         acc = fmaf(w_vec.y, x_vec.y, acc);
-         acc = fmaf(w_vec.z, x_vec.z, acc);
-         acc = fmaf(w_vec.w, x_vec.w, acc);
-       }
-     }
- 
-     // Handle remainder elements
-     for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
-       acc = fmaf(w_row[k], lds_x[k], acc);
-     }
-     __syncthreads();
-   }
- 
-   // Optimized warp reduction and write output for current batch
-   float result = warp_reduce_sum(acc);
-   if (lane == 0) {
-     float* __restrict__ yb = y + (size_t)batch_idx * d;
-     yb[row] = result + (bias ? bias[row] : 0.0f);
-   }
- }
+    }
+    __syncthreads();
+
+    // 2) Optimized computation with weight row for current batch
+    const bf16_t* __restrict__ w_row = w + (size_t)row * n + k_base;
+    const uint2* __restrict__ w_row_u2 = reinterpret_cast<const uint2*>(w_row);
+
+    const int vec_k = (k_size / K_STEP_MATMUL_FLOAT) * K_STEP_MATMUL_FLOAT;
+
+    for (int k = lane * K_STEP_MATMUL_FLOAT; k < vec_k; k += WF_SIZE * K_STEP_MATMUL_FLOAT) {
+      if (k + K_STEP_MATMUL_FLOAT <= vec_k) {
+        const float4 w_vec = bf16quad_to_float4(w_row_u2[k >> 2]);
+        const float4 x_vec = *reinterpret_cast<const float4*>(&lds_x[k]);
+
+        acc = fmaf(w_vec.x, x_vec.x, acc);
+        acc = fmaf(w_vec.y, x_vec.y, acc);
+        acc = fmaf(w_vec.z, x_vec.z, acc);
+        acc = fmaf(w_vec.w, x_vec.w, acc);
+      }
+    }
+
+    for (int k = vec_k + lane; k < k_size; k += WF_SIZE) {
+      acc = fmaf(static_cast<float>(w_row[k]), lds_x[k], acc);
+    }
+    __syncthreads();
+  }
+
+  float result = warp_reduce_sum(acc);
+  if (lane == 0) {
+    float* __restrict__ yb = y + (size_t)batch_idx * d;
+    const float bias_val = bias ? static_cast<float>(bias[row]) : 0.0f;
+    yb[row] = result + bias_val;
+  }
+}
 
 // ================= MLP1 (Gate & Up) : batched per expert =================
 

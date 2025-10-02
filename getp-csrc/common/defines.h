@@ -142,10 +142,10 @@ struct HostPinnedBatchBuffers {
 };
 
 struct GPUWeightBuffersFP32 {
-  float *d_rms_attn_w, *d_rms_ffn_w;
-  float *d_b_qkv, *d_b_o, *d_attn_sinks;
-  float *d_w_router, *d_b_router;
-  float *d_rms_out_w;
+  bf16_t *d_rms_attn_w, *d_rms_ffn_w;
+  bf16_t *d_b_qkv, *d_b_o, *d_attn_sinks;
+  bf16_t *d_w_router, *d_b_router;
+  bf16_t *d_rms_out_w;
 };
 
 struct GPUExpertBiasBuffers {

@@ -201,7 +201,7 @@ __global__ void residual_add_batch_kernel_bf16(bf16_t *x,
 }
 
 __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
-                                     const float *weight, int size,
+                                     const bf16_t *weight, int size,
                                      const int *pos) {
   const int b = blockIdx.y;
 
@@ -251,7 +251,7 @@ __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
 
   for (int idx = tid; idx < size; idx += blockDim.x) {
     float v = static_cast<float>(x_b[idx]);
-    float w = weight[idx];
+    float w = static_cast<float>(weight[idx]);
     float result = w * (v * inv_rms);
     o_b[idx] = hip_bfloat16(result);
   }

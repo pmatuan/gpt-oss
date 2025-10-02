@@ -355,57 +355,65 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
 
   debug_print_gpu_memory("after activations", device_id);
 
-  // Weights (small FP32)
+  const int n_streams = 4;
+  const size_t chunk_bytes = 64ULL * 1024 * 1024;
+
+  // Weights (converted to BF16 on device)
   TransformerWeights *w = &transformer->weights;
 
   const int H_ = H;
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_attn_w, w->rms_attn_w,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->rms_attn_w, (size_t)L * H_,
+                           ctx.gpu_weights_fp32.d_rms_attn_w, n_streams,
+                           chunk_bytes);
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_ffn_w, w->rms_ffn_w,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->rms_ffn_w, (size_t)L * H_,
+                           ctx.gpu_weights_fp32.d_rms_ffn_w, n_streams,
+                           chunk_bytes);
 
   const int D_ = model_config->head_dim;
   const int Hq_ = model_config->n_attn_heads;
   const int Hk_ = model_config->n_kv_heads;
   const int QKV_D = D_ * (Hq_ + 2 * Hk_);
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, L * QKV_D * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_qkv, w->b_qkv,
-                      L * QKV_D * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, L * QKV_D * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_qkv, (size_t)L * QKV_D,
+                           ctx.gpu_weights_fp32.d_b_qkv, n_streams,
+                           chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_o, w->b_o,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_o, (size_t)L * H_, ctx.gpu_weights_fp32.d_b_o,
+                           n_streams, chunk_bytes);
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_attn_sinks, w->attn_sinks,
-                      L * Hq_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->attn_sinks, (size_t)L * Hq_,
+                           ctx.gpu_weights_fp32.d_attn_sinks, n_streams,
+                           chunk_bytes);
 
   const int E_ = model_config->n_experts;
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H_ * E_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_w_router, w->w_router,
-                      L * H_ * E_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H_ * E_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_router, (size_t)L * H_ * E_,
+                           ctx.gpu_weights_fp32.d_w_router, n_streams,
+                           chunk_bytes);
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_router, w->b_router,
-                      L * E_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_router, (size_t)L * E_,
+                           ctx.gpu_weights_fp32.d_b_router, n_streams,
+                           chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w, H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_out_w, w->rms_out_w,
-                      H_ * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w,
+                      H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->rms_out_w, (size_t)H_,
+                           ctx.gpu_weights_fp32.d_rms_out_w, n_streams,
+                           chunk_bytes);
 
-  debug_print_gpu_memory("after small FP32 weights", device_id);
-  
-  const int n_streams = 4;
-  const size_t chunk_bytes = 64ULL * 1024 * 1024;
+  debug_print_gpu_memory("after small BF16 weights", device_id);
 
   // Expert biases FP32 (sharded per-device by local experts)
   const int IM_ = model_config->intermediate_dim;
