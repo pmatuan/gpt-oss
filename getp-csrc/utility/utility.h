@@ -116,6 +116,22 @@ __global__ void route_pack_owner_kernel(
     int K,
     int E);
 
+__global__ void fused_route_owner_kernel(
+    int* __restrict__ b2local,
+    int* __restrict__ local2b,
+    int* __restrict__ owner_B,
+    int* __restrict__ expert_offsets,
+    int* __restrict__ expert_counts_out,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ e2lid_owner_l,
+    int B,
+    int K,
+    int E,
+    int E_local);
+
 // Pack rows x[b,:] for lb=b2local[b] >=0 into dst[lb,:].
 __global__ void pack_rows_owner_kernel(
     bf16_t* __restrict__ dst,          // [B_local, H]
@@ -128,7 +144,7 @@ __global__ void pack_rows_owner_kernel(
 __global__ void pack_meta_owner_kernel(
     int* __restrict__ pos_owner,         // [B_local]
     float* __restrict__ topk_v_owner,    // [B_local*K]
-    const int* __restrict__ local2b,     // [B_local]
+    const int* __restrict__ local2b,     // [B]
     int owner_B,
     const int* __restrict__ pos,         // [B]
     const float* __restrict__ topk_v,    // [B*K]

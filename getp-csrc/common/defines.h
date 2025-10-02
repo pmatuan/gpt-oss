@@ -178,7 +178,6 @@ struct HomePeerBuffers {
   int **d_local2b_peer = nullptr;        // [ndev]
   int **d_expert_counts_peer = nullptr;  // [ndev]
   int **d_expert_offsets_peer = nullptr; // [ndev]
-  int **d_expert_writes_peer = nullptr;  // [ndev]
   int **d_pos_peer = nullptr;            // [ndev]
   float **d_topk_v_peer = nullptr;       // [ndev]
   int *h_owner_B = nullptr;              // [ndev] host pinned
@@ -216,6 +215,9 @@ struct DeviceContext {
   hipStream_t pack_stream = nullptr;      // route_count + scan + route_pack
   hipStream_t mlp_stream = nullptr;       // run MLP on owner
   hipStream_t *comm_streams = nullptr;    // [ndev]
+  hipEvent_t router_ready_event = nullptr;
+  hipEvent_t *pack_done_events = nullptr;   // [ndev]
+  hipEvent_t *copy_ready_events = nullptr;  // [ndev]
 
   size_t stride_w_qkv_bf16 = 0;
   size_t stride_w_o_bf16 = 0;

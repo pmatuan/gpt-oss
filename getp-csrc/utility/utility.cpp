@@ -731,6 +731,110 @@ __global__ void route_pack_owner_kernel(
   }
 }
 
+__global__ void fused_route_owner_kernel(
+    int* __restrict__ b2local,
+    int* __restrict__ local2b,
+    int* __restrict__ owner_B,
+    int* __restrict__ expert_offsets,
+    int* __restrict__ expert_counts_out,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ e2lid_owner_l,
+    int B,
+    int K,
+    int E,
+    int E_local) {
+  extern __shared__ int shared_ints[];
+  int *counts = shared_ints;                         // [E_local]
+  int *offsets = counts + E_local;                  // [E_local + 1]
+  int *writes = offsets + (E_local + 1);            // [E_local]
+  __shared__ int owner_B_shared;
+
+  if (threadIdx.x == 0) owner_B_shared = 0;
+  for (int i = threadIdx.x; i < E_local; i += blockDim.x) {
+    counts[i] = 0;
+    writes[i] = 0;
+  }
+  if (threadIdx.x == 0) offsets[0] = 0;
+  __syncthreads();
+
+  for (int b = threadIdx.x; b < B; b += blockDim.x) {
+    b2local[b] = -1;
+    local2b[b] = -1;
+  }
+  __syncthreads();
+
+  for (int b = threadIdx.x; b < B; b += blockDim.x) {
+    if (pos[b] < 0) continue;
+    for (int k = 0; k < K; ++k) {
+      const int e = topk_i[(size_t)b * (size_t)K + k];
+      if ((unsigned)e >= (unsigned)E) continue;
+      const int lid = e2lid_owner_l[e];
+      if (lid < 0 || lid >= E_local) continue;
+      atomicAdd(&counts[lid], 1);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    int running = 0;
+    for (int i = 0; i < E_local; ++i) {
+      offsets[i] = running;
+      running += counts[i];
+    }
+    offsets[E_local] = running;
+    if (owner_B) *owner_B = 0;
+  }
+  __syncthreads();
+
+  if (expert_offsets) {
+    for (int i = threadIdx.x; i <= E_local; i += blockDim.x) {
+      expert_offsets[i] = offsets[i];
+    }
+  }
+  if (expert_counts_out) {
+    for (int i = threadIdx.x; i < E_local; i += blockDim.x) {
+      expert_counts_out[i] = counts[i];
+    }
+  }
+  __syncthreads();
+
+  for (int b = threadIdx.x; b < B; b += blockDim.x) {
+    if (pos[b] < 0) continue;
+    int lb = atomicCAS(&b2local[b], -1, -2);
+    if (lb == -1) {
+      const int new_id = atomicAdd(&owner_B_shared, 1);
+      local2b[new_id] = b;
+      __threadfence();
+      atomicExch(&b2local[b], new_id);
+      lb = new_id;
+    } else if (lb == -2) {
+      do {
+        lb = b2local[b];
+      } while (lb == -2);
+    }
+    if (lb < 0) continue;
+
+    for (int k = 0; k < K; ++k) {
+      const int e = topk_i[(size_t)b * (size_t)K + k];
+      if ((unsigned)e >= (unsigned)E) continue;
+      const int lid = e2lid_owner_l[e];
+      if (lid < 0 || lid >= E_local) continue;
+      const int write = atomicAdd(&writes[lid], 1);
+      const int idx = offsets[lid] + write;
+      assignment_batches[idx] = static_cast<uint16_t>(lb);
+      assignment_slots[idx] = static_cast<uint8_t>(k);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0 && owner_B) {
+    *owner_B = owner_B_shared;
+  }
+}
+
 __global__ void pack_rows_owner_kernel(
     bf16_t* __restrict__ dst,
     const bf16_t* __restrict__ src,
