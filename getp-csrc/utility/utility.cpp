@@ -629,6 +629,16 @@ __global__ void accumulate_partials_kernel(
   }
 }
 
+__global__ void zero_partial_rows_kernel(
+    float* __restrict__ dst,
+    int H,
+    int rows) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = blockIdx.y * blockDim.y + threadIdx.y;
+  if (b >= rows || h >= H) return;
+  dst[(size_t)b * (size_t)H + h] = 0.0f;
+}
+
 // ================= Device-side bucketization & packing (MoE routing) ================
 __global__ void route_count_owner_kernel(
     int* __restrict__ expert_counts,
@@ -738,19 +748,32 @@ __global__ void pack_rows_owner_kernel(
 __global__ void pack_meta_owner_kernel(
     int* __restrict__ pos_owner,
     float* __restrict__ topk_v_owner,
-    const int* __restrict__ b2local,
+    const int* __restrict__ local2b,
+    int owner_B,
     const int* __restrict__ pos,
     const float* __restrict__ topk_v,
-    int B,
     int K) {
-  const int b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B) return;
-  const int lb = b2local[b];
-  if (lb < 0) return;
+  const int lb = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lb >= owner_B) return;
+  const int b = local2b[lb];
+  if (b < 0) return;
   pos_owner[lb] = pos[b];
   for (int k = 0; k < K; ++k) {
     topk_v_owner[(size_t)lb * K + k] = topk_v[(size_t)b * K + k];
   }
+}
+
+__global__ void reset_owner_mappings_kernel(
+    int* __restrict__ b2local,
+    int* __restrict__ local2b,
+    int prev_owner_B) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= prev_owner_B) return;
+  const int b = local2b[idx];
+  if (b >= 0) {
+    b2local[b] = -1;
+  }
+  local2b[idx] = -1;
 }
 
 // Matmul Helper Functions

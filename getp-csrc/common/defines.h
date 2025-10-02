@@ -181,6 +181,9 @@ struct HomePeerBuffers {
   int **d_expert_writes_peer = nullptr;  // [ndev]
   int **d_pos_peer = nullptr;            // [ndev]
   float **d_topk_v_peer = nullptr;       // [ndev]
+  int *h_owner_B = nullptr;              // [ndev] host pinned
+  int *h_total_assign = nullptr;         // [ndev] host pinned
+  int *h_prev_owner_B = nullptr;         // [ndev] host-persistent for selective resets
 };
 
 struct OwnerReceiveBuffers {
