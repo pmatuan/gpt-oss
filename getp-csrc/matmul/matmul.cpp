@@ -3,6 +3,33 @@
 #include "matmul.h"
 #include <math.h>
 
+struct StoreLogits {
+  float *__restrict__ y;
+  int d;
+  __device__ __forceinline__ void operator()(int row, int col, float val) const {
+    y[(size_t)row * (size_t)d + col] = val;
+  }
+};
+
+struct StoreArgmax {
+  int *__restrict__ out;
+  float *__restrict__ max_vals;
+
+  __device__ __forceinline__ void operator()(int row, int col, float val) const {
+    int *addr = reinterpret_cast<int *>(&max_vals[row]);
+    int old_bits = atomicAdd(addr, 0);
+    while (__int_as_float(old_bits) < val) {
+      const int new_bits = __float_as_int(val);
+      const int prev = atomicCAS(addr, old_bits, new_bits);
+      if (prev == old_bits) {
+        out[row] = col;
+        break;
+      }
+      old_bits = prev;
+    }
+  }
+};
+
 template <
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
   int WARP_TILE_M, int WARP_TILE_N
@@ -180,10 +207,11 @@ __device__ __forceinline__ void matmul_bias_bf16_mfma_body(
 
 template <
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
-  int WARP_TILE_M, int WARP_TILE_N
+  int WARP_TILE_M, int WARP_TILE_N,
+  typename StoreOp
 >
-__device__ __forceinline__ void matmul_bf16_mfma_body(
-    float *__restrict__ y,
+__device__ __forceinline__ void matmul_bf16_mfma_body_impl(
+    const StoreOp &store,
     const bf16_t *__restrict__ x,
     const bf16_t *__restrict__ w,
     int n, int d, int B,
@@ -363,10 +391,43 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
         if (row >= B) continue;
         if (has_pos && pos[row] < 0) continue;
 
-        y[(size_t)row * (size_t)d + col] = v[i];
+        store(row, col, v[i]);
       }
     }
   }
+}
+
+template <
+  int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
+  int WARP_TILE_M, int WARP_TILE_N
+>
+__device__ __forceinline__ void matmul_bf16_mfma_body(
+    float *__restrict__ y,
+    const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w,
+    int n, int d, int B,
+    const int *__restrict__ pos) {
+  StoreLogits store{y, d};
+  matmul_bf16_mfma_body_impl<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH,
+                             WARP_TILE_M, WARP_TILE_N>(
+      store, x, w, n, d, B, pos);
+}
+
+template <
+  int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
+  int WARP_TILE_M, int WARP_TILE_N
+>
+__device__ __forceinline__ void matmul_logits_argmax_body(
+    int *__restrict__ out,
+    float *__restrict__ max_vals,
+    const bf16_t *__restrict__ x,
+    const bf16_t *__restrict__ w,
+    int n, int d, int B,
+    const int *__restrict__ pos) {
+  StoreArgmax store{out, max_vals};
+  matmul_bf16_mfma_body_impl<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH,
+                             WARP_TILE_M, WARP_TILE_N>(
+      store, x, w, n, d, B, pos);
 }
 
 __global__ void matmul_bias_qkv_kernel(
@@ -398,6 +459,27 @@ __global__ void matmul_logits_kernel(
       MATMUL_LOGITS_BLOCK_DEPTH, MATMUL_LOGITS_WARP_TILE_M,
       MATMUL_LOGITS_WARP_TILE_N>(
       y, x, w, n, d, B, pos);
+}
+
+__global__ void init_argmax_state_kernel(float *__restrict__ max_vals,
+                                         int *__restrict__ out_indices,
+                                         int B) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= B)
+    return;
+  max_vals[idx] = -INFINITY;
+  out_indices[idx] = -1;
+}
+
+__global__ void matmul_logits_argmax_kernel(
+    int *__restrict__ out_indices, float *__restrict__ max_vals,
+    const bf16_t *__restrict__ x, const bf16_t *__restrict__ w,
+    int n, int d, int B, const int *__restrict__ pos) {
+  matmul_logits_argmax_body<
+      MATMUL_LOGITS_BLOCK_ROWS, MATMUL_LOGITS_BLOCK_COLS,
+      MATMUL_LOGITS_BLOCK_DEPTH, MATMUL_LOGITS_WARP_TILE_M,
+      MATMUL_LOGITS_WARP_TILE_N>(
+      out_indices, max_vals, x, w, n, d, B, pos);
 }
 
 /**

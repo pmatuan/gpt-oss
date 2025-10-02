@@ -26,6 +26,18 @@ matmul_logits_kernel(float *__restrict__ y,        // [B x d]
                      int n, int d, int B, const int *__restrict__ pos);
 
 __global__ void
+init_argmax_state_kernel(float *__restrict__ max_vals, int *__restrict__ out_indices,
+                         int B);
+
+__global__ void
+matmul_logits_argmax_kernel(int *__restrict__ out_indices,
+                            float *__restrict__ max_vals,
+                            const bf16_t *__restrict__ x,
+                            const bf16_t *__restrict__ w,
+                            int n, int d, int B,
+                            const int *__restrict__ pos);
+
+__global__ void
 matmul_router_kernel(float *__restrict__ y,        // [B, d]
                      const bf16_t *__restrict__ x, // [B, n] (bf16)
                      const bf16_t *__restrict__ w,  // [d, n] (row-major theo n)

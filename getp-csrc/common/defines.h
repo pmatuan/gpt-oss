@@ -114,7 +114,7 @@ struct GPUActivationBuffers {
   int kv_window_capacity;
   int kv_seq_limit;
   uint32_t kv_batch_stride;
-  float *d_logits;
+  float *d_row_max;
   int *d_next_tokens;
   int *d_tokens;
   int *d_pos;

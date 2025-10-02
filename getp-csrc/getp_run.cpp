@@ -141,7 +141,7 @@ static void init_device_context(DeviceContext &ctx, int device_id,
   ctx.h_kv_layer_capacity.clear();
   ctx.d_kv_layer_offsets = nullptr;
   ctx.d_kv_layer_capacity = nullptr;
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_row_max, (size_t)B * sizeof(float)));
 
   // Allocate batch helpers upfront for MAX_BATCH_SIZE
   ctx.capacity_B = B;
@@ -393,8 +393,8 @@ static void cleanup_device_context(DeviceContext &ctx) {
   ctx.gpu_activations.kv_seq_capacity = 0;
   ctx.gpu_activations.kv_window_capacity = 0;
   ctx.gpu_activations.kv_batch_stride = 0;
-  if (ctx.gpu_activations.d_logits)
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_logits));
+  if (ctx.gpu_activations.d_row_max)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_row_max));
   if (ctx.gpu_activations.d_next_tokens)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_next_tokens));
   if (ctx.gpu_activations.d_inv_rms)
@@ -887,30 +887,30 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           ctx.gpu_weights_fp32.d_rms_out_w, H, ctx.gpu_activations.d_pos);
     }
 
-    // 2) MatMul for logits - separate GEMM version (no bias)
+    // 2) Initialize row maxima buffer
     {
-      PROFILE_GPU_SCOPE("matmul_logits_kernel", 0);
+      PROFILE_GPU_SCOPE("init_argmax_state_kernel", 0);
+      const int threads = 256;
+      const int blocks = (batch_size + threads - 1) / threads;
+      init_argmax_state_kernel<<<blocks, threads>>>(
+          ctx.gpu_activations.d_row_max, ctx.gpu_activations.d_next_tokens,
+          batch_size);
+    }
+
+    // 3) MatMul + Argmax fusion
+    {
+      PROFILE_GPU_SCOPE("matmul_logits_argmax_kernel", 0);
       dim3 gridV_gemm(
           (V + MATMUL_LOGITS_BLOCK_COLS - 1) / MATMUL_LOGITS_BLOCK_COLS,
           (batch_size + MATMUL_LOGITS_BLOCK_ROWS - 1) / MATMUL_LOGITS_BLOCK_ROWS,
           1);
       dim3 blockV(WF_SIZE, MATMUL_LOGITS_WAVES_PER_BLOCK, 1);
-      matmul_logits_kernel<<<gridV_gemm, blockV>>>(
-          ctx.gpu_activations.d_logits, ctx.gpu_activations.d_t,
-          ctx.gpu_weights_bf16.d_out_bf16, H, V, batch_size,
-          ctx.gpu_activations.d_pos);
+      matmul_logits_argmax_kernel<<<gridV_gemm, blockV>>>(
+          ctx.gpu_activations.d_next_tokens, ctx.gpu_activations.d_row_max,
+          ctx.gpu_activations.d_t, ctx.gpu_weights_bf16.d_out_bf16,
+          H, V, batch_size, ctx.gpu_activations.d_pos);
+      HIP_CHECK(hipGetLastError());
     }
-  }
-
-  {
-    PROFILE_GPU_SCOPE("argmax_batch_kernel", 0);
-    dim3 grid_argmax(batch_size, 1, 1);
-    size_t shared_bytes = (size_t)BLOCK_SIZE * (sizeof(float) + sizeof(int));
-
-    argmax_batch_kernel<<<grid_argmax, block, shared_bytes>>>(
-        ctx.gpu_activations.d_logits, ctx.gpu_activations.d_next_tokens,
-        V, batch_size, ctx.gpu_activations.d_pos);
-    HIP_CHECK(hipGetLastError());
   }
 
   return ctx.gpu_activations.d_next_tokens;

@@ -306,7 +306,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   ctx.h_kv_layer_capacity.clear();
   ctx.d_kv_layer_offsets = nullptr;
   ctx.d_kv_layer_capacity = nullptr;
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_row_max, (size_t)B * sizeof(float)));
 
   // Allocate batch helpers upfront for MAX_BATCH_SIZE
   ctx.capacity_B = B;
