@@ -239,8 +239,8 @@ static const ModelSpec MODEL_120B{
     "120B", 2880, 36, 128, 4, 2880, 64, 8, 64, 201088, 7.0f};
 
 static const std::array<BenchmarkSetting, 2> g_settings = {
-    BenchmarkSetting{MODEL_20B, 1536},
-    BenchmarkSetting{MODEL_120B, 1536},
+    BenchmarkSetting{MODEL_20B, 896},
+    BenchmarkSetting{MODEL_120B, 768},
 };
 
 static inline std::vector<float> copy_device_float(float *d_ptr, size_t elems) {
