@@ -120,6 +120,8 @@ struct GPUActivationBuffers {
   int *d_tokens;
   int *d_pos;
   float *d_inv_rms;
+  float *d_rope_inv_freq;
+  float rope_concentration;
 };
 
 struct DeviceExpertWorkspace {

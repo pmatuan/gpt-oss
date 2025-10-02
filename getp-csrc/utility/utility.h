@@ -40,7 +40,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // model params
     int Hq, int Hk, int D,
     // RoPE params
-    float theta, float rope_scaling_factor, int initial_context_length,
+    const float* __restrict__ rope_inv_freq,
+    float rope_concentration,
     // cache params
     int layer_idx,
     const uint32_t *__restrict__ layer_offsets,

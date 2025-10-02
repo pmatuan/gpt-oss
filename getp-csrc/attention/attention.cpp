@@ -75,7 +75,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   const int tid = threadIdx.x;
   const int lane = tid & (WF_SIZE - 1);
   const int wid = tid / WF_SIZE;
-  const int nwarp = (blockDim.x + WF_SIZE - 1) / WF_SIZE;
+  const int nwarp = max(1, (blockDim.x + WF_SIZE - 1) / WF_SIZE);
 
   const int pos_b = pos[b];
   if (pos_b < 0)
@@ -85,7 +85,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   if (cap <= 0)
     return;
 
-  const int kv_mul = Hq / Hk;
+  const int kv_mul = 8;
   if (kv_mul > ATTN_FLASH_MAX_KV_MUL)
     return;
   const int kv_dim = Hk * D;
@@ -100,6 +100,10 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   const bf16_t *__restrict__ q_b = q + (size_t)b * Hq * D;
   bf16_t *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
 
+  const int d_owner = tid % D;
+  const int workers_this_dim = ((blockDim.x - 1 - d_owner) / D) + 1;
+  const int worker_rank = tid / D;
+
   int start_t = 0;
   if constexpr (HAS_WINDOW) {
     start_t = pos_b + 1 - sliding_window;
@@ -110,8 +114,10 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   if (att_tokens <= 0)
     return;
 
+  const int score_stride = ATTN_FLASH_TILE + 1;
   float *s_scores = smem_dyn;
-  float *s_q = s_scores + kv_mul * ATTN_FLASH_TILE;
+  float *s_q = s_scores + kv_mul * score_stride;
+  float *s_accum = s_q + kv_mul * D;
 
   __shared__ float s_m[ATTN_FLASH_MAX_KV_MUL];
   __shared__ float s_l[ATTN_FLASH_MAX_KV_MUL];
@@ -146,13 +152,9 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   }
   __syncthreads();
 
-  const int d_owner = tid;
   float acc[ATTN_FLASH_MAX_KV_MUL];
-  if (d_owner < D) {
-#pragma unroll
-    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
-      acc[qh] = 0.0f;
-  }
+  for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
+    acc[qh] = 0.0f;
 
   int done = 0;
   while (done < att_tokens) {
@@ -164,7 +166,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
     for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
       thread_max[qh] = -INFINITY;
 
-    for (int local_t = tid; local_t < tile_len; local_t += blockDim.x) {
+    for (int local_t = wid; local_t < tile_len; local_t += nwarp) {
       const int t = tile_base_t + local_t;
       const int slot = t % cap;
       const size_t slot_off = (size_t)slot * kv_dim + kv_head_offset;
@@ -178,7 +180,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 
       const int D4 = D >> 2;
 #pragma unroll 4
-      for (int d4 = 0; d4 < D4; ++d4) {
+      for (int d4 = lane; d4 < D4; d4 += WF_SIZE) {
         const float4 kv = bf16quad_to_float4(k_u2[d4]);
         const int base = d4 << 2;
 #pragma unroll
@@ -190,7 +192,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
           sc[qh] = fmaf(qv[3], kv.w, sc[qh]);
         }
       }
-      for (int d = (D4 << 2); d < D; ++d) {
+      for (int d = (D4 << 2) + lane; d < D; d += WF_SIZE) {
         const float kd = static_cast<float>(k_ptr[d]);
 #pragma unroll
         for (int qh = 0; qh < kv_mul; ++qh) {
@@ -199,9 +201,15 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
       }
 #pragma unroll
       for (int qh = 0; qh < kv_mul; ++qh) {
-        sc[qh] *= rsqrt_D;
-        s_scores[qh * ATTN_FLASH_TILE + local_t] = sc[qh];
-        thread_max[qh] = fmaxf(thread_max[qh], sc[qh]);
+        float sum = sc[qh];
+        for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
+          sum += __shfl_down(sum, offset, WF_SIZE);
+        }
+        if (lane == 0) {
+          const float scaled = sum * rsqrt_D;
+          s_scores[qh * score_stride + local_t] = scaled;
+          thread_max[qh] = fmaxf(thread_max[qh], scaled);
+        }
       }
     }
     __syncthreads();
@@ -220,16 +228,15 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
         }
       }
       __syncthreads();
-      if (d_owner < D)
-        acc[qh] *= s_scale[qh];
+      acc[qh] *= s_scale[qh];
       __syncthreads();
     }
 
     for (int qh = 0; qh < kv_mul; ++qh) {
       float thread_sum = 0.0f;
       for (int local_t = tid; local_t < tile_len; local_t += blockDim.x) {
-        float p = __expf(s_scores[qh * ATTN_FLASH_TILE + local_t] - s_m[qh]);
-        s_scores[qh * ATTN_FLASH_TILE + local_t] = p;
+        float p = __expf(s_scores[qh * score_stride + local_t] - s_m[qh]);
+        s_scores[qh * score_stride + local_t] = p;
         thread_sum += p;
       }
       __syncthreads();
@@ -240,18 +247,17 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
       __syncthreads();
     }
 
-    if (d_owner < D) {
-      for (int local_t = 0; local_t < tile_len; ++local_t) {
-        const int t = tile_base_t + local_t;
-        const int slot = t % cap;
-        const size_t slot_off = (size_t)slot * kv_dim + kv_head_offset;
-        const bf16_t *__restrict__ v_ptr = v_layer + slot_off;
-        const float v_d = static_cast<float>(v_ptr[d_owner]);
+    for (int local_t = worker_rank; local_t < tile_len;
+         local_t += workers_this_dim) {
+      const int t = tile_base_t + local_t;
+      const int slot = t % cap;
+      const size_t slot_off = (size_t)slot * kv_dim + kv_head_offset;
+      const bf16_t *__restrict__ v_ptr = v_layer + slot_off;
+      const float v_d = static_cast<float>(v_ptr[d_owner]);
 #pragma unroll
-        for (int qh = 0; qh < kv_mul; ++qh) {
-          const float p = s_scores[qh * ATTN_FLASH_TILE + local_t];
-          acc[qh] = fmaf(p, v_d, acc[qh]);
-        }
+      for (int qh = 0; qh < kv_mul; ++qh) {
+        const float p = s_scores[qh * score_stride + local_t];
+        acc[qh] = fmaf(p, v_d, acc[qh]);
       }
     }
     __syncthreads();
@@ -276,12 +282,24 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   }
   __syncthreads();
 
-  if (d_owner < D) {
+  for (int qh = 0; qh < kv_mul; ++qh) {
+    acc[qh] *= s_scale[qh];
+    s_accum[qh * ATTN_THREADS_PER_BLOCK + tid] = acc[qh];
+  }
+  __syncthreads();
+
+  if (worker_rank == 0) {
 #pragma unroll
     for (int qh = 0; qh < kv_mul; ++qh) {
-      acc[qh] *= s_scale[qh];
+      float total = 0.0f;
+      for (int w = 0; w < workers_this_dim; ++w) {
+        const int peer_tid = d_owner + w * D;
+        if (peer_tid >= blockDim.x)
+          break;
+        total += s_accum[qh * ATTN_THREADS_PER_BLOCK + peer_tid];
+      }
       const float inv_l = __frcp_rn(s_l[qh]);
-      const float val = acc[qh] * inv_l;
+      const float val = total * inv_l;
       const int q_head = kv_head * kv_mul + qh;
       out_b[(size_t)q_head * D + d_owner] = hip_bfloat16(val);
     }

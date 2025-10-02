@@ -70,7 +70,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // model params
     int Hq, int Hk, int D,
     // RoPE params
-    float theta, float rope_scaling_factor, int initial_context_length,
+    const float* __restrict__ rope_inv_freq,
+    float rope_concentration,
     // cache params
     int layer_idx,
     const uint32_t *__restrict__ layer_offsets,
@@ -81,10 +82,10 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
 
     const int h = blockIdx.x;           // head idx
     const int b = blockIdx.y;           // batch idx
-    const int i = threadIdx.x;          // [0..D/2)
+    const int lane = threadIdx.x & (WF_SIZE - 1);
     const int half = D >> 1;
 
-    if (b >= batch_size || i >= half) return;
+    if (b >= batch_size || half <= 0 || !rope_inv_freq) return;
 
     const int pos_b = pos[b];
     if (pos_b < 0) return;
@@ -104,63 +105,49 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_batch_stride;
     const bf16_t* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
-    // ---- compute RoPE angles for this (i, b)
-    // inv_freq with scaling (khớp logic hiện tại)
-    float freq = powf(theta, (float)(2 * i) / (float)D);
-    float inv_freq;
-    float concentration = 1.0f;
-    if (rope_scaling_factor > 1.0f) {
-        concentration = 0.1f * logf(rope_scaling_factor) + 1.0f;
-        const float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-        const float low  = half * logf((float)initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(theta);
-        const float high = half * logf((float)initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(theta);
-        const float interpolation = 1.0f / (rope_scaling_factor * freq);
-        const float extrapolation = 1.0f / freq;
-        float ramp = ((float)i - low) / (high - low);
-        ramp = fmaxf(0.0f, fminf(1.0f, ramp));
-        const float mask = 1.0f - ramp;
-        inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
-    } else {
-        inv_freq = 1.0f / freq;
-    }
-    const float ang = pos_b * inv_freq;
-    const float c = cosf(ang) * concentration;
-    const float s = sinf(ang) * concentration;
+    const float concentration = rope_concentration;
 
-    // ---- Q: read from qkv, apply RoPE, write to q_out
-    if (h < Hq) {
-        const int q_off = h * D;
-        float x1 = static_cast<float>(qkv_b[q_off + i]);
-        float x2 = static_cast<float>(qkv_b[q_off + half + i]);
-        // rotate
-        float y1 = x1 * c - x2 * s;
-        float y2 = x2 * c + x1 * s;
-        q_b[q_off + i]        = hip_bfloat16(y1);
-        q_b[q_off + half + i] = hip_bfloat16(y2);
-    }
+    for (int i = lane; i < half; i += WF_SIZE) {
+        const float inv_freq = rope_inv_freq[i];
+        const float ang = pos_b * inv_freq;
+        float s_val, c_val;
+        sincosf(ang, &s_val, &c_val);
+        c_val *= concentration;
+        s_val *= concentration;
 
-    // ---- K: read from qkv, apply RoPE, scatter to key_cache
-    if (h < Hk) {
-        const int k_off_qkv = q_size + h * D;           // K starts after Q
-        const int slot = pos_b % cap;
-        const size_t kc_idx = (size_t)layer_base + (size_t)slot * KV +
-                              (size_t)h * D;
+        // ---- Q: read from qkv, apply RoPE, write to q_out
+        if (h < Hq) {
+            const int q_off = h * D;
+            const float x1 = static_cast<float>(qkv_b[q_off + i]);
+            const float x2 = static_cast<float>(qkv_b[q_off + half + i]);
+            const float y1 = x1 * c_val - x2 * s_val;
+            const float y2 = x2 * c_val + x1 * s_val;
+            q_b[q_off + i]        = hip_bfloat16(y1);
+            q_b[q_off + half + i] = hip_bfloat16(y2);
+        }
 
-        float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
-        float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
-        float rk1 = k1 * c - k2 * s;
-        float rk2 = k2 * c + k1 * s;
+        if (h < Hk) {
+            const int slot = pos_b % cap;
+            const size_t kc_idx = (size_t)layer_base + (size_t)slot * KV +
+                                  (size_t)h * D;
 
-        kcache_b[kc_idx + i]        = hip_bfloat16(rk1);
-        kcache_b[kc_idx + half + i] = hip_bfloat16(rk2);
+            // ---- K: read from qkv, apply RoPE, scatter to key_cache
+            const int k_off_qkv = q_size + h * D;           // K starts after Q
+            const float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
+            const float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
+            const float rk1 = k1 * c_val - k2 * s_val;
+            const float rk2 = k2 * c_val + k1 * s_val;
+            kcache_b[kc_idx + i]        = hip_bfloat16(rk1);
+            kcache_b[kc_idx + half + i] = hip_bfloat16(rk2);
 
-        // ---- V: read from qkv, direct scatter (no RoPE)
-        const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
-        const size_t vc_idx = kc_idx;
-        float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
-        float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
-        vcache_b[vc_idx + i]        = hip_bfloat16(v1);
-        vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
+            // ---- V: read from qkv, direct scatter (no RoPE)
+            const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
+            const size_t vc_idx = kc_idx;
+            const float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
+            const float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
+            vcache_b[vc_idx + i]        = hip_bfloat16(v1);
+            vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
+        }
     }
 }
 

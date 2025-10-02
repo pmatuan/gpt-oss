@@ -1,5 +1,5 @@
-srun: job 78349 queued and waiting for resources
-srun: job 78349 has been allocated resources
+srun: job 78678 queued and waiting for resources
+srun: job 78678 has been allocated resources
 parsing args...
 loading tiktoken encoding: o200k_harmony
 reading submission: submission/output_20b_token_ids.txt
@@ -17,8 +17,8 @@ downloading nltk resource: omw-1.4
 downloaded: omw-1.4
 aligning by index, items: 896
 computing METEOR in parallel with 96 workers...
-  0%|          | 0/896 [00:00<?, ?it/s]  0%|          | 1/896 [00:21<5:14:45, 21.10s/it]  0%|          | 2/896 [00:21<2:13:17,  8.95s/it]  0%|          | 3/896 [00:22<1:19:26,  5.34s/it]100%|██████████| 896/896 [00:22<00:00, 39.59it/s]
-meteor	0.506367
+  0%|          | 0/896 [00:00<?, ?it/s]  0%|          | 1/896 [00:19<4:45:43, 19.15s/it]  0%|          | 3/896 [00:21<1:24:19,  5.67s/it]  1%|▏         | 13/896 [00:21<14:25,  1.02it/s]   5%|▍         | 44/896 [00:22<02:59,  4.74it/s]100%|██████████| 896/896 [00:22<00:00, 40.34it/s]
+meteor	0.518625
 computing BERTScore (roberta-large-mnli)...
 found local BERTScore model at /nfs/gpu_trainee/final-project/models/bs_model/roberta-large-mnli
 loading BERTScore model: /nfs/gpu_trainee/final-project/models/bs_model/roberta-large-mnli...
@@ -27,14 +27,92 @@ calculating scores...
 computing bert embedding.
 BERTScore:   0%|          | 0/896 [00:00<?, ?it/s]
   0%|          | 0/4 [00:00<?, ?it/s][A
- 25%|██▌       | 1/4 [00:13<00:39, 13.20s/it][A
- 50%|█████     | 2/4 [00:14<00:12,  6.10s/it][A
-srun: interrupt (one more within 1 sec to abort)
-srun: StepId=78349.0 task 0: running
-srun: sending Ctrl-C to StepId=78349.0
-srun: forcing job termination
-srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
- 75%|███████▌  | 3/4 [00:15<00:03,  3.83s/it][Aslurmstepd: error: *** STEP 78349.0 ON MV-DZ-MI250-05 CANCELLED AT 2025-10-02T12:16:11 ***
-srun: sending Ctrl-C to StepId=78349.0
-srun: job abort in progress
-srun: sending Ctrl-C to StepId=78349.0
+ 25%|██▌       | 1/4 [00:12<00:36, 12.33s/it][A
+ 50%|█████     | 2/4 [00:13<00:11,  5.72s/it][A
+ 75%|███████▌  | 3/4 [00:14<00:03,  3.60s/it][A
+100%|██████████| 4/4 [00:15<00:00,  2.58s/it][A100%|██████████| 4/4 [00:15<00:00,  3.88s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A
+ 50%|█████     | 1/2 [00:00<00:00,  6.76it/s][A100%|██████████| 2/2 [00:00<00:00, 12.03it/s]
+done in 15.71 seconds, 8.15 sentences/sec
+calculating scores...
+computing bert embedding.
+BERTScore:  14%|█▍        | 128/896 [00:15<01:34,  8.15it/s]
+  0%|          | 0/4 [00:00<?, ?it/s][A
+ 25%|██▌       | 1/4 [00:01<00:03,  1.07s/it][A
+ 50%|█████     | 2/4 [00:02<00:02,  1.06s/it][A
+ 75%|███████▌  | 3/4 [00:03<00:01,  1.06s/it][A
+100%|██████████| 4/4 [00:04<00:00,  1.04s/it][A100%|██████████| 4/4 [00:04<00:00,  1.05s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A100%|██████████| 2/2 [00:00<00:00, 55.07it/s]
+done in 4.27 seconds, 30.01 sentences/sec
+calculating scores...
+computing bert embedding.
+BERTScore:  29%|██▊       | 256/896 [00:19<00:44, 14.25it/s]
+  0%|          | 0/4 [00:00<?, ?it/s][A
+ 25%|██▌       | 1/4 [00:01<00:03,  1.06s/it][A
+ 50%|█████     | 2/4 [00:02<00:02,  1.06s/it][A
+ 75%|███████▌  | 3/4 [00:03<00:01,  1.06s/it][A
+100%|██████████| 4/4 [00:04<00:00,  1.02it/s][A100%|██████████| 4/4 [00:04<00:00,  1.01s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A100%|██████████| 2/2 [00:00<00:00, 55.29it/s]
+done in 4.12 seconds, 31.07 sentences/sec
+calculating scores...
+computing bert embedding.
+BERTScore:  43%|████▎     | 384/896 [00:24<00:27, 18.93it/s]
+  0%|          | 0/4 [00:00<?, ?it/s][A
+ 25%|██▌       | 1/4 [00:01<00:03,  1.06s/it][A
+ 50%|█████     | 2/4 [00:02<00:02,  1.06s/it][A
+ 75%|███████▌  | 3/4 [00:03<00:01,  1.06s/it][A
+100%|██████████| 4/4 [00:04<00:00,  1.02s/it][A100%|██████████| 4/4 [00:04<00:00,  1.04s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A100%|██████████| 2/2 [00:00<00:00, 55.31it/s]
+done in 4.21 seconds, 30.37 sentences/sec
+calculating scores...
+computing bert embedding.
+BERTScore:  57%|█████▋    | 512/896 [00:28<00:17, 22.24it/s]
+  0%|          | 0/4 [00:00<?, ?it/s][A
+ 25%|██▌       | 1/4 [00:01<00:03,  1.05s/it][A
+ 50%|█████     | 2/4 [00:02<00:02,  1.04s/it][A
+ 75%|███████▌  | 3/4 [00:03<00:01,  1.04s/it][A
+100%|██████████| 4/4 [00:04<00:00,  1.00s/it][A100%|██████████| 4/4 [00:04<00:00,  1.02s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A100%|██████████| 2/2 [00:00<00:00, 54.97it/s]
+done in 4.14 seconds, 30.93 sentences/sec
+calculating scores...
+computing bert embedding.
+BERTScore:  71%|███████▏  | 640/896 [00:32<00:10, 24.75it/s]
+  0%|          | 0/4 [00:00<?, ?it/s][A
+ 25%|██▌       | 1/4 [00:01<00:03,  1.04s/it][A
+ 50%|█████     | 2/4 [00:02<00:02,  1.04s/it][A
+ 75%|███████▌  | 3/4 [00:03<00:01,  1.04s/it][A
+100%|██████████| 4/4 [00:04<00:00,  1.01it/s][A100%|██████████| 4/4 [00:04<00:00,  1.01s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A100%|██████████| 2/2 [00:00<00:00, 55.27it/s]
+done in 4.11 seconds, 31.17 sentences/sec
+calculating scores...
+computing bert embedding.
+BERTScore:  86%|████████▌ | 768/896 [00:36<00:04, 26.61it/s]
+  0%|          | 0/4 [00:00<?, ?it/s][A
+ 25%|██▌       | 1/4 [00:01<00:03,  1.04s/it][A
+ 50%|█████     | 2/4 [00:02<00:02,  1.04s/it][A
+ 75%|███████▌  | 3/4 [00:03<00:01,  1.04s/it][A
+100%|██████████| 4/4 [00:04<00:00,  1.04s/it][A100%|██████████| 4/4 [00:04<00:00,  1.04s/it]
+computing greedy matching.
+
+  0%|          | 0/2 [00:00<?, ?it/s][A100%|██████████| 2/2 [00:00<00:00, 54.77it/s]
+BERTScore: 100%|██████████| 896/896 [00:40<00:00, 27.68it/s]BERTScore: 100%|██████████| 896/896 [00:40<00:00, 21.96it/s]
+done in 4.24 seconds, 30.17 sentences/sec
+bertscore_f1	0.977443
+========== 
+
+done.
+items	896
+meteor	0.518625
+bertscore_f1	0.977443

@@ -45,7 +45,8 @@ static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
   if (seq_limit_hint > 0 && required_seq > seq_limit_hint)
     required_seq = seq_limit_hint;
 
-  required_seq = std::max(1, std::min(required_seq, p->seq_len));
+  const int max_seq_capacity = std::max(p->seq_len, p->initial_context_length);
+  required_seq = std::max(1, std::min(required_seq, max_seq_capacity));
 
   const bool has_window = (p->sliding_window > 0);
   const int KV = p->head_dim * p->n_kv_heads;
@@ -64,8 +65,8 @@ static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
       grown = required_seq;
     if (seq_limit_hint > 0 && grown > seq_limit_hint)
       grown = seq_limit_hint;
-    if (grown > p->seq_len)
-      grown = p->seq_len;
+    if (grown > max_seq_capacity)
+      grown = max_seq_capacity;
     if (grown == target_full)
       break;
     target_full = grown;
@@ -543,7 +544,8 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   debug_print_gpu_memory("after large BF16 weights", device_id);
 
   // Initialize KV cache with optimal sequence length during warmup
-  int seq_hint = model_config->seq_len;
+  int seq_hint = std::max(model_config->seq_len,
+                          model_config->initial_context_length);
   ensure_kv_cache_capacity(ctx, seq_hint);
 
   debug_print_gpu_memory("after KV cache allocation (model fully loaded)", device_id);
