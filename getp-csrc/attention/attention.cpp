@@ -55,10 +55,11 @@ __device__ __forceinline__ float block_reduce_sum(float thread_val,
 
 template <bool HAS_WINDOW>
 __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
-    bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
+    bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
     const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
     const bf16_t *__restrict__ attn_sinks, int layer_idx,
     const int *__restrict__ pos, int D, int Hq, int Hk,
+    const float *__restrict__ rope_inv_freq, float rope_concentration,
     const uint32_t *__restrict__ layer_offsets,
     const int *__restrict__ layer_capacity, int sliding_window,
     uint32_t kv_batch_stride, int batch_size, float *__restrict__ smem_dyn,
@@ -97,12 +98,18 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
       k_cache + (size_t)b * kv_batch_stride + layer_base;
   const bf16_t *__restrict__ v_layer =
       v_cache + (size_t)b * kv_batch_stride + layer_base;
-  const bf16_t *__restrict__ q_b = q + (size_t)b * Hq * D;
+  const size_t q_stride = (size_t)Hq * D;
+  const size_t kv_stride = (size_t)Hk * D;
+  const size_t qkv_stride = q_stride + 2 * kv_stride;
+  const bf16_t *__restrict__ qkv_b = qkv + (size_t)b * qkv_stride;
   bf16_t *__restrict__ out_b = out_tb + (size_t)b * Hq * D;
 
   const int d_owner = tid % D;
   const int workers_this_dim = ((blockDim.x - 1 - d_owner) / D) + 1;
   const int worker_rank = tid / D;
+  const int subgroup = lane >> 4;
+  const int lane16 = lane & 15;
+  const int groups_per_warp = WF_SIZE / 16;
 
   int start_t = 0;
   if constexpr (HAS_WINDOW) {
@@ -117,12 +124,12 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   const int score_stride = ATTN_FLASH_TILE + 1;
   float *s_scores = smem_dyn;
   float *s_q = s_scores + kv_mul * score_stride;
+  const int acc_stride = ATTN_THREADS_PER_BLOCK + 1;
   float *s_accum = s_q + kv_mul * D;
 
   __shared__ float s_m[ATTN_FLASH_MAX_KV_MUL];
   __shared__ float s_l[ATTN_FLASH_MAX_KV_MUL];
   __shared__ float s_scale[ATTN_FLASH_MAX_KV_MUL];
-  __shared__ float s_tmp[ATTN_FLASH_MAX_KV_MUL];
 
   if (tid == 0) {
     for (int qh = 0; qh < kv_mul; ++qh) {
@@ -133,21 +140,36 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   __syncthreads();
 
   const int D2 = D >> 1;
-  for (int qh = 0; qh < kv_mul; ++qh) {
-    const int q_head = kv_head * kv_mul + qh;
-    const bf16_t *__restrict__ q_head_ptr = q_b + (size_t)q_head * D;
-    const uint32_t *__restrict__ q_u32 =
-        reinterpret_cast<const uint32_t *>(q_head_ptr);
-
-    for (int i = tid; i < D2; i += blockDim.x) {
-      float a, b;
-      bf16pair_to_float2(q_u32[i], a, b);
-      const int base = qh * D + (i << 1);
-      s_q[base + 0] = a;
-      s_q[base + 1] = b;
+  const float position_f = static_cast<float>(pos_b);
+  const float concentration = rope_concentration;
+  if (wid == 0 && rope_inv_freq != nullptr) {
+    for (int qh = 0; qh < kv_mul; ++qh) {
+      const int q_head = kv_head * kv_mul + qh;
+      const bf16_t *__restrict__ q_head_ptr = qkv_b + (size_t)q_head * D;
+      for (int i = lane; i < D2; i += WF_SIZE) {
+        const float x1 = static_cast<float>(q_head_ptr[i]);
+        const float x2 = static_cast<float>(q_head_ptr[D2 + i]);
+        const float inv = rope_inv_freq[i];
+        float s_val, c_val;
+        sincosf(position_f * inv, &s_val, &c_val);
+        c_val *= concentration;
+        s_val *= concentration;
+        const float y1 = fmaf(-x2, s_val, x1 * c_val);
+        const float y2 = fmaf(x1, s_val, x2 * c_val);
+        s_q[qh * D + i] = y1;
+        s_q[qh * D + D2 + i] = y2;
+      }
+      if ((D & 1) && lane == 0) {
+        s_q[qh * D + (D - 1)] = static_cast<float>(q_head_ptr[D - 1]);
+      }
     }
-    if ((D & 1) && tid == 0) {
-      s_q[qh * D + (D - 1)] = static_cast<float>(q_head_ptr[D - 1]);
+  } else if (wid == 0) {
+    for (int qh = 0; qh < kv_mul; ++qh) {
+      const int q_head = kv_head * kv_mul + qh;
+      const bf16_t *__restrict__ q_head_ptr = qkv_b + (size_t)q_head * D;
+      for (int i = lane; i < D; i += WF_SIZE) {
+        s_q[qh * D + i] = static_cast<float>(q_head_ptr[i]);
+      }
     }
   }
   __syncthreads();
@@ -160,16 +182,24 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
   while (done < att_tokens) {
     const int tile_len = min(ATTN_FLASH_TILE, att_tokens - done);
     const int tile_base_t = start_t + done;
+    int slot_base = tile_base_t;
+    if (slot_base >= cap) {
+      slot_base %= cap;
+    }
 
     float thread_max[ATTN_FLASH_MAX_KV_MUL];
 #pragma unroll
     for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
       thread_max[qh] = -INFINITY;
 
-    for (int local_t = wid; local_t < tile_len; local_t += nwarp) {
-      const int t = tile_base_t + local_t;
-      const int slot = t % cap;
-      const size_t slot_off = (size_t)slot * kv_dim + kv_head_offset;
+    const int warp_tile_stride = nwarp * groups_per_warp;
+
+    for (int local_t = wid * groups_per_warp + subgroup; local_t < tile_len;
+         local_t += warp_tile_stride) {
+      int slot = slot_base + local_t;
+      while (slot >= cap)
+        slot -= cap;
+      const int slot_off = slot * kv_dim + kv_head_offset;
       const bf16_t *__restrict__ k_ptr = k_layer + slot_off;
       const uint2 *__restrict__ k_u2 = reinterpret_cast<const uint2 *>(k_ptr);
 
@@ -180,7 +210,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 
       const int D4 = D >> 2;
 #pragma unroll 4
-      for (int d4 = lane; d4 < D4; d4 += WF_SIZE) {
+      for (int d4 = lane16; d4 < D4; d4 += 16) {
         const float4 kv = bf16quad_to_float4(k_u2[d4]);
         const int base = d4 << 2;
 #pragma unroll
@@ -192,7 +222,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
           sc[qh] = fmaf(qv[3], kv.w, sc[qh]);
         }
       }
-      for (int d = (D4 << 2) + lane; d < D; d += WF_SIZE) {
+      for (int d = (D4 << 2) + lane16; d < D; d += 16) {
         const float kd = static_cast<float>(k_ptr[d]);
 #pragma unroll
         for (int qh = 0; qh < kv_mul; ++qh) {
@@ -202,10 +232,10 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 #pragma unroll
       for (int qh = 0; qh < kv_mul; ++qh) {
         float sum = sc[qh];
-        for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
-          sum += __shfl_down(sum, offset, WF_SIZE);
+        for (int offset = 8; offset > 0; offset >>= 1) {
+          sum += __shfl_down(sum, offset, 16);
         }
-        if (lane == 0) {
+        if (lane16 == 0) {
           const float scaled = sum * rsqrt_D;
           s_scores[qh * score_stride + local_t] = scaled;
           thread_max[qh] = fmaxf(thread_max[qh], scaled);
@@ -249,9 +279,10 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 
     for (int local_t = worker_rank; local_t < tile_len;
          local_t += workers_this_dim) {
-      const int t = tile_base_t + local_t;
-      const int slot = t % cap;
-      const size_t slot_off = (size_t)slot * kv_dim + kv_head_offset;
+      int slot = slot_base + local_t;
+      while (slot >= cap)
+        slot -= cap;
+      const int slot_off = slot * kv_dim + kv_head_offset;
       const bf16_t *__restrict__ v_ptr = v_layer + slot_off;
       const float v_d = static_cast<float>(v_ptr[d_owner]);
 #pragma unroll
@@ -284,7 +315,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 
   for (int qh = 0; qh < kv_mul; ++qh) {
     acc[qh] *= s_scale[qh];
-    s_accum[qh * ATTN_THREADS_PER_BLOCK + tid] = acc[qh];
+    s_accum[qh * acc_stride + tid] = acc[qh];
   }
   __syncthreads();
 
@@ -296,7 +327,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
         const int peer_tid = d_owner + w * D;
         if (peer_tid >= blockDim.x)
           break;
-        total += s_accum[qh * ATTN_THREADS_PER_BLOCK + peer_tid];
+        total += s_accum[qh * acc_stride + peer_tid];
       }
       const float inv_l = __frcp_rn(s_l[qh]);
       const float val = total * inv_l;
@@ -308,34 +339,37 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 
 __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
     void attention_flashdecode_mqa_even(
-        bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
+        bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
         const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
         const bf16_t *__restrict__ attn_sinks, int layer_idx,
         const int *__restrict__ pos, int D, int Hq, int Hk,
+        const float *__restrict__ rope_inv_freq, float rope_concentration,
         const uint32_t *__restrict__ layer_offsets,
         const int *__restrict__ layer_capacity, int sliding_window,
         uint32_t kv_batch_stride, int batch_size) {
   extern __shared__ float smem[];
   __shared__ float warp_buffer[ATTN_WARPS_PER_BLOCK];
   attention_flashdecode_mqa_kernel<true>(
-      out_tb, q, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
-      layer_offsets, layer_capacity, sliding_window, kv_batch_stride,
+      out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
+      rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
+      sliding_window, kv_batch_stride,
       batch_size, smem, warp_buffer);
 }
 
 __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
     void attention_flashdecode_mqa_odd(
-        bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
+        bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
         const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
         const bf16_t *__restrict__ attn_sinks, int layer_idx,
         const int *__restrict__ pos, int D, int Hq, int Hk,
+        const float *__restrict__ rope_inv_freq, float rope_concentration,
         const uint32_t *__restrict__ layer_offsets,
         const int *__restrict__ layer_capacity, uint32_t kv_batch_stride,
         int batch_size) {
   extern __shared__ float smem[];
   __shared__ float warp_buffer[ATTN_WARPS_PER_BLOCK];
   attention_flashdecode_mqa_kernel<false>(
-      out_tb, q, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
-      layer_offsets, layer_capacity, /*sliding_window*/ 0, kv_batch_stride,
-      batch_size, smem, warp_buffer);
+      out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
+      rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
+      /*sliding_window*/ 0, kv_batch_stride, batch_size, smem, warp_buffer);
 }

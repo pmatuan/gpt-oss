@@ -62,7 +62,6 @@ __global__ void copy_embedding_bf16_batch_kernel(bf16_t *dst, const bf16_t *src,
 }
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
-    bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
     const bf16_t* __restrict__ qkv,    // [B, Hq*D + 2*Hk*D]
@@ -87,6 +86,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
 
     if (b >= batch_size || half <= 0 || !rope_inv_freq) return;
 
+    if (h >= Hk) return;
+
     const int pos_b = pos[b];
     if (pos_b < 0) return;
 
@@ -98,14 +99,21 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     const int cap = layer_capacity[layer_idx];
     if (cap <= 0) return;
     const uint32_t layer_base = layer_offsets[layer_idx];
+    const int slot = pos_b % cap;
 
     // base pointers per batch
-    bf16_t* __restrict__ q_b      = q_out       + (size_t)b * q_size;
     bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_batch_stride;
     bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_batch_stride;
     const bf16_t* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
     const float concentration = rope_concentration;
+
+    const size_t kc_idx_base = (size_t)layer_base + (size_t)slot * KV +
+                               (size_t)h * D;
+    bf16_t* __restrict__ kcache_head = kcache_b + kc_idx_base;
+    bf16_t* __restrict__ vcache_head = vcache_b + kc_idx_base;
+    const int k_off_qkv = q_size + h * D;           // K starts after Q
+    const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
 
     for (int i = lane; i < half; i += WF_SIZE) {
         const float inv_freq = rope_inv_freq[i];
@@ -115,39 +123,25 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
         c_val *= concentration;
         s_val *= concentration;
 
-        // ---- Q: read from qkv, apply RoPE, write to q_out
-        if (h < Hq) {
-            const int q_off = h * D;
-            const float x1 = static_cast<float>(qkv_b[q_off + i]);
-            const float x2 = static_cast<float>(qkv_b[q_off + half + i]);
-            const float y1 = x1 * c_val - x2 * s_val;
-            const float y2 = x2 * c_val + x1 * s_val;
-            q_b[q_off + i]        = hip_bfloat16(y1);
-            q_b[q_off + half + i] = hip_bfloat16(y2);
-        }
+        // ---- K: read from qkv, apply RoPE, scatter to key_cache
+        const float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
+        const float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
+        const float rk1 = fmaf(-k2, s_val, k1 * c_val);
+        const float rk2 = fmaf(k1, s_val, k2 * c_val);
+        kcache_head[i]        = hip_bfloat16(rk1);
+        kcache_head[half + i] = hip_bfloat16(rk2);
 
-        if (h < Hk) {
-            const int slot = pos_b % cap;
-            const size_t kc_idx = (size_t)layer_base + (size_t)slot * KV +
-                                  (size_t)h * D;
+        // ---- V: read from qkv, direct scatter (no RoPE)
+        const float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
+        const float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
+        vcache_head[i]        = hip_bfloat16(v1);
+        vcache_head[half + i] = hip_bfloat16(v2);
+    }
 
-            // ---- K: read from qkv, apply RoPE, scatter to key_cache
-            const int k_off_qkv = q_size + h * D;           // K starts after Q
-            const float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
-            const float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
-            const float rk1 = k1 * c_val - k2 * s_val;
-            const float rk2 = k2 * c_val + k1 * s_val;
-            kcache_b[kc_idx + i]        = hip_bfloat16(rk1);
-            kcache_b[kc_idx + half + i] = hip_bfloat16(rk2);
-
-            // ---- V: read from qkv, direct scatter (no RoPE)
-            const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
-            const size_t vc_idx = kc_idx;
-            const float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
-            const float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
-            vcache_b[vc_idx + i]        = hip_bfloat16(v1);
-            vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
-        }
+    if ((D & 1) && lane == 0) {
+        const int tail = D - 1;
+        kcache_head[tail] = qkv_b[k_off_qkv + tail];
+        vcache_head[tail] = qkv_b[v_off_qkv + tail];
     }
 }
 

@@ -295,7 +295,6 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, (size_t)B * Hq * D * sizeof(bf16_t)));
 
   ctx.gpu_activations.d_key_cache = nullptr;
   ctx.gpu_activations.d_value_cache = nullptr;
@@ -544,7 +543,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   debug_print_gpu_memory("after large BF16 weights", device_id);
 
   // Initialize KV cache with optimal sequence length during warmup
-  int seq_hint = std::max(model_config->seq_len,
+  int seq_hint = std::min(model_config->seq_len,
                           model_config->initial_context_length);
   ensure_kv_cache_capacity(ctx, seq_hint);
 

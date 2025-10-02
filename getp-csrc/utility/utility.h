@@ -32,7 +32,6 @@ __global__ void residual_add_batch_kernel_bf16(bf16_t *x,
                                                const int *pos);
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
-    bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
     const bf16_t* __restrict__ qkv,    // [B, Hq*D + 2*Hk*D]

@@ -115,7 +115,6 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, (size_t)B * Hq * D * sizeof(bf16_t)));
   ctx.gpu_activations.d_rope_inv_freq = nullptr;
   ctx.gpu_activations.rope_concentration = 1.0f;
 
@@ -350,9 +349,9 @@ static void init_device_context(DeviceContext &ctx, int device_id,
 
   debug_print_gpu_memory("after large BF16 weights", device_id);
 
-  // Initialize KV cache with optimal sequence length during warmup
+  // Initialize KV cache with a conservative sequence length during warmup
   int seq_hint =
-      std::max(model_config->seq_len, model_config->initial_context_length);
+      std::min(model_config->seq_len, model_config->initial_context_length);
   ensure_kv_cache_capacity(ctx, seq_hint);
 
   debug_print_gpu_memory("after KV cache allocation (model fully loaded)", device_id);
@@ -381,8 +380,6 @@ static void cleanup_device_context(DeviceContext &ctx) {
     HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
   if (ctx.gpu_activations.d_qkv)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_qkv));
-  if (ctx.gpu_activations.d_q)
-    HIP_CHECK(hipFree(ctx.gpu_activations.d_q));
   if (ctx.gpu_activations.d_key_cache)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_key_cache));
   if (ctx.gpu_activations.d_value_cache)
@@ -650,10 +647,9 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     // Scatter QKV to q / caches (batched)
     {
       PROFILE_GPU_SCOPE("fused_split_rope_scatter_qkv_batch_kernel", 0);
-      dim3 grid_fused(max(Hq, Hk), batch_size, 1);
+      dim3 grid_fused(Hk, batch_size, 1);
       dim3 block_fused(WF_SIZE, 1, 1);
       fused_split_rope_scatter_qkv_batch_kernel<<<grid_fused, block_fused, 0>>>(
-          /*q_out*/ ctx.gpu_activations.d_q,
           /*key_cache*/ ctx.gpu_activations.d_key_cache,
           /*value_cache*/ ctx.gpu_activations.d_value_cache,
           /*qkv*/ ctx.gpu_activations.d_qkv,
@@ -671,27 +667,31 @@ static int *gpu_forward_device_batch(Transformer *transformer,
       const int kv_mul = Hq / Hk;
       dim3 gridAttn(Hk, batch_size, 1);
       dim3 blockA(ATTN_THREADS_PER_BLOCK);
+      const int acc_stride = ATTN_THREADS_PER_BLOCK + 1;
       const size_t shmem_size =
           (size_t)kv_mul *
-          (size_t)(ATTN_FLASH_TILE + 1 + D + ATTN_THREADS_PER_BLOCK) *
+          (size_t)(ATTN_FLASH_TILE + 1 + D + acc_stride) *
           sizeof(float);
       const bool layer_has_window = (l & 1) == 0;
       if (layer_has_window) {
         PROFILE_GPU_SCOPE("attention_flashdecode_mqa_even", 0);
         attention_flashdecode_mqa_even<<<gridAttn, blockA, shmem_size>>>(
-            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
             ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-            Hq, Hk, ctx.d_kv_layer_offsets, ctx.d_kv_layer_capacity,
+            Hq, Hk, ctx.gpu_activations.d_rope_inv_freq,
+            ctx.gpu_activations.rope_concentration, ctx.d_kv_layer_offsets,
+            ctx.d_kv_layer_capacity,
             p->sliding_window, kv_batch_stride, batch_size);
       } else {
         PROFILE_GPU_SCOPE("attention_flashdecode_mqa_odd", 0);
         attention_flashdecode_mqa_odd<<<gridAttn, blockA, shmem_size>>>(
-            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
+            ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
             ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-            Hq, Hk, ctx.d_kv_layer_offsets, ctx.d_kv_layer_capacity,
-            kv_batch_stride, batch_size);
+            Hq, Hk, ctx.gpu_activations.d_rope_inv_freq,
+            ctx.gpu_activations.rope_concentration, ctx.d_kv_layer_offsets,
+            ctx.d_kv_layer_capacity, kv_batch_stride, batch_size);
       }
     }
 
@@ -907,13 +907,16 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     }
   }
 
-  dim3 grid_argmax(batch_size, 1, 1);
-  size_t shared_bytes = (size_t)BLOCK_SIZE * (sizeof(float) + sizeof(int));
+  {
+    PROFILE_GPU_SCOPE("argmax_batch_kernel", 0);
+    dim3 grid_argmax(batch_size, 1, 1);
+    size_t shared_bytes = (size_t)BLOCK_SIZE * (sizeof(float) + sizeof(int));
 
-  argmax_batch_kernel<<<grid_argmax, block, shared_bytes>>>(
-      ctx.gpu_activations.d_logits, ctx.gpu_activations.d_next_tokens,
-      V, batch_size, ctx.gpu_activations.d_pos);
-  HIP_CHECK(hipGetLastError());
+    argmax_batch_kernel<<<grid_argmax, block, shared_bytes>>>(
+        ctx.gpu_activations.d_logits, ctx.gpu_activations.d_next_tokens,
+        V, batch_size, ctx.gpu_activations.d_pos);
+    HIP_CHECK(hipGetLastError());
+  }
 
   return ctx.gpu_activations.d_next_tokens;
 }
