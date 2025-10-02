@@ -3,7 +3,7 @@
 
 #include "../common/defines.h"
 
-__global__ void attention_batch_kernel_even(
+__global__ void attention_flashdecode_mqa_even(
     bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
     const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
     const float *__restrict__ attn_sinks, int layer_idx,
@@ -12,7 +12,7 @@ __global__ void attention_batch_kernel_even(
     const int *__restrict__ layer_capacity, int sliding_window,
     uint32_t kv_batch_stride, int batch_size);
 
-__global__ void attention_batch_kernel_odd(
+__global__ void attention_flashdecode_mqa_odd(
     bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ q,
     const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
     const float *__restrict__ attn_sinks, int layer_idx,

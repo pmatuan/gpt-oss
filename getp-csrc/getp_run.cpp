@@ -590,31 +590,24 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           /*B*/ batch_size);
     }
 
-    // Attention (batched)
     {
-      dim3 gridAttn(Hq, batch_size, 1);
+      const int kv_mul = Hq / Hk;
+      dim3 gridAttn(Hk, batch_size, 1);
       dim3 blockA(ATTN_THREADS_PER_BLOCK);
+      const size_t shmem_size =
+          (size_t)kv_mul * (size_t)(ATTN_FLASH_TILE + D) * sizeof(float);
       const bool layer_has_window = (l & 1) == 0;
       if (layer_has_window) {
-        PROFILE_GPU_SCOPE("attention_batch_kernel_even", 0);
-        const int att_tokens =
-            std::min(max_pos_in_batch + 1, p->sliding_window);
-        const size_t att_shared = (size_t)(att_tokens + 1);
-        const size_t shmem_size =
-            (att_shared + 4 + (size_t)D) * sizeof(float);
-        attention_batch_kernel_even<<<gridAttn, blockA, shmem_size>>>(
+        PROFILE_GPU_SCOPE("attention_flashdecode_mqa_even", 0);
+        attention_flashdecode_mqa_even<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
             ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
             Hq, Hk, ctx.d_kv_layer_offsets, ctx.d_kv_layer_capacity,
             p->sliding_window, kv_batch_stride, batch_size);
       } else {
-        PROFILE_GPU_SCOPE("attention_batch_kernel_odd", 0);
-        const int att_tokens = max_pos_in_batch + 1;
-        const size_t att_shared = (size_t)(att_tokens + 1);
-        const size_t shmem_size =
-            (att_shared + 4 + (size_t)D) * sizeof(float);
-        attention_batch_kernel_odd<<<gridAttn, blockA, shmem_size>>>(
+        PROFILE_GPU_SCOPE("attention_flashdecode_mqa_odd", 0);
+        attention_flashdecode_mqa_odd<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_q,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
             ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
