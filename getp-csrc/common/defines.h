@@ -14,8 +14,10 @@ typedef hip_bfloat16 bf16_t;
 #define WF_SIZE 64
 #define TM 8  
 #define BLOCK_SIZE (WF_SIZE * TM)
-#define ATTN_WARPS_PER_BLOCK 2
+#define ATTN_WARPS_PER_BLOCK 4
 #define ATTN_THREADS_PER_BLOCK (WF_SIZE * ATTN_WARPS_PER_BLOCK)
+#define ATTN_FLASH_TILE 128
+#define ATTN_FLASH_MAX_KV_MUL 8
 #define TK 512
 #define LDS_PAD 16
 #define K_STEP_MATMUL_FLOAT 4
@@ -107,17 +109,18 @@ struct GPUActivationBuffers {
   bf16_t *d_gate_up_workspace; // Pre-allocated workspace for MLP
   size_t gate_up_workspace_bytes;
   bf16_t *d_qkv;
-  bf16_t *d_q;
   bf16_t *d_key_cache, *d_value_cache;
   int kv_seq_capacity;
   int kv_window_capacity;
   int kv_seq_limit;
   uint32_t kv_batch_stride;
-  float *d_logits;
+  float *d_row_max;
   int *d_next_tokens;
   int *d_tokens;
   int *d_pos;
   float *d_inv_rms;
+  float *d_rope_inv_freq;
+  float rope_concentration;
 };
 
 struct DeviceExpertWorkspace {
@@ -140,10 +143,10 @@ struct HostPinnedBatchBuffers {
 };
 
 struct GPUWeightBuffersFP32 {
-  float *d_rms_attn_w, *d_rms_ffn_w;
-  float *d_b_qkv, *d_b_o, *d_attn_sinks;
-  float *d_w_router, *d_b_router;
-  float *d_rms_out_w;
+  bf16_t *d_rms_attn_w, *d_rms_ffn_w;
+  bf16_t *d_b_qkv, *d_b_o, *d_attn_sinks;
+  bf16_t *d_w_router, *d_b_router;
+  bf16_t *d_rms_out_w;
 };
 
 struct GPUExpertBiasBuffers {

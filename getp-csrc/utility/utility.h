@@ -18,7 +18,7 @@ __global__ void copy_embedding_bf16_batch_kernel(bf16_t *dst, const bf16_t *src,
 
 // Normalization Kernels
 __global__ void rmsnorm_batch_kernel(bf16_t *out, const bf16_t *x,
-                                     const float *weight, int dim,
+                                     const bf16_t *weight, int dim,
                                      const int *pos);
 
 // Utility Operations
@@ -32,7 +32,6 @@ __global__ void residual_add_batch_kernel_bf16(bf16_t *x,
                                                const int *pos);
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
-    bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
     const bf16_t* __restrict__ qkv,    // [B, Hq*D + 2*Hk*D]
@@ -40,7 +39,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // model params
     int Hq, int Hk, int D,
     // RoPE params
-    float theta, float rope_scaling_factor, int initial_context_length,
+    const float* __restrict__ rope_inv_freq,
+    float rope_concentration,
     // cache params
     int layer_idx,
     const uint32_t *__restrict__ layer_offsets,

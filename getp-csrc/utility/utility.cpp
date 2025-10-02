@@ -62,7 +62,6 @@ __global__ void copy_embedding_bf16_batch_kernel(bf16_t *dst, const bf16_t *src,
 }
 
 __global__ void fused_split_rope_scatter_qkv_batch_kernel(
-    bf16_t* __restrict__ q_out,
     bf16_t* __restrict__ key_cache,
     bf16_t* __restrict__ value_cache,
     const bf16_t* __restrict__ qkv,    // [B, Hq*D + 2*Hk*D]
@@ -70,7 +69,8 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     // model params
     int Hq, int Hk, int D,
     // RoPE params
-    float theta, float rope_scaling_factor, int initial_context_length,
+    const float* __restrict__ rope_inv_freq,
+    float rope_concentration,
     // cache params
     int layer_idx,
     const uint32_t *__restrict__ layer_offsets,
@@ -81,10 +81,12 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
 
     const int h = blockIdx.x;           // head idx
     const int b = blockIdx.y;           // batch idx
-    const int i = threadIdx.x;          // [0..D/2)
+    const int lane = threadIdx.x & (WF_SIZE - 1);
     const int half = D >> 1;
 
-    if (b >= batch_size || i >= half) return;
+    if (b >= batch_size || half <= 0 || !rope_inv_freq) return;
+
+    if (h >= Hk) return;
 
     const int pos_b = pos[b];
     if (pos_b < 0) return;
@@ -97,70 +99,49 @@ __global__ void fused_split_rope_scatter_qkv_batch_kernel(
     const int cap = layer_capacity[layer_idx];
     if (cap <= 0) return;
     const uint32_t layer_base = layer_offsets[layer_idx];
+    const int slot = pos_b % cap;
 
     // base pointers per batch
-    bf16_t* __restrict__ q_b      = q_out       + (size_t)b * q_size;
     bf16_t* __restrict__ kcache_b = key_cache   + (size_t)b * kv_batch_stride;
     bf16_t* __restrict__ vcache_b = value_cache + (size_t)b * kv_batch_stride;
     const bf16_t* __restrict__ qkv_b = qkv + (size_t)b * (q_size + 2 * kv_size);
 
-    // ---- compute RoPE angles for this (i, b)
-    // inv_freq with scaling (khớp logic hiện tại)
-    float freq = powf(theta, (float)(2 * i) / (float)D);
-    float inv_freq;
-    float concentration = 1.0f;
-    if (rope_scaling_factor > 1.0f) {
-        concentration = 0.1f * logf(rope_scaling_factor) + 1.0f;
-        const float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-        const float low  = half * logf((float)initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(theta);
-        const float high = half * logf((float)initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(theta);
-        const float interpolation = 1.0f / (rope_scaling_factor * freq);
-        const float extrapolation = 1.0f / freq;
-        float ramp = ((float)i - low) / (high - low);
-        ramp = fmaxf(0.0f, fminf(1.0f, ramp));
-        const float mask = 1.0f - ramp;
-        inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
-    } else {
-        inv_freq = 1.0f / freq;
-    }
-    const float ang = pos_b * inv_freq;
-    const float c = cosf(ang) * concentration;
-    const float s = sinf(ang) * concentration;
+    const float concentration = rope_concentration;
 
-    // ---- Q: read from qkv, apply RoPE, write to q_out
-    if (h < Hq) {
-        const int q_off = h * D;
-        float x1 = static_cast<float>(qkv_b[q_off + i]);
-        float x2 = static_cast<float>(qkv_b[q_off + half + i]);
-        // rotate
-        float y1 = x1 * c - x2 * s;
-        float y2 = x2 * c + x1 * s;
-        q_b[q_off + i]        = hip_bfloat16(y1);
-        q_b[q_off + half + i] = hip_bfloat16(y2);
-    }
+    const size_t kc_idx_base = (size_t)layer_base + (size_t)slot * KV +
+                               (size_t)h * D;
+    bf16_t* __restrict__ kcache_head = kcache_b + kc_idx_base;
+    bf16_t* __restrict__ vcache_head = vcache_b + kc_idx_base;
+    const int k_off_qkv = q_size + h * D;           // K starts after Q
+    const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
 
-    // ---- K: read from qkv, apply RoPE, scatter to key_cache
-    if (h < Hk) {
-        const int k_off_qkv = q_size + h * D;           // K starts after Q
-        const int slot = pos_b % cap;
-        const size_t kc_idx = (size_t)layer_base + (size_t)slot * KV +
-                              (size_t)h * D;
+    for (int i = lane; i < half; i += WF_SIZE) {
+        const float inv_freq = rope_inv_freq[i];
+        const float ang = pos_b * inv_freq;
+        float s_val, c_val;
+        sincosf(ang, &s_val, &c_val);
+        c_val *= concentration;
+        s_val *= concentration;
 
-        float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
-        float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
-        float rk1 = k1 * c - k2 * s;
-        float rk2 = k2 * c + k1 * s;
-
-        kcache_b[kc_idx + i]        = hip_bfloat16(rk1);
-        kcache_b[kc_idx + half + i] = hip_bfloat16(rk2);
+        // ---- K: read from qkv, apply RoPE, scatter to key_cache
+        const float k1 = static_cast<float>(qkv_b[k_off_qkv + i]);
+        const float k2 = static_cast<float>(qkv_b[k_off_qkv + half + i]);
+        const float rk1 = fmaf(-k2, s_val, k1 * c_val);
+        const float rk2 = fmaf(k1, s_val, k2 * c_val);
+        kcache_head[i]        = hip_bfloat16(rk1);
+        kcache_head[half + i] = hip_bfloat16(rk2);
 
         // ---- V: read from qkv, direct scatter (no RoPE)
-        const int v_off_qkv = q_size + kv_size + h * D; // V starts after K
-        const size_t vc_idx = kc_idx;
-        float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
-        float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
-        vcache_b[vc_idx + i]        = hip_bfloat16(v1);
-        vcache_b[vc_idx + half + i] = hip_bfloat16(v2);
+        const float v1 = static_cast<float>(qkv_b[v_off_qkv + i]);
+        const float v2 = static_cast<float>(qkv_b[v_off_qkv + half + i]);
+        vcache_head[i]        = hip_bfloat16(v1);
+        vcache_head[half + i] = hip_bfloat16(v2);
+    }
+
+    if ((D & 1) && lane == 0) {
+        const int tail = D - 1;
+        kcache_head[tail] = qkv_b[k_off_qkv + tail];
+        vcache_head[tail] = qkv_b[v_off_qkv + tail];
     }
 }
 
@@ -201,7 +182,7 @@ __global__ void residual_add_batch_kernel_bf16(bf16_t *x,
 }
 
 __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
-                                     const float *weight, int size,
+                                     const bf16_t *weight, int size,
                                      const int *pos) {
   const int b = blockIdx.y;
 
@@ -215,9 +196,20 @@ __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
   const bf16_t *x_b = x + (size_t)b * size;
   bf16_t *o_b = o + (size_t)b * size;
 
+  const int pair_elems = size >> 1;
+  const int tail_start = pair_elems << 1;
+  const uint32_t *x_pairs = reinterpret_cast<const uint32_t *>(x_b);
+  const uint32_t *w_pairs = reinterpret_cast<const uint32_t *>(weight);
+
   float sum = 0.0f;
-  for (int idx = tid; idx < size; idx += blockDim.x) {
-    float v = static_cast<float>(x_b[idx]);
+  for (int idx = tid; idx < pair_elems; idx += blockDim.x) {
+    float v0, v1;
+    bf16pair_to_float2(x_pairs[idx], v0, v1);
+    sum = fmaf(v0, v0, sum);
+    sum = fmaf(v1, v1, sum);
+  }
+  for (int idx = tail_start + tid; idx < size; idx += blockDim.x) {
+    float v = float(x_b[idx]);
     sum = fmaf(v, v, sum);
   }
 
@@ -249,11 +241,22 @@ __global__ void rmsnorm_batch_kernel(bf16_t *o, const bf16_t *x,
   const float mean_sq = warp_sums[0] / (float)size;
   const float inv_rms = rsqrtf(mean_sq + 1e-5f);
 
-  for (int idx = tid; idx < size; idx += blockDim.x) {
-    float v = static_cast<float>(x_b[idx]);
-    float w = weight[idx];
-    float result = w * (v * inv_rms);
-    o_b[idx] = hip_bfloat16(result);
+  for (int idx = tid; idx < pair_elems; idx += blockDim.x) {
+    float v0, v1;
+    bf16pair_to_float2(x_pairs[idx], v0, v1);
+    float w0, w1;
+    bf16pair_to_float2(w_pairs[idx], w0, w1);
+
+    const float base = inv_rms;
+    const int out_idx = idx << 1;
+    o_b[out_idx] = bf16_t(w0 * (v0 * base));
+    o_b[out_idx + 1] = bf16_t(w1 * (v1 * base));
+  }
+
+  for (int idx = tail_start + tid; idx < size; idx += blockDim.x) {
+    float v = float(x_b[idx]);
+    float w = float(weight[idx]);
+    o_b[idx] = bf16_t(w * (v * inv_rms));
   }
 }
 

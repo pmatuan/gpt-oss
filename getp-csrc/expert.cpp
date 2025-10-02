@@ -45,7 +45,8 @@ static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
   if (seq_limit_hint > 0 && required_seq > seq_limit_hint)
     required_seq = seq_limit_hint;
 
-  required_seq = std::max(1, std::min(required_seq, p->seq_len));
+  const int max_seq_capacity = std::max(p->seq_len, p->initial_context_length);
+  required_seq = std::max(1, std::min(required_seq, max_seq_capacity));
 
   const bool has_window = (p->sliding_window > 0);
   const int KV = p->head_dim * p->n_kv_heads;
@@ -64,8 +65,8 @@ static int ensure_kv_cache_capacity(DeviceContext &ctx, int required_seq) {
       grown = required_seq;
     if (seq_limit_hint > 0 && grown > seq_limit_hint)
       grown = seq_limit_hint;
-    if (grown > p->seq_len)
-      grown = p->seq_len;
+    if (grown > max_seq_capacity)
+      grown = max_seq_capacity;
     if (grown == target_full)
       break;
     target_full = grown;
@@ -294,7 +295,6 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
 
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_q, (size_t)B * Hq * D * sizeof(bf16_t)));
 
   ctx.gpu_activations.d_key_cache = nullptr;
   ctx.gpu_activations.d_value_cache = nullptr;
@@ -306,7 +306,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   ctx.h_kv_layer_capacity.clear();
   ctx.d_kv_layer_offsets = nullptr;
   ctx.d_kv_layer_capacity = nullptr;
-  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_logits, (size_t)B * V * sizeof(float)));
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_row_max, (size_t)B * sizeof(float)));
 
   // Allocate batch helpers upfront for MAX_BATCH_SIZE
   ctx.capacity_B = B;
@@ -355,57 +355,65 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
 
   debug_print_gpu_memory("after activations", device_id);
 
-  // Weights (small FP32)
+  const int n_streams = 4;
+  const size_t chunk_bytes = 64ULL * 1024 * 1024;
+
+  // Weights (converted to BF16 on device)
   TransformerWeights *w = &transformer->weights;
 
   const int H_ = H;
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_attn_w, w->rms_attn_w,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_rms_attn_w, L * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->rms_attn_w, (size_t)L * H_,
+                           ctx.gpu_weights_fp32.d_rms_attn_w, n_streams,
+                           chunk_bytes);
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_ffn_w, w->rms_ffn_w,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_rms_ffn_w, L * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->rms_ffn_w, (size_t)L * H_,
+                           ctx.gpu_weights_fp32.d_rms_ffn_w, n_streams,
+                           chunk_bytes);
 
   const int D_ = model_config->head_dim;
   const int Hq_ = model_config->n_attn_heads;
   const int Hk_ = model_config->n_kv_heads;
   const int QKV_D = D_ * (Hq_ + 2 * Hk_);
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, L * QKV_D * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_qkv, w->b_qkv,
-                      L * QKV_D * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_b_qkv, L * QKV_D * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_qkv, (size_t)L * QKV_D,
+                           ctx.gpu_weights_fp32.d_b_qkv, n_streams,
+                           chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_o, w->b_o,
-                      L * H_ * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_b_o, L * H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_o, (size_t)L * H_, ctx.gpu_weights_fp32.d_b_o,
+                           n_streams, chunk_bytes);
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_attn_sinks, w->attn_sinks,
-                      L * Hq_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_attn_sinks, L * Hq_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->attn_sinks, (size_t)L * Hq_,
+                           ctx.gpu_weights_fp32.d_attn_sinks, n_streams,
+                           chunk_bytes);
 
   const int E_ = model_config->n_experts;
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H_ * E_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_w_router, w->w_router,
-                      L * H_ * E_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_w_router, L * H_ * E_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->w_router, (size_t)L * H_ * E_,
+                           ctx.gpu_weights_fp32.d_w_router, n_streams,
+                           chunk_bytes);
 
   HIP_CHECK(
-      hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_b_router, w->b_router,
-                      L * E_ * sizeof(float), hipMemcpyHostToDevice));
+      hipMalloc(&ctx.gpu_weights_fp32.d_b_router, L * E_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->b_router, (size_t)L * E_,
+                           ctx.gpu_weights_fp32.d_b_router, n_streams,
+                           chunk_bytes);
 
-  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w, H_ * sizeof(float)));
-  HIP_CHECK(hipMemcpy(ctx.gpu_weights_fp32.d_rms_out_w, w->rms_out_w,
-                      H_ * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&ctx.gpu_weights_fp32.d_rms_out_w,
+                      H_ * sizeof(bf16_t)));
+  copy_fp32_to_bf16_device(w->rms_out_w, (size_t)H_,
+                           ctx.gpu_weights_fp32.d_rms_out_w, n_streams,
+                           chunk_bytes);
 
-  debug_print_gpu_memory("after small FP32 weights", device_id);
-  
-  const int n_streams = 4;
-  const size_t chunk_bytes = 64ULL * 1024 * 1024;
+  debug_print_gpu_memory("after small BF16 weights", device_id);
 
   // Expert biases FP32 (sharded per-device by local experts)
   const int IM_ = model_config->intermediate_dim;
@@ -535,7 +543,8 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   debug_print_gpu_memory("after large BF16 weights", device_id);
 
   // Initialize KV cache with optimal sequence length during warmup
-  int seq_hint = model_config->seq_len;
+  int seq_hint = std::min(model_config->seq_len,
+                          model_config->initial_context_length);
   ensure_kv_cache_capacity(ctx, seq_hint);
 
   debug_print_gpu_memory("after KV cache allocation (model fully loaded)", device_id);

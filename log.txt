@@ -1,5 +1,5 @@
-srun: job 78230 queued and waiting for resources
-srun: job 78230 has been allocated resources
+srun: job 78831 queued and waiting for resources
+srun: job 78831 has been allocated resources
 vocab_size: 201088
 hidden_dim: 2880
 n_experts: 32
@@ -21,19 +21,19 @@ Found 1 HIP devices, initializing multi-GPU setup...
 Not using expert parallelism (n_experts=32, n_devices=1)
 Initializing device 0 for batch size 896...
 [DEVICE] 0 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
-[DEVICE] 0 [HIP] after activations: HBM free 63.16 GiB / total 63.98 GiB (used 0.83 GiB)
-[DEVICE] 0 [HIP] after small FP32 weights: HBM free 63.00 GiB / total 63.98 GiB (used 0.98 GiB)
-[DEVICE] 0 [HIP] after expert biases: HBM free 62.98 GiB / total 63.98 GiB (used 1.00 GiB)
-[DEVICE] 0 [HIP] after large BF16 weights: HBM free 24.04 GiB / total 63.98 GiB (used 39.95 GiB)
+[DEVICE] 0 [HIP] after activations: HBM free 63.69 GiB / total 63.98 GiB (used 0.29 GiB)
+[DEVICE] 0 [HIP] after small BF16 weights: HBM free 63.68 GiB / total 63.98 GiB (used 0.30 GiB)
+[DEVICE] 0 [HIP] after expert biases: HBM free 63.67 GiB / total 63.98 GiB (used 0.32 GiB)
+[DEVICE] 0 [HIP] after large BF16 weights: HBM free 24.72 GiB / total 63.98 GiB (used 39.26 GiB)
 [DEVICE] 0 allocated KV cache full 1024 tokens
-[DEVICE] 0 [HIP] after KV cache allocation (model fully loaded): HBM free 0.41 GiB / total 63.98 GiB (used 63.57 GiB)
+[DEVICE] 0 [HIP] after KV cache allocation (model fully loaded): HBM free 1.10 GiB / total 63.98 GiB (used 62.89 GiB)
 Multi-GPU initialization complete!
 
-warm up elapsed time(s): 39.193000
+warm up elapsed time(s): 66.313000
 Processing 896 requests across 1 GPUs...
-Multi-GPU inference completed. Total tokens generated: 887954
+Multi-GPU inference completed. Total tokens generated: 898236
 
-elapsed time(s): 309.243000, achieved throughput TPS (tok/s): 2871.379465
+elapsed time(s): 246.688000, achieved throughput TPS (tok/s): 3641.182384
 
 finish elapsed time(s): 0.002000
 
@@ -42,22 +42,24 @@ finish elapsed time(s): 0.002000
 ├──────────────────────────────────────────────────────────────────────────────────────┤
 │ Function/Kernel Name                          │   Total (ms) │    Calls │   Avg (ms) │
 ├──────────────────────────────────────────────────────────────────────────────────────┤
-│ CPU:inference                                 │   309243.431 │        1 │ 309243.431 │
-│ CPU:gpu_forward_device_batch                  │   308520.292 │     1023 │    301.584 │
-│ GPU:attention_batch_kernel_odd                │   104579.051 │    12276 │      8.519 │
-│ GPU:mlp1_fused_gemm                           │    82183.877 │    24552 │      3.347 │
-│ GPU:mlp2_bias_weighted_accum_gemm             │    43693.653 │    24552 │      1.780 │
-│ GPU:attention_batch_kernel_even               │    21395.280 │    12276 │      1.743 │
-│ GPU:matmul_logits_kernel                      │    17003.349 │     1023 │     16.621 │
-│ GPU:matmul_bias_att_kernel                    │    11172.180 │    24552 │      0.455 │
-│ GPU:matmul_bias_qkv_kernel                    │    11010.554 │    24552 │      0.448 │
-│ GPU:fused_split_rope_scatter_qkv_batch_kernel │     4722.271 │    24552 │      0.192 │
-│ GPU:matmul_router_kernel                      │     2792.788 │    24552 │      0.114 │
-│ GPU:rmsnorm_batch_kernel                      │     1740.975 │    50127 │      0.035 │
-│ GPU:residual_add_batch_kernel                 │     1616.170 │    49104 │      0.033 │
-│ GPU:fused_topk_softmax_batch_kernel           │      887.844 │    24552 │      0.036 │
-│ GPU:expert_counting                           │      885.600 │    24552 │      0.036 │
-│ GPU:expert_assignment_building                │      696.242 │    24552 │      0.028 │
-│ GPU:copy_embedding_bf16_batch_kernel          │       33.623 │     1023 │      0.033 │
+│ CPU:inference                                 │   246688.463 │        1 │ 246688.463 │
+│ CPU:gpu_forward_device_batch                  │   246612.081 │     1023 │    241.068 │
+│ GPU:mlp1_fused_gemm                           │    82150.445 │    24552 │      3.346 │
+│ GPU:attention_flashdecode_mqa_odd             │    53400.087 │    12276 │      4.350 │
+│ GPU:mlp2_bias_weighted_accum_gemm             │    43595.794 │    24552 │      1.776 │
+│ GPU:matmul_logits_argmax_kernel               │    16780.686 │     1023 │     16.403 │
+│ GPU:attention_flashdecode_mqa_even            │    15309.634 │    12276 │      1.247 │
+│ GPU:matmul_bias_att_kernel                    │    11133.386 │    24552 │      0.453 │
+│ GPU:matmul_bias_qkv_kernel                    │    10982.864 │    24552 │      0.447 │
+│ GPU:matmul_router_kernel                      │     2842.282 │    24552 │      0.116 │
+│ GPU:residual_add_batch_kernel                 │     1612.086 │    49104 │      0.033 │
+│ GPU:rmsnorm_batch_kernel                      │     1570.912 │    50127 │      0.031 │
+│ GPU:fused_split_rope_scatter_qkv_batch_kernel │      935.710 │    24552 │      0.038 │
+│ GPU:fused_topk_softmax_batch_kernel           │      888.006 │    24552 │      0.036 │
+│ GPU:expert_assignment_building                │      429.660 │    24552 │      0.018 │
+│ GPU:expert_counting                           │      404.363 │    24552 │      0.016 │
+│ GPU:exclusive_scan_small_kernel               │      248.194 │    24552 │      0.010 │
+│ GPU:copy_embedding_bf16_batch_kernel          │       35.053 │     1023 │      0.034 │
+│ GPU:init_argmax_state_kernel                  │        8.642 │     1023 │      0.008 │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 

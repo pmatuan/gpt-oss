@@ -8,14 +8,14 @@ __global__ void
 matmul_bias_qkv_kernel(bf16_t *__restrict__ y,         // [B x d]
                        const bf16_t *__restrict__ x,   // [B x n] (bf16)
                        const bf16_t *__restrict__ w,   // [d x n] (bf16 packed)
-                       const float *__restrict__ bias, // [d] or nullptr
+                       const bf16_t *__restrict__ bias, // [d] or nullptr
                        int n, int d, int B, const int *__restrict__ pos);
 
 __global__ void
 matmul_bias_att_kernel(bf16_t *__restrict__ y,         // [B x d]
                        const bf16_t *__restrict__ x,   // [B x n] (bf16)
                        const bf16_t *__restrict__ w,   // [d x n] (bf16 packed)
-                       const float *__restrict__ bias, // [d] or nullptr
+                       const bf16_t *__restrict__ bias, // [d] or nullptr
                        int n, int d, int B, const int *__restrict__ pos);
 
 // No-bias variant: Y = X @ W^T
@@ -26,10 +26,22 @@ matmul_logits_kernel(float *__restrict__ y,        // [B x d]
                      int n, int d, int B, const int *__restrict__ pos);
 
 __global__ void
+init_argmax_state_kernel(float *__restrict__ max_vals, int *__restrict__ out_indices,
+                         int B);
+
+__global__ void
+matmul_logits_argmax_kernel(int *__restrict__ out_indices,
+                            float *__restrict__ max_vals,
+                            const bf16_t *__restrict__ x,
+                            const bf16_t *__restrict__ w,
+                            int n, int d, int B,
+                            const int *__restrict__ pos);
+
+__global__ void
 matmul_router_kernel(float *__restrict__ y,        // [B, d]
                      const bf16_t *__restrict__ x, // [B, n] (bf16)
-                     const float *__restrict__ w,  // [d, n] (row-major theo n)
-                     const float *__restrict__ bias, // [d] (có thể null)
+                     const bf16_t *__restrict__ w,  // [d, n] (row-major theo n)
+                     const bf16_t *__restrict__ bias, // [d] (có thể null)
                      int n, int d, int batch_size, const int *pos);
 
 __global__ void
