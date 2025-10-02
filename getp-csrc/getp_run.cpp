@@ -550,6 +550,10 @@ static int *gpu_forward_device_batch(Transformer *transformer,
   DeviceContext &ctx = g_devices[device_id];
   HIP_CHECK(hipSetDevice(device_id));
 
+  if (max_pos_in_batch >= 0) {
+    ensure_kv_cache_capacity(ctx, max_pos_in_batch + 1);
+  }
+
   if (batch_size <= 0) {
     return ctx.gpu_activations.d_next_tokens;
   }
@@ -776,24 +780,15 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         ctx.gpu_activations.gate_up_workspace_bytes = gate_up_topk_bytes;
       }
       bf16_t *d_gate_up_topk = ctx.gpu_activations.d_gate_up_workspace;
-      HIP_CHECK(hipMemsetAsync(d_gate_up_topk, 0, gate_up_topk_bytes, 0));;
 
       const int total_pairs = batch_size * p->experts_per_token;
-      int max_assign_per_expert = 0;
-      int total_assignments = 0;
+      int max_assign_per_expert = std::min(total_pairs, batch_size);
       dim3 gridCount((total_pairs + 255) / 256, 1, 1);
 
       int *d_expert_counts = expert_ws.d_expert_counts;
       int *d_expert_offsets = expert_ws.d_expert_offsets;
       uint16_t *d_assignment_batches = expert_ws.d_assignment_batches;
       uint8_t *d_assignment_slots = expert_ws.d_assignment_slots;
-      int *h_counts = host_ws.expert_counts;
-      int *h_offsets = host_ws.expert_offsets;
-
-      if (E > 0) {
-        std::fill_n(h_counts, E, 0);
-        std::fill_n(h_offsets, E + 1, 0);
-      }
 
       if (total_pairs > 0 && E > 0) {
         {
@@ -803,70 +798,70 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           count_expert_assignments_kernel<<<gridCount, 256, 0>>>(
               d_expert_counts, ctx.gpu_activations.d_topk_i,
               ctx.gpu_activations.d_pos, batch_size, p->experts_per_token, E);
-          HIP_CHECK(hipMemcpyAsync(h_counts, d_expert_counts,
-                                  (size_t)E * sizeof(int), hipMemcpyDeviceToHost,
-                                  0));
-          HIP_CHECK(hipStreamSynchronize(0));
-
-          for (int e = 0; e < E; ++e) {
-            h_offsets[e + 1] = h_offsets[e] + h_counts[e];
-            if (h_counts[e] > max_assign_per_expert)
-              max_assign_per_expert = h_counts[e];
+          HIP_CHECK(hipGetLastError());
+        }
+        {
+          PROFILE_GPU_SCOPE("exclusive_scan_small_kernel", 0);
+          int threads_scan = 1;
+          while (threads_scan < E && threads_scan < 1024)
+            threads_scan <<= 1;
+          threads_scan = std::max(threads_scan, 32);
+          if (threads_scan < E) {
+            fprintf(stderr,
+                    "exclusive_scan_small_kernel requires blockDim >= E (E=%d)\n",
+                    E);
+            exit(EXIT_FAILURE);
           }
-          total_assignments = h_offsets[E];
+          size_t shared_scan_bytes = (size_t)threads_scan * sizeof(int);
+          exclusive_scan_small_kernel<<<1, threads_scan, shared_scan_bytes>>>(
+              d_expert_counts, d_expert_offsets, E);
+          HIP_CHECK(hipGetLastError());
         }
 
-        if (total_assignments > 0) {
-          {
-            PROFILE_GPU_SCOPE("expert_assignment_building", 0);
-            HIP_CHECK(hipMemcpyAsync(d_expert_offsets, h_offsets,
-                                    (size_t)(E + 1) * sizeof(int),
-                                    hipMemcpyHostToDevice, 0));
+        {
+          PROFILE_GPU_SCOPE("expert_assignment_building", 0);
+          HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int),
+                                   0));
 
-            HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int),
-                                    0));
-
-            build_expert_assignments_kernel<<<gridCount, 256, 0>>>(
-                ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos,
-                d_expert_offsets, d_expert_counts, d_assignment_batches,
-                d_assignment_slots, batch_size, p->experts_per_token, E);
-          }
+          build_expert_assignments_kernel<<<gridCount, 256, 0>>>(
+              ctx.gpu_activations.d_topk_i, ctx.gpu_activations.d_pos,
+              d_expert_offsets, d_expert_counts, d_assignment_batches,
+              d_assignment_slots, batch_size, p->experts_per_token, E);
+          HIP_CHECK(hipGetLastError());
         }
 
-        if (total_assignments > 0) {
-          {
-            PROFILE_GPU_SCOPE("mlp1_fused_gemm", 0);
-            const int max_tiles =
-                (max_assign_per_expert + MATMUL_MLP1_BLOCK_ROWS - 1) /
-                MATMUL_MLP1_BLOCK_ROWS;
-            dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
-            dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) /
-                              MATMUL_MLP1_BLOCK_COLS,
-                          max_tiles, E);
-            mlp1_kernel<<<grid_mlp1, block_mlp1, 0>>>(
+        {
+          PROFILE_GPU_SCOPE("mlp1_fused_gemm", 0);
+          const int max_tiles =
+              (max_assign_per_expert + MATMUL_MLP1_BLOCK_ROWS - 1) /
+              MATMUL_MLP1_BLOCK_ROWS;
+          dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK, 1);
+          dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS - 1) /
+                            MATMUL_MLP1_BLOCK_COLS,
+                        max_tiles, E);
+          mlp1_kernel<<<grid_mlp1, block_mlp1, 0>>>(
               d_gate_up_topk, ctx.gpu_activations.d_t,
               ctx.gpu_weights_bf16.d_w_mlp1_bf16, ctx.stride_w_mlp1_bf16,
               ctx.gpu_expert_bias.g_b_mlp1, d_assignment_batches,
               d_assignment_slots, d_expert_offsets, l, E, H, IM, p->swiglu_limit,
               batch_size, ctx.gpu_activations.d_pos);
-          }
+        }
 
-          {
-            PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm", 0);
-            const int max_tiles =
-                (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
-                MATMUL_MLP2_BLOCK_ROWS;
-            dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
-            dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
-                              MATMUL_MLP2_BLOCK_COLS,
-                          max_tiles, E);
-            mlp2_kernel<<<grid_mlp2, block_mlp2, 0>>>(
+        {
+          PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm", 0);
+          const int max_tiles =
+              (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
+              MATMUL_MLP2_BLOCK_ROWS;
+          dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
+          dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
+                            MATMUL_MLP2_BLOCK_COLS,
+                        max_tiles, E);
+          mlp2_kernel<<<grid_mlp2, block_mlp2, 0>>>(
               ctx.gpu_activations.d_e_agg, d_gate_up_topk,
               ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.stride_w_mlp2_bf16,
               ctx.gpu_expert_bias.g_b_mlp2, d_assignment_batches,
               d_assignment_slots, d_expert_offsets, ctx.gpu_activations.d_topk_v, l,
               E, IM, H, batch_size, ctx.gpu_activations.d_pos);
-          }
         }
       } // End of if total_pairs > 0 && E > 0
 
