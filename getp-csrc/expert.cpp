@@ -622,6 +622,14 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     HIP_CHECK(hipStreamCreateWithFlags(&ctx.comm_streams[i], hipStreamNonBlocking));
   }
 
+  HIP_CHECK(hipEventCreateWithFlags(&ctx.router_ready_event, hipEventDisableTiming));
+  ctx.pack_done_events = (hipEvent_t *)malloc(sizeof(hipEvent_t) * g_num_devices);
+  ctx.copy_ready_events = (hipEvent_t *)malloc(sizeof(hipEvent_t) * g_num_devices);
+  for (int i = 0; i < g_num_devices; ++i) {
+    HIP_CHECK(hipEventCreateWithFlags(&ctx.pack_done_events[i], hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&ctx.copy_ready_events[i], hipEventDisableTiming));
+  }
+
   if (g_num_devices > 1) {
     const int K = model_config->experts_per_token;
     const size_t B_owner_peer_cap = (size_t)MAX_BATCH_SIZE;
@@ -637,10 +645,24 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     ensure_host_ptr_array(&ctx.home_peer_buffers.d_b2local_peer, g_num_devices);
     ensure_host_ptr_array(&ctx.home_peer_buffers.d_local2b_peer, g_num_devices);
     ensure_host_ptr_array(&ctx.home_peer_buffers.d_expert_counts_peer, g_num_devices);
-    ensure_host_ptr_array(&ctx.home_peer_buffers.d_expert_writes_peer, g_num_devices);
     ensure_host_ptr_array(&ctx.home_peer_buffers.d_expert_offsets_peer, g_num_devices);
     ensure_host_ptr_array(&ctx.home_peer_buffers.d_pos_peer, g_num_devices);
     ensure_host_ptr_array(&ctx.home_peer_buffers.d_topk_v_peer, g_num_devices);
+    if (!ctx.home_peer_buffers.h_owner_B) {
+      HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&ctx.home_peer_buffers.h_owner_B),
+                              g_num_devices * sizeof(int)));
+      std::fill_n(ctx.home_peer_buffers.h_owner_B, g_num_devices, 0);
+    }
+    if (!ctx.home_peer_buffers.h_total_assign) {
+      HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&ctx.home_peer_buffers.h_total_assign),
+                              g_num_devices * sizeof(int)));
+      std::fill_n(ctx.home_peer_buffers.h_total_assign, g_num_devices, 0);
+    }
+    if (!ctx.home_peer_buffers.h_prev_owner_B) {
+      HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&ctx.home_peer_buffers.h_prev_owner_B),
+                              g_num_devices * sizeof(int)));
+      std::fill_n(ctx.home_peer_buffers.h_prev_owner_B, g_num_devices, -1);
+    }
 
     ensure_host_ptr_array(&ctx.owner_receive_buffers.recv_x_from_home, g_num_devices);
     ensure_host_ptr_array(&ctx.owner_receive_buffers.recv_pos_from_home, g_num_devices);
@@ -675,10 +697,13 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
       hip_alloc((void**)&ctx.home_peer_buffers.d_b2local_peer[peer],               (size_t)B * sizeof(int));
       hip_alloc((void**)&ctx.home_peer_buffers.d_local2b_peer[peer],               (size_t)B * sizeof(int));
       hip_alloc((void**)&ctx.home_peer_buffers.d_expert_counts_peer[peer],         (size_t)E_local_max * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_expert_writes_peer[peer],         (size_t)E_local_max * sizeof(int));
       hip_alloc((void**)&ctx.home_peer_buffers.d_expert_offsets_peer[peer],        (size_t)(E_local_max + 1) * sizeof(int));
       hip_alloc((void**)&ctx.home_peer_buffers.d_pos_peer[peer],                   (size_t)B * sizeof(int));
       hip_alloc((void**)&ctx.home_peer_buffers.d_topk_v_peer[peer],                (size_t)B * (size_t)K * sizeof(float));
+      HIP_CHECK(hipMemset(ctx.home_peer_buffers.d_b2local_peer[peer], 0xFF,
+                          (size_t)B * sizeof(int)));
+      HIP_CHECK(hipMemset(ctx.home_peer_buffers.d_local2b_peer[peer], 0xFF,
+                          (size_t)B * sizeof(int)));
 
       // OWNER (this ctx) nhận từ HOME=peer
       hip_alloc((void**)&ctx.owner_receive_buffers.recv_x_from_home[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
@@ -800,21 +825,58 @@ static void cleanup_device_context_ep(DeviceContext &ctx) {
   free_per_peer_ptrs(ctx.home_peer_buffers.d_local2b_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_expert_counts_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_expert_offsets_peer);
-  free_per_peer_ptrs(ctx.home_peer_buffers.d_expert_writes_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_pos_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_topk_v_peer);
+  if (ctx.home_peer_buffers.h_owner_B) {
+    HIP_CHECK(hipHostFree(ctx.home_peer_buffers.h_owner_B));
+    ctx.home_peer_buffers.h_owner_B = nullptr;
+  }
+  if (ctx.home_peer_buffers.h_total_assign) {
+    HIP_CHECK(hipHostFree(ctx.home_peer_buffers.h_total_assign));
+    ctx.home_peer_buffers.h_total_assign = nullptr;
+  }
+  if (ctx.home_peer_buffers.h_prev_owner_B) {
+    HIP_CHECK(hipHostFree(ctx.home_peer_buffers.h_prev_owner_B));
+    ctx.home_peer_buffers.h_prev_owner_B = nullptr;
+  }
+  if (ctx.router_ready_event) {
+    HIP_CHECK(hipEventDestroy(ctx.router_ready_event));
+    ctx.router_ready_event = nullptr;
+  }
+  if (ctx.pack_done_events) {
+    for (int i = 0; i < g_num_devices; ++i) {
+      if (ctx.pack_done_events[i]) HIP_CHECK(hipEventDestroy(ctx.pack_done_events[i]));
+    }
+    free(ctx.pack_done_events);
+    ctx.pack_done_events = nullptr;
+  }
+  if (ctx.copy_ready_events) {
+    for (int i = 0; i < g_num_devices; ++i) {
+      if (ctx.copy_ready_events[i]) HIP_CHECK(hipEventDestroy(ctx.copy_ready_events[i]));
+    }
+    free(ctx.copy_ready_events);
+    ctx.copy_ready_events = nullptr;
+  }
 }
 
 static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_limit, const int H, const int IM, const int E, const int L, const int K, int batch_size, int layer) {
   // Ensure router outputs computed on default stream are visible before routing on pack_stream
-  hipEvent_t router_ready_evt;
-  HIP_CHECK(hipEventCreateWithFlags(&router_ready_evt, hipEventDisableTiming));
+  hipEvent_t router_ready_evt = ctx.router_ready_event;
   HIP_CHECK(hipEventRecord(router_ready_evt, 0 /* default stream */));
   HIP_CHECK(hipStreamWaitEvent(ctx.pack_stream, router_ready_evt, 0));
-  HIP_CHECK(hipEventDestroy(router_ready_evt));
   // For each owner, count -> scan -> pack -> bulk copy
-  dim3 blockB(256, 1, 1);
-  dim3 gridB((batch_size + 255) / 256, 1, 1);
+  int current_device = -1;
+  auto ensure_device = [&](int device_id) {
+    if (current_device == device_id)
+      return;
+    HIP_CHECK(hipSetDevice(device_id));
+    current_device = device_id;
+  };
+  ensure_device(ctx.device_id);
+
+  int *h_owner_B = ctx.home_peer_buffers.h_owner_B;
+  int *h_total_assign = ctx.home_peer_buffers.h_total_assign;
+  int *h_prev_owner_B = ctx.home_peer_buffers.h_prev_owner_B;
   for (int owner = 0; owner < g_num_devices; ++owner) {
     // Get E_local for this owner at layer l
     const int E_local_layer = g_E_local_per_owner_layer[(size_t)owner * (size_t)L + (size_t)layer];
@@ -822,58 +884,24 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
     // Pointers to home-side scratch/buffers
     int *d_counts = ctx.home_peer_buffers.d_expert_counts_peer[owner];
     int *d_offsets = ctx.home_peer_buffers.send_expert_offsets_peer[owner];
-    int *d_writes = ctx.home_peer_buffers.d_expert_writes_peer[owner];
     int *d_b2local = ctx.home_peer_buffers.d_b2local_peer[owner];
     int *d_local2b = ctx.home_peer_buffers.d_local2b_peer[owner];
     int *d_owner_B = ctx.home_peer_buffers.d_owner_B_peer[owner];
-
-    // Reset buffers
-    HIP_CHECK(hipMemsetAsync(d_counts, 0, (size_t)E_local_layer * sizeof(int), ctx.pack_stream));
-    HIP_CHECK(hipMemsetAsync(d_writes, 0, (size_t)E_local_layer * sizeof(int), ctx.pack_stream));
-    HIP_CHECK(hipMemsetAsync(d_b2local, 0xFF, (size_t)batch_size * sizeof(int), ctx.pack_stream)); // -1
-    HIP_CHECK(hipMemsetAsync(d_owner_B, 0, sizeof(int), ctx.pack_stream));
 
     // owner-specific e2lid map base on device
     const int *d_e2lid_owner_l = ctx.routing_meta.d_e2lid_allowners +
                                  (((size_t)owner * L + (size_t)layer) * (size_t)E);
 
     {
-      // route_count
-      PROFILE_GPU_SCOPE("route_count_owner_kernel", 0);
-      route_count_owner_kernel<<<gridB, blockB, 0, ctx.pack_stream>>>(
-          d_counts,
-          ctx.gpu_activations.d_topk_i,
-          ctx.gpu_activations.d_pos,
-          d_e2lid_owner_l,
-          batch_size,
-          K,
-          E);
-    }
-    {
-      PROFILE_GPU_SCOPE("exclusive_scan_small_kernel", 0);
-      // exclusive scan counts -> offsets
-      const int shared_scan = std::max(32, E_local_layer) * (int)sizeof(int);
-      exclusive_scan_small_kernel<<<1, E_local_layer, shared_scan, ctx.pack_stream>>>(
-          d_counts,
-          d_offsets,
-          E_local_layer);
-    }
-
-    // Total assignments = offsets[E_local]
-    int h_total_assign = 0;
-    HIP_CHECK(hipMemcpyAsync(&h_total_assign, d_offsets + E_local_layer, sizeof(int), hipMemcpyDeviceToHost, ctx.pack_stream));
-    HIP_CHECK(hipStreamSynchronize(ctx.pack_stream));
-    if (h_total_assign == 0) continue;
-
-    {
-      PROFILE_GPU_SCOPE("route_pack_owner_kernel", 0);
-      // route_pack -> assignment arrays and b2local/local2b
-      route_pack_owner_kernel<<<gridB, blockB, 0, ctx.pack_stream>>>(
+      PROFILE_GPU_SCOPE("fused_route_owner_kernel", 0);
+      const int threads = 256;
+      const int shared_bytes = (int)sizeof(int) * (3 * E_local_layer + 1);
+      fused_route_owner_kernel<<<1, threads, shared_bytes, ctx.pack_stream>>>(
           d_b2local,
           d_local2b,
           d_owner_B,
           d_offsets,
-          d_writes,
+          d_counts,
           ctx.home_peer_buffers.send_assignment_batches_peer[owner],
           ctx.home_peer_buffers.send_assignment_slots_peer[owner],
           ctx.gpu_activations.d_topk_i,
@@ -881,14 +909,28 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
           d_e2lid_owner_l,
           batch_size,
           K,
-          E);
+          E,
+          E_local_layer);
     }
 
-    // Read B_local
-    int h_B_local = 0;
-    HIP_CHECK(hipMemcpyAsync(&h_B_local, d_owner_B, sizeof(int), hipMemcpyDeviceToHost, ctx.pack_stream));
+    // Total assignments = offsets[E_local]
+    HIP_CHECK(hipMemcpyAsync(&h_total_assign[owner],
+                             d_offsets + E_local_layer,
+                             sizeof(int),
+                             hipMemcpyDeviceToHost,
+                             ctx.pack_stream));
+    HIP_CHECK(hipMemcpyAsync(&h_owner_B[owner],
+                             d_owner_B,
+                             sizeof(int),
+                             hipMemcpyDeviceToHost,
+                             ctx.pack_stream));
     HIP_CHECK(hipStreamSynchronize(ctx.pack_stream));
-    if (h_B_local == 0) continue;
+    const int owner_total_assign = h_total_assign ? h_total_assign[owner] : 0;
+    const int h_B_local = h_owner_B ? h_owner_B[owner] : 0;
+    if (owner_total_assign == 0 || h_B_local == 0) {
+      if (h_prev_owner_B) h_prev_owner_B[owner] = 0;
+      continue;
+    }
 
     // Pack rows and meta to contiguous send buffers
     {
@@ -898,33 +940,35 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
       pack_rows_owner_kernel<<<gridPack, blockH, 0, ctx.pack_stream>>>(
           ctx.home_peer_buffers.send_x_peer[owner],
           ctx.gpu_activations.d_t,
-          d_b2local,
-          batch_size,
+          d_local2b,
+          h_B_local,
           H);
     }
     {
       PROFILE_GPU_SCOPE("pack_meta_owner_kernel", 0);
-      dim3 gridMeta((batch_size + 255) / 256, 1, 1);
+      dim3 gridMeta((h_B_local + 255) / 256, 1, 1);
       pack_meta_owner_kernel<<<gridMeta, 256, 0, ctx.pack_stream>>>(
           ctx.home_peer_buffers.send_pos_peer[owner],
           ctx.home_peer_buffers.send_topk_v_peer[owner],
-          d_b2local,
+          d_local2b,
+          h_B_local,
           ctx.gpu_activations.d_pos,
           ctx.gpu_activations.d_topk_v,
-          batch_size,
           K);
     }
 
     // Ensure pack completes before starting P2P copies.
     // Note: cross-device stream-wait is not supported; use CPU sync on the pack event.
-    hipEvent_t pack_done_evt;
-    HIP_CHECK(hipEventCreateWithFlags(&pack_done_evt, hipEventDisableTiming));
-    HIP_CHECK(hipEventRecord(pack_done_evt, ctx.pack_stream));
-    HIP_CHECK(hipEventSynchronize(pack_done_evt));
-    HIP_CHECK(hipEventDestroy(pack_done_evt));
+    hipEvent_t pack_done_evt = ctx.pack_done_events ? ctx.pack_done_events[owner] : nullptr;
+    if (pack_done_evt) {
+      HIP_CHECK(hipEventRecord(pack_done_evt, ctx.pack_stream));
+      HIP_CHECK(hipEventSynchronize(pack_done_evt));
+    } else {
+      HIP_CHECK(hipStreamSynchronize(ctx.pack_stream));
+    }
 
     // Enqueue copies on the DESTINATION (owner) device's comm stream for this home.
-    HIP_CHECK(hipSetDevice(owner));
+    ensure_device(owner);
     hipStream_t ocomm = g_devices[owner].comm_streams[ctx.device_id];
     HIP_CHECK(hipMemcpyPeerAsync(g_devices[owner].owner_receive_buffers.recv_x_from_home[ctx.device_id], owner,
               ctx.home_peer_buffers.send_x_peer[owner], ctx.device_id,
@@ -937,26 +981,43 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
               (size_t)h_B_local * K * sizeof(float), ocomm));
     HIP_CHECK(hipMemcpyPeerAsync(g_devices[owner].owner_receive_buffers.recv_assignment_batches[ctx.device_id], owner,
               ctx.home_peer_buffers.send_assignment_batches_peer[owner], ctx.device_id,
-              (size_t)h_total_assign * sizeof(uint16_t), ocomm));
+              (size_t)owner_total_assign * sizeof(uint16_t), ocomm));
     HIP_CHECK(hipMemcpyPeerAsync(g_devices[owner].owner_receive_buffers.recv_assignment_slots[ctx.device_id], owner,
               ctx.home_peer_buffers.send_assignment_slots_peer[owner], ctx.device_id,
-              (size_t)h_total_assign * sizeof(uint8_t), ocomm));
+              (size_t)owner_total_assign * sizeof(uint8_t), ocomm));
     HIP_CHECK(hipMemcpyPeerAsync(g_devices[owner].owner_receive_buffers.recv_expert_offsets[ctx.device_id], owner,
               d_offsets, ctx.device_id,
               (size_t)(E_local_layer + 1) * sizeof(int), ocomm));
 
     // Ensure copies have completed on the owner before launching owner-side MLP.
-    HIP_CHECK(hipStreamSynchronize(ocomm));
+    hipEvent_t copy_ready_evt = g_devices[owner].copy_ready_events
+                                    ? g_devices[owner].copy_ready_events[ctx.device_id]
+                                    : nullptr;
+    if (copy_ready_evt) {
+      HIP_CHECK(hipEventRecord(copy_ready_evt, ocomm));
+      HIP_CHECK(hipStreamWaitEvent(g_devices[owner].mlp_stream, copy_ready_evt, 0));
+    } else {
+      HIP_CHECK(hipStreamSynchronize(ocomm));
+    }
 
     // Launch MLP on owner after the copies complete (enqueue on owner's mlp_stream)
     {
       PROFILE_GPU_SCOPE("mlp1_kernel", 0);
       // For simplicity, reuse counts buffer by copying from offsets diff
       int *d_owner_offsets = g_devices[owner].owner_receive_buffers.recv_expert_offsets[ctx.device_id];
-      // Clear owner-side buffers before compute to avoid stale data
-      HIP_CHECK(hipMemsetAsync(g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id], 0, (size_t)h_B_local * H * sizeof(float), g_devices[owner].mlp_stream));
-      // Optional: clear gate_up buffer region (mlp1 will overwrite assigned entries)
-      HIP_CHECK(hipMemsetAsync(g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id], 0, (size_t)K * (size_t)h_B_local * (size_t)IM * sizeof(bf16_t), g_devices[owner].mlp_stream));
+      const dim3 zeroBlock(32, 4, 1);
+      const dim3 zeroGrid((H + zeroBlock.x - 1) / zeroBlock.x,
+                          (h_B_local + zeroBlock.y - 1) / zeroBlock.y,
+                          1);
+      zero_partial_rows_kernel<<<zeroGrid, zeroBlock, 0, g_devices[owner].mlp_stream>>>(
+          g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id],
+          H,
+          h_B_local);
+      const size_t gate_bytes = (size_t)owner_total_assign * (size_t)IM * sizeof(bf16_t);
+      if (gate_bytes > 0) {
+        HIP_CHECK(hipMemsetAsync(g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id], 0,
+                                 gate_bytes, g_devices[owner].mlp_stream));
+      }
 
       const int max_tiles = (h_B_local + MATMUL_MLP1_BLOCK_ROWS_120B - 1) / MATMUL_MLP1_BLOCK_ROWS_120B;
       dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK_120B, 1);
@@ -1000,7 +1061,7 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
     HIP_CHECK(hipStreamSynchronize(g_devices[owner].mlp_stream));
 
     // Copy partials back to home on same comm stream and enqueue accumulate on home.comm_stream[owner]
-    HIP_CHECK(hipSetDevice(ctx.device_id));
+    ensure_device(ctx.device_id);
     HIP_CHECK(hipMemcpyPeerAsync(ctx.partial_buffers.recv_partial_home[owner], ctx.device_id,
                                   g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id], owner,
                                   (size_t)h_B_local * H * sizeof(float), ctx.comm_streams[owner]));
@@ -1017,5 +1078,9 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
           h_B_local);
       HIP_CHECK(hipStreamSynchronize(ctx.comm_streams[owner]));
     }
+    if (h_prev_owner_B) {
+      h_prev_owner_B[owner] = h_B_local;
+    }
   }
+  ensure_device(ctx.device_id);
 }

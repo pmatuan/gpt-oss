@@ -618,15 +618,49 @@ __global__ void accumulate_partials_kernel(
     const int* __restrict__ batch_ids,
     int H,
     int cnt) {
-  const int h = blockIdx.x * blockDim.x + threadIdx.x;
-  const int i = blockIdx.y;
-  if (i >= cnt || h >= H) return;
-  const int b = batch_ids[i];
+  const int lb = blockIdx.y;
+  if (lb >= cnt) return;
+  const int b = batch_ids[lb];
   if (b < 0) return;
-  const float val = src[(size_t)i * (size_t)H + h];
-  if (val != 0.0f) {
-    atomicAdd(dest + (size_t)b * (size_t)H + h, val);
+
+  float* __restrict__ dst_row = dest + (size_t)b * (size_t)H;
+  const float* __restrict__ src_row = src + (size_t)lb * (size_t)H;
+
+  const int thread_linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_threads = blockDim.x * gridDim.x;
+
+  const bool can_vectorize = ((reinterpret_cast<uintptr_t>(dst_row) & 0xF) == 0) &&
+                             ((reinterpret_cast<uintptr_t>(src_row) & 0xF) == 0);
+
+  if (can_vectorize) {
+    const int vec_elems = H / 4;
+    const f32x4* __restrict__ src_vec =
+        reinterpret_cast<const f32x4*>(src_row);
+    f32x4* __restrict__ dst_vec = reinterpret_cast<f32x4*>(dst_row);
+
+    for (int idx = thread_linear_idx; idx < vec_elems; idx += total_threads) {
+      dst_vec[idx] = dst_vec[idx] + src_vec[idx];
+    }
+
+    const int tail_start = vec_elems * 4;
+    for (int h = tail_start + thread_linear_idx; h < H; h += total_threads) {
+      dst_row[h] += src_row[h];
+    }
+  } else {
+    for (int h = thread_linear_idx; h < H; h += total_threads) {
+      dst_row[h] += src_row[h];
+    }
   }
+}
+
+__global__ void zero_partial_rows_kernel(
+    float* __restrict__ dst,
+    int H,
+    int rows) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = blockIdx.y * blockDim.y + threadIdx.y;
+  if (b >= rows || h >= H) return;
+  dst[(size_t)b * (size_t)H + h] = 0.0f;
 }
 
 // ================= Device-side bucketization & packing (MoE routing) ================
@@ -721,36 +755,206 @@ __global__ void route_pack_owner_kernel(
   }
 }
 
+__global__ void fused_route_owner_kernel(
+    int* __restrict__ b2local,
+    int* __restrict__ local2b,
+    int* __restrict__ owner_B,
+    int* __restrict__ expert_offsets,
+    int* __restrict__ expert_counts_out,
+    uint16_t* __restrict__ assignment_batches,
+    uint8_t* __restrict__ assignment_slots,
+    const int* __restrict__ topk_i,
+    const int* __restrict__ pos,
+    const int* __restrict__ e2lid_owner_l,
+    int B,
+    int K,
+    int E,
+    int E_local) {
+  extern __shared__ int shared_ints[];
+  int *counts = shared_ints;                         // [E_local]
+  int *offsets = counts + E_local;                  // [E_local + 1]
+  int *writes = offsets + (E_local + 1);            // [E_local]
+  __shared__ int owner_B_shared;
+
+  if (threadIdx.x == 0) owner_B_shared = 0;
+  for (int i = threadIdx.x; i < E_local; i += blockDim.x) {
+    counts[i] = 0;
+    writes[i] = 0;
+  }
+  if (threadIdx.x == 0) offsets[0] = 0;
+  __syncthreads();
+
+  for (int b = threadIdx.x; b < B; b += blockDim.x) {
+    b2local[b] = -1;
+    local2b[b] = -1;
+  }
+  __syncthreads();
+
+  for (int b = threadIdx.x; b < B; b += blockDim.x) {
+    if (pos[b] < 0) continue;
+    for (int k = 0; k < K; ++k) {
+      const int e = topk_i[(size_t)b * (size_t)K + k];
+      if ((unsigned)e >= (unsigned)E) continue;
+      const int lid = e2lid_owner_l[e];
+      if (lid < 0 || lid >= E_local) continue;
+      atomicAdd(&counts[lid], 1);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    int running = 0;
+    for (int i = 0; i < E_local; ++i) {
+      offsets[i] = running;
+      running += counts[i];
+    }
+    offsets[E_local] = running;
+  }
+  __syncthreads();
+
+  if (expert_offsets) {
+    for (int i = threadIdx.x; i <= E_local; i += blockDim.x) {
+      expert_offsets[i] = offsets[i];
+    }
+  }
+  if (expert_counts_out) {
+    for (int i = threadIdx.x; i < E_local; i += blockDim.x) {
+      expert_counts_out[i] = counts[i];
+    }
+  }
+  __syncthreads();
+
+  for (int b = threadIdx.x; b < B; b += blockDim.x) {
+    if (pos[b] < 0) continue;
+
+    bool has_local_assignment = false;
+    #pragma unroll
+    for (int k = 0; k < K; ++k) {
+      const int e = topk_i[(size_t)b * (size_t)K + k];
+      if ((unsigned)e >= (unsigned)E) continue;
+      const int lid = e2lid_owner_l[e];
+      if (lid < 0 || lid >= E_local) continue;
+      has_local_assignment = true;
+      break;
+    }
+    if (!has_local_assignment) {
+      continue;
+    }
+
+    const int lb = atomicAdd(&owner_B_shared, 1);
+    b2local[b] = lb;
+    local2b[lb] = b;
+
+    for (int k = 0; k < K; ++k) {
+      const int e = topk_i[(size_t)b * (size_t)K + k];
+      if ((unsigned)e >= (unsigned)E) continue;
+      const int lid = e2lid_owner_l[e];
+      if (lid < 0 || lid >= E_local) continue;
+      const int write = atomicAdd(&writes[lid], 1);
+      const int idx = offsets[lid] + write;
+      assignment_batches[idx] = static_cast<uint16_t>(lb);
+      assignment_slots[idx] = static_cast<uint8_t>(k);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    if (owner_B) *owner_B = owner_B_shared;
+  }
+}
+
 __global__ void pack_rows_owner_kernel(
     bf16_t* __restrict__ dst,
     const bf16_t* __restrict__ src,
-    const int* __restrict__ b2local,
-    int B,
+    const int* __restrict__ local2b,
+    int owner_B,
     int H) {
-  const int b = blockIdx.y;
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B || i >= H) return;
-  const int lb = b2local[b];
-  if (lb < 0) return;
-  dst[(size_t)lb * H + i] = src[(size_t)b * H + i];
+  const int lb = blockIdx.y;
+  if (lb >= owner_B) return;
+
+  const int thread_linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_threads = blockDim.x * gridDim.x;
+
+  const int b = local2b[lb];
+  if (b < 0) return;
+
+  const size_t dst_base = (size_t)lb * (size_t)H;
+  const size_t src_base = (size_t)b * (size_t)H;
+
+  const bool can_vectorize = ((reinterpret_cast<uintptr_t>(dst + dst_base) & 0x3) == 0) &&
+                             ((reinterpret_cast<uintptr_t>(src + src_base) & 0x3) == 0);
+
+  if (can_vectorize) {
+    const int vec_elems = H / 2;
+    const uint32_t* __restrict__ src_vec =
+        reinterpret_cast<const uint32_t*>(src + src_base);
+    uint32_t* __restrict__ dst_vec = reinterpret_cast<uint32_t*>(dst + dst_base);
+
+    for (int idx = thread_linear_idx; idx < vec_elems; idx += total_threads) {
+      dst_vec[idx] = src_vec[idx];
+    }
+
+    const int tail_start = vec_elems * 2;
+    for (int h = tail_start + thread_linear_idx; h < H; h += total_threads) {
+      dst[dst_base + h] = src[src_base + h];
+    }
+  } else {
+    for (int h = thread_linear_idx; h < H; h += total_threads) {
+      dst[dst_base + h] = src[src_base + h];
+    }
+  }
 }
 
 __global__ void pack_meta_owner_kernel(
     int* __restrict__ pos_owner,
     float* __restrict__ topk_v_owner,
-    const int* __restrict__ b2local,
+    const int* __restrict__ local2b,
+    int owner_B,
     const int* __restrict__ pos,
     const float* __restrict__ topk_v,
-    int B,
     int K) {
-  const int b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B) return;
-  const int lb = b2local[b];
-  if (lb < 0) return;
+  const int lb = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lb >= owner_B) return;
+
+  const int b = local2b[lb];
+  if (b < 0) return;
+
   pos_owner[lb] = pos[b];
-  for (int k = 0; k < K; ++k) {
-    topk_v_owner[(size_t)lb * K + k] = topk_v[(size_t)b * K + k];
+
+  float* __restrict__ dst_row = topk_v_owner + (size_t)lb * (size_t)K;
+  const float* __restrict__ src_row = topk_v + (size_t)b * (size_t)K;
+
+  const bool can_vectorize = ((reinterpret_cast<uintptr_t>(dst_row) & 0xF) == 0) &&
+                             ((reinterpret_cast<uintptr_t>(src_row) & 0xF) == 0);
+
+  if (can_vectorize) {
+    const int vec_elems = K / 4;
+    const f32x4* __restrict__ src_vec = reinterpret_cast<const f32x4*>(src_row);
+    f32x4* __restrict__ dst_vec = reinterpret_cast<f32x4*>(dst_row);
+    for (int idx = 0; idx < vec_elems; ++idx) {
+      dst_vec[idx] = src_vec[idx];
+    }
+    for (int k = vec_elems * 4; k < K; ++k) {
+      dst_row[k] = src_row[k];
+    }
+  } else {
+    for (int k = 0; k < K; ++k) {
+      dst_row[k] = src_row[k];
+    }
   }
+}
+
+__global__ void reset_owner_mappings_kernel(
+    int* __restrict__ b2local,
+    int* __restrict__ local2b,
+    int prev_owner_B) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= prev_owner_B) return;
+  const int b = local2b[idx];
+  if (b >= 0) {
+    b2local[b] = -1;
+  }
+  local2b[idx] = -1;
 }
 
 // Matmul Helper Functions
@@ -771,7 +975,7 @@ __device__ __forceinline__ s16x4 load_bf16x4(const uint16_t* src, int valid_elem
     return out;
   }
 
-#pragma unroll
+  #pragma unroll
   for (int i = 0; i < MATMUL_CHUNK_K; ++i) {
     out[i] = (i < valid_elems) ? static_cast<short>(src[i]) : 0;
   }
