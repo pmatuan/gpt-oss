@@ -27,6 +27,55 @@ static inline int ep_owner_of(int l, int e, int E) {
   return g_ep_owner_map.empty() ? 0 : g_ep_owner_map[(size_t)l * (size_t)E + (size_t)e];
 }
 
+static void build_rope_tables(const Config *cfg, std::vector<float> &inv_freq_out,
+                              float &concentration_out) {
+  const int D = cfg->head_dim;
+  const int half = D >> 1;
+  inv_freq_out.assign(half, 0.0f);
+  concentration_out = 1.0f;
+
+  if (half == 0)
+    return;
+
+  const float theta = cfg->rope_theta;
+  const float scaling = cfg->rope_scaling_factor;
+  const float initial_context = static_cast<float>(cfg->initial_context_length);
+  const float ntk_beta = 32.0f;
+  const float ntk_alpha = 1.0f;
+  const float two_pi = 6.28318530717958647692f;
+  const float log_theta = logf(theta);
+
+  float low = 0.0f;
+  float high = 0.0f;
+
+  if (scaling > 1.0f && theta > 0.0f) {
+    concentration_out = 0.1f * logf(scaling) + 1.0f;
+    if (log_theta != 0.0f) {
+      low = half * logf(initial_context / (ntk_beta * two_pi)) / log_theta;
+      high = half * logf(initial_context / (ntk_alpha * two_pi)) / log_theta;
+    }
+  }
+
+  for (int i = 0; i < half; ++i) {
+    const float exponent = (2.0f * static_cast<float>(i)) /
+                           static_cast<float>(D);
+    const float freq = powf(theta, exponent);
+    const float inv_base = freq != 0.0f ? 1.0f / freq : 0.0f;
+    float inv = inv_base;
+
+    if (scaling > 1.0f && log_theta != 0.0f) {
+      const float interpolation = inv_base / scaling;
+      const float denom = high - low;
+      float ramp = denom != 0.0f ? (static_cast<float>(i) - low) / denom : 0.0f;
+      ramp = fmaxf(0.0f, fminf(1.0f, ramp));
+      const float mask = 1.0f - ramp;
+      inv = interpolation * (1.0f - mask) + inv_base * mask;
+    }
+
+    inv_freq_out[i] = inv;
+  }
+}
+
 // Helper to allocate host arrays of device pointers lazily
 template <typename T>
 static void ensure_host_ptr_array(T ***arr, int ndev) {
@@ -296,6 +345,21 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
 
+  ctx.gpu_activations.d_rope_inv_freq = nullptr;
+  ctx.gpu_activations.rope_concentration = 1.0f;
+  {
+    std::vector<float> rope_inv_freq;
+    float rope_concentration = 1.0f;
+    build_rope_tables(model_config, rope_inv_freq, rope_concentration);
+    if (!rope_inv_freq.empty()) {
+      const size_t bytes = rope_inv_freq.size() * sizeof(float);
+      HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_rope_inv_freq, bytes));
+      HIP_CHECK(hipMemcpy(ctx.gpu_activations.d_rope_inv_freq,
+                          rope_inv_freq.data(), bytes, hipMemcpyHostToDevice));
+    }
+    ctx.gpu_activations.rope_concentration = rope_concentration;
+  }
+
   ctx.gpu_activations.d_key_cache = nullptr;
   ctx.gpu_activations.d_value_cache = nullptr;
   ctx.gpu_activations.kv_seq_capacity = 0;
@@ -543,7 +607,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
   debug_print_gpu_memory("after large BF16 weights", device_id);
 
   // Initialize KV cache with optimal sequence length during warmup
-  int seq_hint = std::min(model_config->seq_len,
+  int seq_hint = std::max(model_config->seq_len,
                           model_config->initial_context_length);
   ensure_kv_cache_capacity(ctx, seq_hint);
 

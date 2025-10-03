@@ -16,58 +16,6 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-static void build_rope_tables(const Config *cfg,
-                              std::vector<float> &inv_freq_out,
-                              float &concentration_out) {
-  const int D = cfg->head_dim;
-  const int half = D >> 1;
-  inv_freq_out.assign(half, 0.0f);
-  concentration_out = 1.0f;
-
-  if (half == 0)
-    return;
-
-  const float theta = cfg->rope_theta;
-  const float scaling = cfg->rope_scaling_factor;
-  const float initial_context = static_cast<float>(cfg->initial_context_length);
-  const float ntk_beta = 32.0f;
-  const float ntk_alpha = 1.0f;
-  const float two_pi = 6.28318530717958647692f;
-  const float log_theta = logf(theta);
-
-  float low = 0.0f;
-  float high = 0.0f;
-
-  if (scaling > 1.0f) {
-    concentration_out = 0.1f * logf(scaling) + 1.0f;
-    const float denom = log_theta;
-    if (denom != 0.0f) {
-      low = half * logf(initial_context / (ntk_beta * two_pi)) / denom;
-      high = half * logf(initial_context / (ntk_alpha * two_pi)) / denom;
-    }
-  }
-
-  for (int i = 0; i < half; ++i) {
-    const float exponent = (2.0f * static_cast<float>(i)) /
-                           static_cast<float>(D);
-    const float freq = powf(theta, exponent);
-    const float inv_base = freq != 0.0f ? 1.0f / freq : 0.0f;
-    float inv = inv_base;
-
-    if (scaling > 1.0f) {
-      const float interpolation = inv_base / scaling;
-      const float extrapolation = inv_base;
-      const float denom = high - low;
-      float ramp = denom != 0.0f ? (static_cast<float>(i) - low) / denom : 0.0f;
-      ramp = fmaxf(0.0f, fminf(1.0f, ramp));
-      const float mask = 1.0f - ramp;
-      inv = interpolation * (1.0f - mask) + extrapolation * mask;
-    }
-
-    inv_freq_out[i] = inv;
-  }
-}
-
 static void init_device_context(DeviceContext &ctx, int device_id,
                                 Transformer *transformer) {
   ctx.device_id = device_id;
