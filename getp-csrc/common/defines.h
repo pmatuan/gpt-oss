@@ -196,7 +196,8 @@ struct OwnerReceiveBuffers {
 
 struct OwnerPartialBuffers {
   float **partial_owner_per_home = nullptr; // [ndev] -> [B_local,H]
-  float **recv_partial_home = nullptr;      // [ndev] -> [B_local,H] (allocated on home device)
+  bf16_t **partial_owner_per_home_bf16 = nullptr; // [ndev] -> [B_local,H]
+  bf16_t **recv_partial_home_bf16 = nullptr;      // [ndev] -> [B_local,H]
   bf16_t **gate_up_owner_per_home = nullptr; // [ndev] -> [K, B_local, IM]
 };
 
@@ -218,6 +219,7 @@ struct DeviceContext {
   hipEvent_t router_ready_event = nullptr;
   hipEvent_t *pack_done_events = nullptr;   // [ndev]
   hipEvent_t *copy_ready_events = nullptr;  // [ndev]
+  hipEvent_t *mlp_done_events = nullptr;    // [ndev]
 
   size_t stride_w_qkv_bf16 = 0;
   size_t stride_w_o_bf16 = 0;

@@ -1,11 +1,11 @@
-srun: job 78796 queued and waiting for resources
-srun: job 78796 has been allocated resources
+srun: job 80113 queued and waiting for resources
+srun: job 80113 has been allocated resources
 vocab_size: 201088
 hidden_dim: 2880
-n_experts: 32
+n_experts: 128
 experts_per_token: 4
 intermediate_dim: 2880
-n_layers: 24
+n_layers: 36
 head_dim: 64
 n_attn_heads: 64
 n_kv_heads: 8
@@ -15,51 +15,80 @@ rope theta: 150000.000000
 rope_scaling_factor: 32.000000
 sliding window: 128
 swiglu_limit: 7.000000
-requests size = 235110400 B
-Num requests: 896
-Found 1 HIP devices, initializing multi-GPU setup...
-Not using expert parallelism (n_experts=32, n_devices=1)
-Initializing device 0 for batch size 896...
+requests size = 1612185600 B
+Num requests: 6144
+Found 8 HIP devices, initializing multi-GPU setup...
+Using expert parallelism with 8 devices and 128 experts
+Initializing device 0 for batch size 768...
+Initializing device 3 for batch size 768...
 [DEVICE] 0 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
-[DEVICE] 0 [HIP] after activations: HBM free 63.02 GiB / total 63.98 GiB (used 0.96 GiB)
-[DEVICE] 0 [HIP] after small BF16 weights: HBM free 63.01 GiB / total 63.98 GiB (used 0.97 GiB)
-[DEVICE] 0 [HIP] after expert biases: HBM free 62.99 GiB / total 63.98 GiB (used 0.99 GiB)
-[DEVICE] 0 [HIP] after large BF16 weights: HBM free 24.05 GiB / total 63.98 GiB (used 39.93 GiB)
+[DEVICE] 3 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+Initializing device 7 for batch size 768...
+Initializing device 1 for batch size 768...
+Initializing device 4 for batch size 768...
+Initializing device 6 for batch size 768...
+Initializing device 2 for batch size 768...
+[DEVICE] 7 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 4 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 6 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 1 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 2 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+Initializing device 5 for batch size 768...
+[DEVICE] 5 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 1 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 1 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 0 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 0 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 4 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 4 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 7 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 7 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 2 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 2 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 3 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 3 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 5 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 6 [HIP] after activations: HBM free 63.12 GiB / total 63.98 GiB (used 0.86 GiB)
+[DEVICE] 6 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 5 [HIP] after small BF16 weights: HBM free 63.09 GiB / total 63.98 GiB (used 0.89 GiB)
+[DEVICE] 1 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 0 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 7 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 2 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 6 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 3 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 4 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 5 [HIP] after expert biases: HBM free 63.02 GiB / total 63.98 GiB (used 0.97 GiB)
+[DEVICE] 2 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 3 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 2 allocated KV cache full 1024 tokens
+[DEVICE] 2 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 4 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 3 allocated KV cache full 1024 tokens
+[DEVICE] 3 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 4 allocated KV cache full 1024 tokens
+[DEVICE] 4 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 7 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 1 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 5 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 0 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 6 [HIP] after large BF16 weights: HBM free 32.38 GiB / total 63.98 GiB (used 31.61 GiB)
+[DEVICE] 7 allocated KV cache full 1024 tokens
+[DEVICE] 7 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 1 allocated KV cache full 1024 tokens
+[DEVICE] 1 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 5 allocated KV cache full 1024 tokens
+[DEVICE] 6 allocated KV cache full 1024 tokens
 [DEVICE] 0 allocated KV cache full 1024 tokens
-[DEVICE] 0 [HIP] after KV cache allocation (model fully loaded): HBM free 0.43 GiB / total 63.98 GiB (used 63.56 GiB)
+[DEVICE] 5 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 0 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
+[DEVICE] 6 [HIP] after KV cache allocation (model fully loaded): HBM free 2.00 GiB / total 63.98 GiB (used 61.98 GiB)
 Multi-GPU initialization complete!
 
-warm up elapsed time(s): 43.742000
-Processing 896 requests across 1 GPUs...
-Multi-GPU inference completed. Total tokens generated: 890011
+warm up elapsed time(s): 79.774000
+Processing 6144 requests across 8 GPUs...
+Multi-GPU inference completed. Total tokens generated: 6060259
 
-elapsed time(s): 246.403000, achieved throughput TPS (tok/s): 3612.013652
+elapsed time(s): 772.313000, achieved throughput TPS (tok/s): 7846.894977
 
-finish elapsed time(s): 0.002000
-
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                                  PROFILER SUMMARY                                    │
-├──────────────────────────────────────────────────────────────────────────────────────┤
-│ Function/Kernel Name                          │   Total (ms) │    Calls │   Avg (ms) │
-├──────────────────────────────────────────────────────────────────────────────────────┤
-│ CPU:inference                                 │   246402.644 │        1 │ 246402.644 │
-│ CPU:gpu_forward_device_batch                  │   246336.064 │     1023 │    240.798 │
-│ GPU:mlp1_fused_gemm                           │    81756.068 │    24552 │      3.330 │
-│ GPU:attention_flashdecode_mqa_odd             │    52809.432 │    12276 │      4.302 │
-│ GPU:mlp2_bias_weighted_accum_gemm             │    43406.315 │    24552 │      1.768 │
-│ GPU:matmul_logits_kernel                      │    17062.506 │     1023 │     16.679 │
-│ GPU:attention_flashdecode_mqa_even            │    15177.749 │    12276 │      1.236 │
-│ GPU:matmul_bias_att_kernel                    │    11174.913 │    24552 │      0.455 │
-│ GPU:matmul_bias_qkv_kernel                    │    11040.335 │    24552 │      0.450 │
-│ GPU:matmul_router_kernel                      │     2824.973 │    24552 │      0.115 │
-│ GPU:residual_add_batch_kernel                 │     1629.597 │    49104 │      0.033 │
-│ GPU:rmsnorm_batch_kernel                      │     1575.048 │    50127 │      0.031 │
-│ GPU:fused_split_rope_scatter_qkv_batch_kernel │      919.716 │    24552 │      0.037 │
-│ GPU:fused_topk_softmax_batch_kernel           │      893.459 │    24552 │      0.036 │
-│ GPU:argmax_batch_kernel                       │      665.543 │     1023 │      0.651 │
-│ GPU:expert_assignment_building                │      439.944 │    24552 │      0.018 │
-│ GPU:expert_counting                           │      415.947 │    24552 │      0.017 │
-│ GPU:exclusive_scan_small_kernel               │      255.337 │    24552 │      0.010 │
-│ GPU:copy_embedding_bf16_batch_kernel          │       33.966 │     1023 │      0.033 │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-
+finish elapsed time(s): 0.122000

@@ -73,6 +73,19 @@ __global__ void accumulate_partials_kernel(
     int H,
     int cnt);
 
+__global__ void cast_fp32_to_bf16_rows_kernel(
+    const float* __restrict__ src,
+    bf16_t* __restrict__ dst,
+    int H,
+    int rows);
+
+__global__ void accumulate_partials_bf16_kernel(
+    float* __restrict__ dest,
+    const bf16_t* __restrict__ src,
+    const int* __restrict__ batch_ids,
+    int H,
+    int cnt);
+
 __global__ void zero_partial_rows_kernel(
     float* __restrict__ dst,
     int H,

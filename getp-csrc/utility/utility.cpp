@@ -39,6 +39,16 @@ __device__ __forceinline__ float4 bf16quad_to_float4(uint2 u) {
   return r;
 }
 
+__device__ __forceinline__ float bf16_to_float_scalar(bf16_t v) {
+  const uint16_t raw = *reinterpret_cast<const uint16_t *>(&v);
+  union {
+    uint32_t u;
+    float f;
+  } cvt;
+  cvt.u = static_cast<uint32_t>(raw) << 16;
+  return cvt.f;
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
   for (int off = WF_SIZE >> 1; off > 0; off >>= 1) {
@@ -650,6 +660,40 @@ __global__ void accumulate_partials_kernel(
     for (int h = thread_linear_idx; h < H; h += total_threads) {
       dst_row[h] += src_row[h];
     }
+  }
+}
+
+__global__ void cast_fp32_to_bf16_rows_kernel(
+    const float* __restrict__ src,
+    bf16_t* __restrict__ dst,
+    int H,
+    int rows) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y;
+  if (r >= rows || h >= H) return;
+  const size_t idx = (size_t)r * (size_t)H + h;
+  dst[idx] = hip_bfloat16(src[idx]);
+}
+
+__global__ void accumulate_partials_bf16_kernel(
+    float* __restrict__ dest,
+    const bf16_t* __restrict__ src,
+    const int* __restrict__ batch_ids,
+    int H,
+    int cnt) {
+  const int lb = blockIdx.y;
+  if (lb >= cnt) return;
+  const int b = batch_ids[lb];
+  if (b < 0) return;
+
+  float* __restrict__ dst_row = dest + (size_t)b * (size_t)H;
+  const bf16_t* __restrict__ src_row = src + (size_t)lb * (size_t)H;
+
+  const int thread_linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_threads = blockDim.x * gridDim.x;
+
+  for (int h = thread_linear_idx; h < H; h += total_threads) {
+    dst_row[h] += bf16_to_float_scalar(src_row[h]);
   }
 }
 
