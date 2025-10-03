@@ -940,8 +940,8 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
       pack_rows_owner_kernel<<<gridPack, blockH, 0, ctx.pack_stream>>>(
           ctx.home_peer_buffers.send_x_peer[owner],
           ctx.gpu_activations.d_t,
-          d_b2local,
-          batch_size,
+          d_local2b,
+          h_B_local,
           H);
     }
     {

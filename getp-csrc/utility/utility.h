@@ -132,12 +132,12 @@ __global__ void fused_route_owner_kernel(
     int E,
     int E_local);
 
-// Pack rows x[b,:] for lb=b2local[b] >=0 into dst[lb,:].
+// Pack rows x[local2b[lb],:] into dst[lb,:].
 __global__ void pack_rows_owner_kernel(
     bf16_t* __restrict__ dst,          // [B_local, H]
     const bf16_t* __restrict__ src,    // [B, H]
-    const int* __restrict__ b2local,   // [B]
-    int B,
+    const int* __restrict__ local2b,   // [B]
+    int owner_B,
     int H);
 
 // Pack pos[B_local] and topk_v[B_local*K] using compact local2b map.
