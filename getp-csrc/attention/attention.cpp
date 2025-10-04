@@ -111,9 +111,6 @@ __device__ __forceinline__ void flash_decoding_body(
   if (cap <= 0)
     return;
 
-  constexpr int kv_mul = 8;
-  if (kv_mul > ATTN_FLASH_MAX_KV_MUL)
-    return;
   const int kv_dim = Hk * D;
   const int kv_head_offset = kv_head * D;
   const float rsqrt_D = rsqrtf(static_cast<float>(D));
@@ -148,9 +145,9 @@ __device__ __forceinline__ void flash_decoding_body(
 
   const int score_stride = ATTN_FLASH_TILE + 1;
   float *s_scores = smem_dyn;
-  float *s_q = s_scores + kv_mul * score_stride;
+  float *s_q = s_scores + ATTN_FLASH_MAX_KV_MUL * score_stride;
   const int acc_stride = ATTN_THREADS_PER_BLOCK + 1;
-  float *s_accum = s_q + kv_mul * D;
+  float *s_accum = s_q + ATTN_FLASH_MAX_KV_MUL * D;
 
   __shared__ float s_m[ATTN_FLASH_MAX_KV_MUL];
   __shared__ float s_l[ATTN_FLASH_MAX_KV_MUL];
@@ -159,7 +156,7 @@ __device__ __forceinline__ void flash_decoding_body(
   __shared__ float s_red_tmp[ATTN_FLASH_MAX_KV_MUL];
 
   if (tid == 0) {
-    for (int qh = 0; qh < kv_mul; ++qh) {
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       s_m[qh] = -INFINITY;
       s_l[qh] = 0.0f;
     }
@@ -170,8 +167,8 @@ __device__ __forceinline__ void flash_decoding_body(
   const float position_f = static_cast<float>(pos_b);
   const float concentration = rope_concentration;
   if (wid == 0 && rope_inv_freq != nullptr) {
-    for (int qh = 0; qh < kv_mul; ++qh) {
-      const int q_head = kv_head * kv_mul + qh;
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
+      const int q_head = kv_head * ATTN_FLASH_MAX_KV_MUL + qh;
       const bf16_t *__restrict__ q_head_ptr = qkv_b + (size_t)q_head * D;
       for (int i = lane; i < D2; i += WF_SIZE) {
         const float x1 = static_cast<float>(q_head_ptr[i]);
@@ -191,8 +188,8 @@ __device__ __forceinline__ void flash_decoding_body(
       }
     }
   } else if (wid == 0) {
-    for (int qh = 0; qh < kv_mul; ++qh) {
-      const int q_head = kv_head * kv_mul + qh;
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
+      const int q_head = kv_head * ATTN_FLASH_MAX_KV_MUL + qh;
       const bf16_t *__restrict__ q_head_ptr = qkv_b + (size_t)q_head * D;
       for (int i = lane; i < D; i += WF_SIZE) {
         s_q[qh * D + i] = static_cast<float>(q_head_ptr[i]);
@@ -203,7 +200,7 @@ __device__ __forceinline__ void flash_decoding_body(
 
   const float *q_heads[ATTN_FLASH_MAX_KV_MUL];
 #pragma unroll
-  for (int qh = 0; qh < kv_mul; ++qh)
+  for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
     q_heads[qh] = s_q + qh * D;
 
   float acc[ATTN_FLASH_MAX_KV_MUL];
@@ -246,7 +243,7 @@ __device__ __forceinline__ void flash_decoding_body(
         const float4 kv = bf16quad_to_float4(k_u2[d4]);
         const int base = d4 << 2;
 #pragma unroll
-        for (int qh = 0; qh < kv_mul; ++qh) {
+        for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
           const float *qv = q_heads[qh] + base;
           sc[qh] = fmaf(qv[0], kv.x, sc[qh]);
           sc[qh] = fmaf(qv[1], kv.y, sc[qh]);
@@ -257,12 +254,12 @@ __device__ __forceinline__ void flash_decoding_body(
       for (int d = (D4 << 2) + lane16; d < D; d += 16) {
         const float kd = static_cast<float>(k_ptr[d]);
 #pragma unroll
-        for (int qh = 0; qh < kv_mul; ++qh) {
+        for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
           sc[qh] = fmaf(q_heads[qh][d], kd, sc[qh]);
         }
       }
 #pragma unroll
-      for (int qh = 0; qh < kv_mul; ++qh) {
+      for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
         float sum = sc[qh];
         for (int offset = 8; offset > 0; offset >>= 1) {
           sum += __shfl_down(sum, offset, 16);
@@ -277,10 +274,10 @@ __device__ __forceinline__ void flash_decoding_body(
     __syncthreads();
 
     block_reduce_max_multi(thread_max, s_warp_red, s_red_tmp, lane, wid,
-                            nwarp, kv_mul);
+                            nwarp, ATTN_FLASH_MAX_KV_MUL);
     if (tid == 0) {
 #pragma unroll
-      for (int qh = 0; qh < kv_mul; ++qh) {
+      for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
         const float mx = s_red_tmp[qh];
         if (mx > s_m[qh]) {
           const float scale = __expf(s_m[qh] - mx);
@@ -294,7 +291,7 @@ __device__ __forceinline__ void flash_decoding_body(
     }
     __syncthreads();
 #pragma unroll
-    for (int qh = 0; qh < kv_mul; ++qh)
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
       acc[qh] *= s_scale[qh];
 
     float thread_sum_multi[ATTN_FLASH_MAX_KV_MUL];
@@ -304,7 +301,7 @@ __device__ __forceinline__ void flash_decoding_body(
 
     for (int local_t = tid; local_t < tile_len; local_t += blockDim.x) {
 #pragma unroll
-      for (int qh = 0; qh < kv_mul; ++qh) {
+      for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
         float p = __expf(s_scores[qh * score_stride + local_t] - s_m[qh]);
         s_scores[qh * score_stride + local_t] = p;
         thread_sum_multi[qh] += p;
@@ -312,10 +309,10 @@ __device__ __forceinline__ void flash_decoding_body(
     }
     __syncthreads();
     block_reduce_sum_multi(thread_sum_multi, s_warp_red, s_red_tmp, lane, wid,
-                            nwarp, kv_mul);
+                            nwarp, ATTN_FLASH_MAX_KV_MUL);
     if (tid == 0) {
 #pragma unroll
-      for (int qh = 0; qh < kv_mul; ++qh)
+      for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
         s_l[qh] += s_red_tmp[qh];
     }
     __syncthreads();
@@ -329,7 +326,7 @@ __device__ __forceinline__ void flash_decoding_body(
       const bf16_t *__restrict__ v_ptr = v_layer + slot_off;
       const float v_d = static_cast<float>(v_ptr[d_owner]);
 #pragma unroll
-      for (int qh = 0; qh < kv_mul; ++qh) {
+      for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
         const float p = s_scores[qh * score_stride + local_t];
         acc[qh] = fmaf(p, v_d, acc[qh]);
       }
@@ -340,8 +337,8 @@ __device__ __forceinline__ void flash_decoding_body(
   }
 
   if (tid == 0) {
-    for (int qh = 0; qh < kv_mul; ++qh) {
-      const int q_head = kv_head * kv_mul + qh;
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
+      const int q_head = kv_head * ATTN_FLASH_MAX_KV_MUL + qh;
       const float sink = static_cast<float>(attn_sinks[layer_idx * Hq + q_head]);
       if (sink > s_m[qh]) {
         const float scale = __expf(s_m[qh] - sink);
@@ -356,7 +353,7 @@ __device__ __forceinline__ void flash_decoding_body(
   }
   __syncthreads();
 
-  for (int qh = 0; qh < kv_mul; ++qh) {
+  for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
     acc[qh] *= s_scale[qh];
     s_accum[qh * acc_stride + tid] = acc[qh];
   }
@@ -364,7 +361,7 @@ __device__ __forceinline__ void flash_decoding_body(
 
   if (worker_rank == 0) {
 #pragma unroll
-    for (int qh = 0; qh < kv_mul; ++qh) {
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       float total = 0.0f;
       for (int w = 0; w < workers_this_dim; ++w) {
         const int peer_tid = d_owner + w * D;
@@ -374,7 +371,7 @@ __device__ __forceinline__ void flash_decoding_body(
       }
       const float inv_l = __frcp_rn(s_l[qh]);
       const float val = total * inv_l;
-      const int q_head = kv_head * kv_mul + qh;
+      const int q_head = kv_head * ATTN_FLASH_MAX_KV_MUL + qh;
       out_b[(size_t)q_head * D + d_owner] = hip_bfloat16(val);
     }
   }
