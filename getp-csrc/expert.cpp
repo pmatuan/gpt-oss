@@ -1,6 +1,5 @@
 #include "common/defines.h"
 #include "matmul/matmul.cpp"
-#include "profiler/profiler.cpp"
 #include "utility/utility.cpp"
 #include "utility/utility.h"
 #include <algorithm>
@@ -1403,7 +1402,6 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
                                  (((size_t)owner * L + (size_t)layer) * (size_t)E);
 
     {
-      PROFILE_GPU_SCOPE("fused_route_owner_kernel", 0);
       const int threads = 256;
       const int shared_bytes = (int)sizeof(int) * (3 * E_local_layer + 1);
       fused_route_owner_kernel<<<1, threads, shared_bytes, ctx.pack_stream>>>(
@@ -1475,7 +1473,6 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
     int *d_local2b = ctx.home_peer_buffers.d_local2b_peer[owner];
 
     {
-      PROFILE_GPU_SCOPE("pack_rows_owner_kernel", 0);
       dim3 gridPack((H + BLOCK_SIZE - 1) / BLOCK_SIZE, h_B_local, 1);
       dim3 blockH(BLOCK_SIZE, 1, 1);
       pack_rows_owner_kernel<<<gridPack, blockH, 0, ctx.pack_stream>>>(
@@ -1486,7 +1483,6 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
           H);
     }
     {
-      PROFILE_GPU_SCOPE("pack_meta_owner_kernel", 0);
       dim3 gridMeta((h_B_local + 255) / 256, 1, 1);
       pack_meta_owner_kernel<<<gridMeta, 256, 0, ctx.pack_stream>>>(
           ctx.home_peer_buffers.send_pos_peer[owner],
@@ -1583,7 +1579,6 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
     }
 
     {
-      PROFILE_GPU_SCOPE("accumulate_partials_bf16_kernel", 0);
       dim3 blockH(BLOCK_SIZE, 1, 1);
       dim3 gridAcc((H + BLOCK_SIZE - 1) / BLOCK_SIZE, h_B_local, 1);
       accumulate_partials_bf16_kernel<<<gridAcc, blockH, 0, comm_stream>>>(

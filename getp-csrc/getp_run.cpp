@@ -502,7 +502,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
                                      const int *tokens, const int *pos,
                                      int batch_size, int device_id,
                                      int max_pos_in_batch) {
-  PROFILE_SCOPE("gpu_forward_device_batch");
   DeviceContext &ctx = g_devices[device_id];
   HIP_CHECK(hipSetDevice(device_id));
 
@@ -565,7 +564,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
   // Launch batched embedding kernel
   {
-    PROFILE_GPU_SCOPE("copy_embedding_bf16_batch_kernel", 0);
     dim3 gridH_batch(gridH_thread.x, batch_size, 1);
     copy_embedding_bf16_batch_kernel<<<gridH_batch, block, 0>>>(
         ctx.gpu_activations.d_x,
@@ -578,7 +576,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     {
       // First apply RMSNorm
       {
-        PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
         dim3 gridH_batch(1, batch_size, 1);
         rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
             ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
@@ -588,7 +585,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
       // Then apply MatMul + Bias
       {
-        PROFILE_GPU_SCOPE("matmul_bias_qkv_kernel", 0);
         dim3 gridQKV_gemm(
             (QKV_D + MATMUL_QKV_BLOCK_COLS - 1) / MATMUL_QKV_BLOCK_COLS,
             (batch_size + MATMUL_QKV_BLOCK_ROWS - 1) / MATMUL_QKV_BLOCK_ROWS,
@@ -606,7 +602,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
     // Scatter QKV to q / caches (batched)
     {
-      PROFILE_GPU_SCOPE("fused_split_rope_scatter_qkv_batch_kernel", 0);
       dim3 grid_fused(Hk, batch_size, 1);
       dim3 block_fused(WF_SIZE, 1, 1);
       fused_split_rope_scatter_qkv_batch_kernel<<<grid_fused, block_fused, 0>>>(
@@ -634,7 +629,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           sizeof(float);
       const bool layer_has_window = (l & 1) == 0;
       if (layer_has_window) {
-        PROFILE_GPU_SCOPE("flash_decoding_even", 0);
         flash_decoding_even<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
@@ -644,7 +638,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
             ctx.d_kv_layer_capacity,
             p->sliding_window, kv_batch_stride, batch_size);
       } else {
-        PROFILE_GPU_SCOPE("flash_decoding_odd", 0);
         flash_decoding_odd<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
@@ -661,7 +654,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
       // First do MatMul + Bias: temp = tb @ W^T + b
       {
-        PROFILE_GPU_SCOPE("matmul_bias_att_kernel", 0);
         dim3 gridO_gemm(
             (H + MATMUL_ATT_BLOCK_COLS - 1) / MATMUL_ATT_BLOCK_COLS,
             (batch_size + MATMUL_ATT_BLOCK_ROWS - 1) / MATMUL_ATT_BLOCK_ROWS,
@@ -676,7 +668,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
       // Then do residual add: x = x + temp
       {
-        PROFILE_GPU_SCOPE("residual_add_batch_kernel", 0);
         dim3 gridH_batch(gridH_thread.x, batch_size, 1);
         residual_add_batch_kernel_bf16<<<gridH_batch, block, 0>>>(
             ctx.gpu_activations.d_x, ctx.gpu_activations.d_t, H, batch_size,
@@ -686,7 +677,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
     // FFN (batched)
     {
-      PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
       dim3 gridH_batch(1, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
@@ -695,7 +685,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     }
 
     {
-      PROFILE_GPU_SCOPE("matmul_router_kernel", 0);
       dim3 gridE_gemm((E + TM - 1) / TM, batch_size, 1);
       matmul_router_kernel<<<gridE_gemm, block, 0>>>(
           ctx.gpu_activations.d_router_score, ctx.gpu_activations.d_t,
@@ -705,7 +694,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
     }
 
     {
-      PROFILE_GPU_SCOPE("fused_topk_softmax_batch_kernel", 0);
       dim3 gridTopK_batch(1, batch_size, 1);
       size_t shared_mem_size = (size_t)E * sizeof(float);
       fused_topk_softmax_batch_kernel<<<gridTopK_batch, BLOCK_SIZE,
@@ -748,7 +736,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
       if (total_pairs > 0 && E > 0) {
         {
-          PROFILE_GPU_SCOPE("expert_counting", 0);
           HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int), 0));
 
           count_expert_assignments_kernel<<<gridCount, 256, 0>>>(
@@ -757,7 +744,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           HIP_CHECK(hipGetLastError());
         }
         {
-          PROFILE_GPU_SCOPE("exclusive_scan_small_kernel", 0);
           int threads_scan = 1;
           while (threads_scan < E && threads_scan < 1024)
             threads_scan <<= 1;
@@ -775,7 +761,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         }
 
         {
-          PROFILE_GPU_SCOPE("expert_assignment_building", 0);
           HIP_CHECK(hipMemsetAsync(d_expert_counts, 0, (size_t)E * sizeof(int),
                                    0));
 
@@ -787,7 +772,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         }
 
         {
-          PROFILE_GPU_SCOPE("mlp1_fused_gemm", 0);
           const int max_tiles =
               (max_assign_per_expert + MATMUL_MLP1_BLOCK_ROWS - 1) /
               MATMUL_MLP1_BLOCK_ROWS;
@@ -805,14 +789,12 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
         // Zero intermediate buffer before MLP2
         {
-          PROFILE_GPU_SCOPE("zero_mlp2_partial", 0);
           const size_t zero_bytes = ctx.gpu_activations.mlp2_partial_bytes;
           HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_mlp2_partial_bf16, 0, zero_bytes, 0));
         }
 
         // MLP2 writes to intermediate buffer without atomics
         {
-          PROFILE_GPU_SCOPE("mlp2_noatomic_gemm", 0);
           const int max_tiles =
               (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
               MATMUL_MLP2_BLOCK_ROWS;
@@ -830,7 +812,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
         // Reduce K slots into e_agg
         {
-          PROFILE_GPU_SCOPE("reduce_mlp2_slots", 0);
           const int K = p->experts_per_token;
           dim3 blockReduce(BLOCK_SIZE, 1, 1);
           dim3 gridReduce((H + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, 1);
@@ -844,7 +825,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
     } // End of local MoE compute
     {
-      PROFILE_GPU_SCOPE("residual_add_batch_kernel", 0);
       dim3 gridH_batch(gridH_thread.x, batch_size, 1);
       residual_add_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_x, ctx.gpu_activations.d_e_agg, H, batch_size,
@@ -857,7 +837,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
   {
     // 1) RMSNorm - separate kernel call
     {
-      PROFILE_GPU_SCOPE("rmsnorm_batch_kernel", 0);
       dim3 gridH_batch(1, batch_size, 1);
       rmsnorm_batch_kernel<<<gridH_batch, block, 0>>>(
           ctx.gpu_activations.d_t, ctx.gpu_activations.d_x,
@@ -866,7 +845,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
 
     // 2) MatMul for logits - separate GEMM version (no bias)
     {
-      PROFILE_GPU_SCOPE("matmul_logits_kernel", 0);
       dim3 gridV_gemm(
           (V + MATMUL_LOGITS_BLOCK_COLS - 1) / MATMUL_LOGITS_BLOCK_COLS,
           (batch_size + MATMUL_LOGITS_BLOCK_ROWS - 1) / MATMUL_LOGITS_BLOCK_ROWS,
@@ -880,7 +858,6 @@ static int *gpu_forward_device_batch(Transformer *transformer,
   }
 
   {
-    PROFILE_GPU_SCOPE("argmax_batch_kernel", 0);
     dim3 grid_argmax(batch_size, 1, 1);
     size_t shared_bytes = (size_t)BLOCK_SIZE * (sizeof(float) + sizeof(int));
 
@@ -1010,7 +987,6 @@ static long long run_requests_on_device(Transformer *transformer,
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  PROFILE_SCOPE("inference");
   if (g_num_devices == 0) {
     fprintf(stderr, "No GPUs initialized for inference!\n");
     return 0;
