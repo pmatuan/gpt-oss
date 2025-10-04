@@ -4,6 +4,7 @@
 #include "utility/utility.cpp"
 #include "utility/utility.h"
 #include <algorithm>
+#include <condition_variable>
 #include <math.h>
 #include <mutex>
 #include <omp.h>
@@ -25,6 +26,414 @@ static std::vector<int> g_E_local_per_owner_layer; // size = ndev*L
 
 static inline int ep_owner_of(int l, int e, int E) {
   return g_ep_owner_map.empty() ? 0 : g_ep_owner_map[(size_t)l * (size_t)E + (size_t)e];
+}
+
+struct AggregatedRunInfo {
+  int total_B = 0;
+  int total_assign = 0;
+  int offset_stride = 0;
+  std::vector<int> B_offsets;
+  std::vector<int> assign_offsets;
+  std::vector<int> B_counts;
+  std::vector<int> assign_counts;
+  std::vector<int> expert_offsets_flat;
+};
+
+__global__ void add_u16_offset_kernel(uint16_t *data, int count, uint16_t offset) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    data[idx] = static_cast<uint16_t>(data[idx] + offset);
+  }
+}
+
+static void launch_add_offset(uint16_t *ptr, int count, int offset, hipStream_t stream) {
+  if (!ptr || count <= 0 || offset == 0)
+    return;
+  const int threads = 256;
+  const int blocks = (count + threads - 1) / threads;
+  const uint16_t off16 = static_cast<uint16_t>(offset);
+  add_u16_offset_kernel<<<blocks, threads, 0, stream>>>(ptr, count, off16);
+}
+
+static void run_owner_mlp(DeviceContext &owner_ctx,
+                          int layer,
+                          const AggregatedRunInfo &info,
+                          float swiglu_limit,
+                          int H,
+                          int IM,
+                          int K,
+                          int L);
+
+static void aggregator_register_home(int owner,
+                                     int layer,
+                                     int home,
+                                     int B_local,
+                                     int assign_local,
+                                     const int *offsets_host,
+                                     int offsets_len) {
+  DeviceContext &owner_ctx = g_devices[owner];
+  if (owner_ctx.owner_layer_aggregators.empty())
+    return;
+  OwnerLayerAggregator *agg = owner_ctx.owner_layer_aggregators[layer].get();
+  if (!agg)
+    return;
+
+  std::lock_guard<std::mutex> lock(agg->mutex);
+  if (!agg->collecting) {
+    agg->collecting = true;
+    agg->ready_for_mlp = false;
+    agg->mlp_running = false;
+    agg->mlp_done = false;
+    agg->homes_arrived = 0;
+    agg->homes_copied = 0;
+    agg->total_B = 0;
+    agg->total_assign = 0;
+    if (!agg->B_offsets.empty())
+      std::fill(agg->B_offsets.begin(), agg->B_offsets.end(), 0);
+    if (!agg->assign_offsets.empty())
+      std::fill(agg->assign_offsets.begin(), agg->assign_offsets.end(), 0);
+    if (!agg->B_counts.empty())
+      std::fill(agg->B_counts.begin(), agg->B_counts.end(), 0);
+    if (!agg->assign_counts.empty())
+      std::fill(agg->assign_counts.begin(), agg->assign_counts.end(), 0);
+    if (!agg->expert_offsets_flat.empty())
+      std::fill(agg->expert_offsets_flat.begin(), agg->expert_offsets_flat.end(), 0);
+    agg->epoch++;
+  }
+
+  agg->B_offsets[home] = agg->total_B;
+  agg->assign_offsets[home] = agg->total_assign;
+  agg->B_counts[home] = B_local;
+  agg->assign_counts[home] = assign_local;
+
+  if (!agg->expert_offsets_flat.empty() && offsets_host && offsets_len > 0) {
+    const int stride = agg->offset_stride;
+    const int base = home * stride;
+    const int len = std::min(offsets_len, stride);
+    for (int i = 0; i < len; ++i) {
+      agg->expert_offsets_flat[base + i] = offsets_host[i];
+    }
+  }
+
+  agg->total_B += B_local;
+  agg->total_assign += assign_local;
+  agg->homes_arrived += 1;
+}
+
+static void aggregator_wait_for_mlp(DeviceContext &home_ctx,
+                                    int owner,
+                                    int layer,
+                                    float swiglu_limit,
+                                    int H,
+                                    int IM,
+                                    int K,
+                                    int L) {
+  DeviceContext &owner_ctx = g_devices[owner];
+  if (owner_ctx.owner_layer_aggregators.empty())
+    return;
+  OwnerLayerAggregator *agg = owner_ctx.owner_layer_aggregators[layer].get();
+  if (!agg)
+    return;
+
+  std::unique_lock<std::mutex> lock(agg->mutex);
+  agg->homes_copied += 1;
+  if (agg->homes_copied == g_num_devices) {
+    agg->ready_for_mlp = true;
+    agg->cv.notify_all();
+  }
+
+  while (!agg->mlp_done) {
+    if (agg->ready_for_mlp && !agg->mlp_running && home_ctx.device_id == owner) {
+      agg->mlp_running = true;
+      AggregatedRunInfo info;
+      info.total_B = agg->total_B;
+      info.total_assign = agg->total_assign;
+      info.offset_stride = agg->offset_stride;
+      info.B_offsets = agg->B_offsets;
+      info.assign_offsets = agg->assign_offsets;
+      info.B_counts = agg->B_counts;
+      info.assign_counts = agg->assign_counts;
+      info.expert_offsets_flat = agg->expert_offsets_flat;
+      lock.unlock();
+      run_owner_mlp(owner_ctx, layer, info, swiglu_limit, H, IM, K, L);
+      lock.lock();
+      agg->mlp_done = true;
+      agg->mlp_running = false;
+      agg->collecting = false;
+      agg->ready_for_mlp = false;
+      agg->homes_arrived = 0;
+      agg->homes_copied = 0;
+      agg->total_B = 0;
+      agg->total_assign = 0;
+      agg->cv.notify_all();
+    } else {
+      agg->cv.wait(lock);
+    }
+  }
+}
+
+static void run_owner_mlp(DeviceContext &owner_ctx,
+                          int layer,
+                          const AggregatedRunInfo &info,
+                          float swiglu_limit,
+                          int H,
+                          int IM,
+                          int K,
+                          int L) {
+  const int owner = owner_ctx.device_id;
+  HIP_CHECK(hipSetDevice(owner));
+
+  const int E_local_layer =
+      g_E_local_per_owner_layer[(size_t)owner * (size_t)L + (size_t)layer];
+  const int total_B = info.total_B;
+  const int total_assign = info.total_assign;
+  hipStream_t mlp_stream = owner_ctx.mlp_stream;
+
+  auto record_completion_events = [&]() {
+    if (owner_ctx.mlp_done_events) {
+      for (int home = 0; home < g_num_devices; ++home) {
+        hipEvent_t evt = owner_ctx.mlp_done_events[home];
+        if (evt)
+          HIP_CHECK(hipEventRecord(evt, mlp_stream));
+      }
+    } else {
+      HIP_CHECK(hipStreamSynchronize(mlp_stream));
+    }
+  };
+
+  if (E_local_layer <= 0 || total_B <= 0 || total_assign <= 0) {
+    record_completion_events();
+    return;
+  }
+
+  OwnerAggregateBuffers &agg_buf = owner_ctx.aggregate_buffers;
+
+  const bool have_offsets = (info.offset_stride >= (E_local_layer + 1)) &&
+                            !info.expert_offsets_flat.empty();
+
+  std::vector<int> aggregated_counts(E_local_layer, 0);
+  if (have_offsets) {
+    const int stride = info.offset_stride;
+    for (int home = 0; home < g_num_devices; ++home) {
+      const int base = home * stride;
+      for (int e = 0; e < E_local_layer; ++e) {
+        const int start = info.expert_offsets_flat[base + e];
+        const int end = info.expert_offsets_flat[base + e + 1];
+        aggregated_counts[e] += (end - start);
+      }
+    }
+  }
+
+  std::vector<int> aggregated_offsets(E_local_layer + 1, 0);
+  for (int e = 0; e < E_local_layer; ++e) {
+    aggregated_offsets[e + 1] = aggregated_offsets[e] + aggregated_counts[e];
+  }
+  aggregated_offsets[E_local_layer] = total_assign;
+
+  HIP_CHECK(hipMemcpy(agg_buf.expert_offsets_all, aggregated_offsets.data(),
+                      (size_t)(E_local_layer + 1) * sizeof(int),
+                      hipMemcpyHostToDevice));
+
+  std::vector<int> write_cursor = aggregated_offsets;
+
+  for (int home = 0; home < g_num_devices; ++home) {
+    const int B_h = info.B_counts[home];
+    const int assign_h = info.assign_counts[home];
+    const int B_offset = info.B_offsets[home];
+    const int assign_offset = info.assign_offsets[home];
+
+    if (B_h > 0) {
+      bf16_t *src_x = (home == owner)
+                          ? owner_ctx.home_peer_buffers.send_x_peer[owner]
+                          : owner_ctx.owner_receive_buffers.recv_x_from_home[home];
+      HIP_CHECK(hipMemcpyAsync(agg_buf.recv_x_all + (size_t)B_offset * (size_t)H,
+                               src_x,
+                               (size_t)B_h * (size_t)H * sizeof(bf16_t),
+                               hipMemcpyDeviceToDevice,
+                               mlp_stream));
+
+      int *src_pos = (home == owner)
+                         ? owner_ctx.home_peer_buffers.send_pos_peer[owner]
+                         : owner_ctx.owner_receive_buffers.recv_pos_from_home[home];
+      HIP_CHECK(hipMemcpyAsync(agg_buf.recv_pos_all + (size_t)B_offset,
+                               src_pos,
+                               (size_t)B_h * sizeof(int),
+                               hipMemcpyDeviceToDevice,
+                               mlp_stream));
+
+      float *src_topk =
+          (home == owner) ? owner_ctx.home_peer_buffers.send_topk_v_peer[owner]
+                          : owner_ctx.owner_receive_buffers.recv_topk_v_from_home[home];
+      HIP_CHECK(hipMemcpyAsync(agg_buf.recv_topk_v_all +
+                                   (size_t)B_offset * (size_t)K,
+                               src_topk,
+                               (size_t)B_h * (size_t)K * sizeof(float),
+                               hipMemcpyDeviceToDevice,
+                               mlp_stream));
+    }
+
+    if (assign_h > 0 && have_offsets) {
+      uint16_t *src_batches =
+          (home == owner)
+              ? owner_ctx.home_peer_buffers.send_assignment_batches_peer[owner]
+              : owner_ctx.owner_receive_buffers.recv_assignment_batches[home];
+      uint8_t *src_slots =
+          (home == owner)
+              ? owner_ctx.home_peer_buffers.send_assignment_slots_peer[owner]
+              : owner_ctx.owner_receive_buffers.recv_assignment_slots[home];
+      const int *offsets_home =
+          info.expert_offsets_flat.data() + (size_t)home * info.offset_stride;
+
+      for (int e = 0; e < E_local_layer; ++e) {
+        const int start_local = offsets_home[e];
+        const int end_local = offsets_home[e + 1];
+        const int count = end_local - start_local;
+        if (count <= 0)
+          continue;
+
+        const int dst_index = write_cursor[e];
+        HIP_CHECK(hipMemcpyAsync(agg_buf.assignment_batches_all + dst_index,
+                                 src_batches + start_local,
+                                 (size_t)count * sizeof(uint16_t),
+                                 hipMemcpyDeviceToDevice,
+                                 mlp_stream));
+        HIP_CHECK(hipMemcpyAsync(agg_buf.assignment_slots_all + dst_index,
+                                 src_slots + start_local,
+                                 (size_t)count * sizeof(uint8_t),
+                                 hipMemcpyDeviceToDevice,
+                                 mlp_stream));
+
+        launch_add_offset(agg_buf.assignment_batches_all + dst_index, count,
+                          B_offset, mlp_stream);
+
+        write_cursor[e] += count;
+      }
+    } else if (assign_h > 0) {
+      uint16_t *src_batches =
+          (home == owner)
+              ? owner_ctx.home_peer_buffers.send_assignment_batches_peer[owner]
+              : owner_ctx.owner_receive_buffers.recv_assignment_batches[home];
+      uint8_t *src_slots =
+          (home == owner)
+              ? owner_ctx.home_peer_buffers.send_assignment_slots_peer[owner]
+              : owner_ctx.owner_receive_buffers.recv_assignment_slots[home];
+
+      HIP_CHECK(hipMemcpyAsync(agg_buf.assignment_batches_all + assign_offset,
+                               src_batches,
+                               (size_t)assign_h * sizeof(uint16_t),
+                               hipMemcpyDeviceToDevice,
+                               mlp_stream));
+      HIP_CHECK(hipMemcpyAsync(agg_buf.assignment_slots_all + assign_offset,
+                               src_slots,
+                               (size_t)assign_h * sizeof(uint8_t),
+                               hipMemcpyDeviceToDevice,
+                               mlp_stream));
+
+      launch_add_offset(agg_buf.assignment_batches_all + assign_offset, assign_h,
+                        B_offset, mlp_stream);
+    }
+  }
+
+  const dim3 zeroBlock(32, 4, 1);
+  const dim3 zeroGrid((H + zeroBlock.x - 1) / zeroBlock.x,
+                      (total_B + zeroBlock.y - 1) / zeroBlock.y, 1);
+  zero_partial_rows_kernel<<<zeroGrid, zeroBlock, 0, mlp_stream>>>(
+      agg_buf.partial_fp32_all, H, total_B);
+
+  const size_t gate_bytes = (size_t)total_assign * (size_t)IM * sizeof(bf16_t);
+  if (gate_bytes > 0) {
+    HIP_CHECK(hipMemsetAsync(agg_buf.gate_up_all, 0, gate_bytes, mlp_stream));
+  }
+
+  const size_t mlp2_bytes = (size_t)K * (size_t)total_B * (size_t)H * sizeof(bf16_t);
+  if (mlp2_bytes > 0) {
+    HIP_CHECK(
+        hipMemsetAsync(agg_buf.mlp2_partial_all, 0, mlp2_bytes, mlp_stream));
+  }
+
+  const int max_tiles_mlp1 =
+      (total_B + MATMUL_MLP1_BLOCK_ROWS_120B - 1) / MATMUL_MLP1_BLOCK_ROWS_120B;
+  dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK_120B, 1);
+  dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS_120B - 1) /
+                     MATMUL_MLP1_BLOCK_COLS_120B,
+                 max_tiles_mlp1, E_local_layer);
+  mlp1_120b_kernel<<<grid_mlp1, block_mlp1, 0, mlp_stream>>>(
+      agg_buf.gate_up_all, agg_buf.recv_x_all,
+      owner_ctx.gpu_weights_bf16.d_w_mlp1_bf16,
+      owner_ctx.stride_w_mlp1_bf16,
+      owner_ctx.gpu_expert_bias.g_b_mlp1,
+      agg_buf.assignment_batches_all,
+      agg_buf.assignment_slots_all,
+      agg_buf.expert_offsets_all,
+      layer,
+      owner_ctx.E_local,
+      H, IM, swiglu_limit,
+      total_B,
+      agg_buf.recv_pos_all);
+
+  const int max_tiles_mlp2 =
+      (total_B + MATMUL_MLP2_BLOCK_ROWS_120B - 1) / MATMUL_MLP2_BLOCK_ROWS_120B;
+  dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK_120B, 1);
+  dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS_120B - 1) /
+                     MATMUL_MLP2_BLOCK_COLS_120B,
+                 max_tiles_mlp2, E_local_layer);
+  mlp2_120b_kernel<<<grid_mlp2, block_mlp2, 0, mlp_stream>>>(
+      agg_buf.mlp2_partial_all, agg_buf.gate_up_all,
+      owner_ctx.gpu_weights_bf16.d_w_mlp2_bf16,
+      owner_ctx.stride_w_mlp2_bf16,
+      owner_ctx.gpu_expert_bias.g_b_mlp2,
+      agg_buf.assignment_batches_all,
+      agg_buf.assignment_slots_all,
+      agg_buf.expert_offsets_all,
+      agg_buf.recv_topk_v_all,
+      layer,
+      owner_ctx.E_local,
+      IM, H, total_B,
+      agg_buf.recv_pos_all);
+
+  dim3 gridReduce((H + BLOCK_SIZE - 1) / BLOCK_SIZE, total_B, 1);
+  dim3 blockReduce(BLOCK_SIZE, 1, 1);
+  reduce_mlp2_slots_kernel<<<gridReduce, blockReduce, 0, mlp_stream>>>(
+      agg_buf.partial_fp32_all,
+      agg_buf.mlp2_partial_all,
+      agg_buf.recv_pos_all,
+      K,
+      total_B,
+      H);
+
+  dim3 gridCast((H + BLOCK_SIZE - 1) / BLOCK_SIZE, total_B, 1);
+  dim3 blockCast(BLOCK_SIZE, 1, 1);
+  cast_fp32_to_bf16_rows_kernel<<<gridCast, blockCast, 0, mlp_stream>>>(
+      agg_buf.partial_fp32_all,
+      agg_buf.partial_bf16_all,
+      H,
+      total_B);
+
+  for (int home = 0; home < g_num_devices; ++home) {
+    const int B_h = info.B_counts[home];
+    if (B_h <= 0)
+      continue;
+
+    const size_t offset_elems = (size_t)info.B_offsets[home] * (size_t)H;
+    const size_t bytes_fp32 = (size_t)B_h * (size_t)H * sizeof(float);
+    const size_t bytes_bf16 = (size_t)B_h * (size_t)H * sizeof(bf16_t);
+
+    float *dst_fp32 = owner_ctx.partial_buffers.partial_owner_per_home[home];
+    bf16_t *dst_bf16 = owner_ctx.partial_buffers.partial_owner_per_home_bf16[home];
+
+    HIP_CHECK(hipMemcpyAsync(dst_fp32,
+                             agg_buf.partial_fp32_all + offset_elems,
+                             bytes_fp32,
+                             hipMemcpyDeviceToDevice,
+                             mlp_stream));
+    HIP_CHECK(hipMemcpyAsync(dst_bf16,
+                             agg_buf.partial_bf16_all + offset_elems,
+                             bytes_bf16,
+                             hipMemcpyDeviceToDevice,
+                             mlp_stream));
+  }
+
+  record_completion_events();
 }
 
 static void build_rope_tables(const Config *cfg, std::vector<float> &inv_freq_out,
@@ -636,10 +1045,14 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     HIP_CHECK(hipEventCreateWithFlags(&ctx.mlp_done_events[i], hipEventDisableTiming));
   }
 
-  if (g_num_devices > 1) {
-    const int K = model_config->experts_per_token;
-    const size_t B_owner_peer_cap = (size_t)MAX_BATCH_SIZE;
+  const int K = model_config->experts_per_token;
+  const size_t B_owner_peer_cap = (size_t)MAX_BATCH_SIZE;
+  const size_t B_owner_total_cap = B_owner_peer_cap * (size_t)std::max(1, g_num_devices);
+  auto hip_alloc_ptr = [&](void **ptr, size_t bytes) {
+    HIP_CHECK(hipMalloc(ptr, bytes));
+  };
 
+  if (g_num_devices > 0) {
     // Tạo mảng host chứa device pointers nếu chưa có
     ensure_host_ptr_array(&ctx.home_peer_buffers.send_x_peer, g_num_devices);
     ensure_host_ptr_array(&ctx.home_peer_buffers.send_pos_peer, g_num_devices);
@@ -682,10 +1095,6 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     ensure_host_ptr_array(&ctx.partial_buffers.gate_up_owner_per_home, g_num_devices);
     ensure_host_ptr_array(&ctx.partial_buffers.mlp2_partial_owner_per_home, g_num_devices);
 
-    auto hip_alloc = [&](void **ptr, size_t bytes) {
-      HIP_CHECK(hipMalloc(ptr, bytes));
-    };
-
     for (int peer = 0; peer < g_num_devices; ++peer) {
       // E_local lớn nhất của 'peer' này trên mọi layer (để sizing offsets/counts)
       int E_local_max = 0;
@@ -695,37 +1104,72 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
       }
 
       // HOME → OWNER
-      hip_alloc((void**)&ctx.home_peer_buffers.send_x_peer[peer],                  (size_t)B * (size_t)H * sizeof(bf16_t));
-      hip_alloc((void**)&ctx.home_peer_buffers.send_pos_peer[peer],                (size_t)B * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.send_topk_v_peer[peer],             (size_t)B * (size_t)K * sizeof(float));
-      hip_alloc((void**)&ctx.home_peer_buffers.send_assignment_batches_peer[peer], (size_t)B * (size_t)K * sizeof(uint16_t));
-      hip_alloc((void**)&ctx.home_peer_buffers.send_assignment_slots_peer[peer],   (size_t)B * (size_t)K * sizeof(uint8_t));
-      hip_alloc((void**)&ctx.home_peer_buffers.send_expert_offsets_peer[peer],     (size_t)(E_local_max + 1) * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_owner_B_peer[peer],               sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_b2local_peer[peer],               (size_t)B * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_local2b_peer[peer],               (size_t)B * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_expert_counts_peer[peer],         (size_t)E_local_max * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_expert_offsets_peer[peer],        (size_t)(E_local_max + 1) * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_pos_peer[peer],                   (size_t)B * sizeof(int));
-      hip_alloc((void**)&ctx.home_peer_buffers.d_topk_v_peer[peer],                (size_t)B * (size_t)K * sizeof(float));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.send_x_peer[peer],                  (size_t)B * (size_t)H * sizeof(bf16_t));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.send_pos_peer[peer],                (size_t)B * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.send_topk_v_peer[peer],             (size_t)B * (size_t)K * sizeof(float));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.send_assignment_batches_peer[peer], (size_t)B * (size_t)K * sizeof(uint16_t));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.send_assignment_slots_peer[peer],   (size_t)B * (size_t)K * sizeof(uint8_t));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.send_expert_offsets_peer[peer],     (size_t)(E_local_max + 1) * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_owner_B_peer[peer],               sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_b2local_peer[peer],               (size_t)B * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_local2b_peer[peer],               (size_t)B * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_expert_counts_peer[peer],         (size_t)E_local_max * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_expert_offsets_peer[peer],        (size_t)(E_local_max + 1) * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_pos_peer[peer],                   (size_t)B * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.home_peer_buffers.d_topk_v_peer[peer],                (size_t)B * (size_t)K * sizeof(float));
       HIP_CHECK(hipMemset(ctx.home_peer_buffers.d_b2local_peer[peer], 0xFF,
                           (size_t)B * sizeof(int)));
       HIP_CHECK(hipMemset(ctx.home_peer_buffers.d_local2b_peer[peer], 0xFF,
                           (size_t)B * sizeof(int)));
 
       // OWNER (this ctx) nhận từ HOME=peer
-      hip_alloc((void**)&ctx.owner_receive_buffers.recv_x_from_home[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
-      hip_alloc((void**)&ctx.owner_receive_buffers.recv_pos_from_home[peer],           B_owner_peer_cap * sizeof(int));
-      hip_alloc((void**)&ctx.owner_receive_buffers.recv_topk_v_from_home[peer],        B_owner_peer_cap * (size_t)K * sizeof(float));
-      hip_alloc((void**)&ctx.owner_receive_buffers.recv_assignment_batches[peer],      B_owner_peer_cap * (size_t)K * sizeof(uint16_t));
-      hip_alloc((void**)&ctx.owner_receive_buffers.recv_assignment_slots[peer],        B_owner_peer_cap * (size_t)K * sizeof(uint8_t));
-      hip_alloc((void**)&ctx.owner_receive_buffers.recv_expert_offsets[peer],          (size_t)(E_local_max + 1) * sizeof(int));
-      hip_alloc((void**)&ctx.partial_buffers.partial_owner_per_home[peer],             B_owner_peer_cap * (size_t)H * sizeof(float));
-      hip_alloc((void**)&ctx.partial_buffers.partial_owner_per_home_bf16[peer],        B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
-      hip_alloc((void**)&ctx.partial_buffers.recv_partial_home_bf16[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
-      hip_alloc((void**)&ctx.partial_buffers.gate_up_owner_per_home[peer],             (size_t)K * B_owner_peer_cap * (size_t)IM * sizeof(bf16_t));
-      hip_alloc((void**)&ctx.partial_buffers.mlp2_partial_owner_per_home[peer],         (size_t)K * B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
+      hip_alloc_ptr((void**)&ctx.owner_receive_buffers.recv_x_from_home[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
+      hip_alloc_ptr((void**)&ctx.owner_receive_buffers.recv_pos_from_home[peer],           B_owner_peer_cap * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.owner_receive_buffers.recv_topk_v_from_home[peer],        B_owner_peer_cap * (size_t)K * sizeof(float));
+      hip_alloc_ptr((void**)&ctx.owner_receive_buffers.recv_assignment_batches[peer],      B_owner_peer_cap * (size_t)K * sizeof(uint16_t));
+      hip_alloc_ptr((void**)&ctx.owner_receive_buffers.recv_assignment_slots[peer],        B_owner_peer_cap * (size_t)K * sizeof(uint8_t));
+      hip_alloc_ptr((void**)&ctx.owner_receive_buffers.recv_expert_offsets[peer],          (size_t)(E_local_max + 1) * sizeof(int));
+      hip_alloc_ptr((void**)&ctx.partial_buffers.partial_owner_per_home[peer],             B_owner_peer_cap * (size_t)H * sizeof(float));
+      hip_alloc_ptr((void**)&ctx.partial_buffers.partial_owner_per_home_bf16[peer],        B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
+      hip_alloc_ptr((void**)&ctx.partial_buffers.recv_partial_home_bf16[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
+      hip_alloc_ptr((void**)&ctx.partial_buffers.gate_up_owner_per_home[peer],             (size_t)K * B_owner_peer_cap * (size_t)IM * sizeof(bf16_t));
+      hip_alloc_ptr((void**)&ctx.partial_buffers.mlp2_partial_owner_per_home[peer],         (size_t)K * B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
     }
+  }
+
+  if (!ctx.aggregate_buffers.recv_x_all) {
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.recv_x_all,
+                  B_owner_total_cap * (size_t)H * sizeof(bf16_t));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.recv_pos_all,
+                  B_owner_total_cap * sizeof(int));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.recv_topk_v_all,
+                  B_owner_total_cap * (size_t)K * sizeof(float));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.assignment_batches_all,
+                  B_owner_total_cap * (size_t)K * sizeof(uint16_t));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.assignment_slots_all,
+                  B_owner_total_cap * (size_t)K * sizeof(uint8_t));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.gate_up_all,
+                  B_owner_total_cap * (size_t)K * (size_t)IM * sizeof(bf16_t));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.mlp2_partial_all,
+                  B_owner_total_cap * (size_t)K * (size_t)H * sizeof(bf16_t));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.partial_fp32_all,
+                  B_owner_total_cap * (size_t)H * sizeof(float));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.partial_bf16_all,
+                  B_owner_total_cap * (size_t)H * sizeof(bf16_t));
+    hip_alloc_ptr((void**)&ctx.aggregate_buffers.expert_offsets_all,
+                  (size_t)(ctx.E_local + 1) * sizeof(int));
+  }
+
+  ctx.owner_layer_aggregators.resize(L);
+  for (int l = 0; l < L; ++l) {
+    auto agg = std::make_unique<OwnerLayerAggregator>();
+    agg->offset_stride = ctx.E_local + 1;
+    agg->B_offsets.resize(g_num_devices, 0);
+    agg->assign_offsets.resize(g_num_devices, 0);
+    agg->B_counts.resize(g_num_devices, 0);
+    agg->assign_counts.resize(g_num_devices, 0);
+    agg->expert_offsets_flat.resize((size_t)g_num_devices * (size_t)agg->offset_stride, 0);
+    ctx.owner_layer_aggregators[l] = std::move(agg);
   }
 }
 
@@ -839,6 +1283,47 @@ static void cleanup_device_context_ep(DeviceContext &ctx) {
   free_per_peer_ptrs(ctx.home_peer_buffers.d_expert_offsets_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_pos_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_topk_v_peer);
+  if (ctx.aggregate_buffers.recv_x_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.recv_x_all));
+    ctx.aggregate_buffers.recv_x_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.recv_pos_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.recv_pos_all));
+    ctx.aggregate_buffers.recv_pos_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.recv_topk_v_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.recv_topk_v_all));
+    ctx.aggregate_buffers.recv_topk_v_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.assignment_batches_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.assignment_batches_all));
+    ctx.aggregate_buffers.assignment_batches_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.assignment_slots_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.assignment_slots_all));
+    ctx.aggregate_buffers.assignment_slots_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.gate_up_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.gate_up_all));
+    ctx.aggregate_buffers.gate_up_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.mlp2_partial_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.mlp2_partial_all));
+    ctx.aggregate_buffers.mlp2_partial_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.partial_fp32_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.partial_fp32_all));
+    ctx.aggregate_buffers.partial_fp32_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.partial_bf16_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.partial_bf16_all));
+    ctx.aggregate_buffers.partial_bf16_all = nullptr;
+  }
+  if (ctx.aggregate_buffers.expert_offsets_all) {
+    HIP_CHECK(hipFree(ctx.aggregate_buffers.expert_offsets_all));
+    ctx.aggregate_buffers.expert_offsets_all = nullptr;
+  }
+  ctx.owner_layer_aggregators.clear();
   if (ctx.home_peer_buffers.h_owner_B) {
     HIP_CHECK(hipHostFree(ctx.home_peer_buffers.h_owner_B));
     ctx.home_peer_buffers.h_owner_B = nullptr;
@@ -955,20 +1440,37 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
   // Stage 2: pack payloads for owners with work
   for (int owner = 0; owner < g_num_devices; ++owner) {
     const int E_local_layer = g_E_local_per_owner_layer[(size_t)owner * (size_t)L + (size_t)layer];
-    if (E_local_layer == 0) continue;
-
     const int owner_total_assign = h_total_assign ? h_total_assign[owner] : 0;
     const int h_B_local = h_owner_B ? h_owner_B[owner] : 0;
     owner_total_assign_host[owner] = owner_total_assign;
     owner_B_host[owner] = h_B_local;
 
+    const int offsets_len = (E_local_layer > 0) ? (E_local_layer + 1) : 0;
+    std::vector<int> offsets_host;
+    if (offsets_len > 0) {
+      offsets_host.resize(offsets_len);
+      HIP_CHECK(hipMemcpy(offsets_host.data(),
+                          ctx.home_peer_buffers.send_expert_offsets_peer[owner],
+                          (size_t)offsets_len * sizeof(int),
+                          hipMemcpyDeviceToHost));
+    }
+
+    aggregator_register_home(owner, layer, ctx.device_id, h_B_local,
+                             owner_total_assign,
+                             offsets_host.empty() ? nullptr : offsets_host.data(),
+                             offsets_len);
+
     const bool has_work = (owner_total_assign > 0) && (h_B_local > 0);
     owner_active[owner] = has_work ? 1 : 0;
     if (!has_work) {
-      if (h_prev_owner_B) h_prev_owner_B[owner] = 0;
+      if (h_prev_owner_B)
+        h_prev_owner_B[owner] = 0;
       continue;
     }
+
     owners_with_work.push_back(owner);
+    if (h_prev_owner_B)
+      h_prev_owner_B[owner] = h_B_local;
 
     int *d_local2b = ctx.home_peer_buffers.d_local2b_peer[owner];
 
@@ -1001,7 +1503,8 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
 
   // Stage 3: transfer packed payloads and set up dependencies
   for (int owner = 0; owner < g_num_devices; ++owner) {
-    if (!owner_active[owner]) continue;
+    if (!owner_active[owner])
+      continue;
 
     const int owner_total_assign = owner_total_assign_host[owner];
     const int h_B_local = owner_B_host[owner];
@@ -1045,139 +1548,8 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
     }
   }
 
-  // Stage 4: run owner-side MLPs and convert partials to BF16
   for (int owner = 0; owner < g_num_devices; ++owner) {
-    if (!owner_active[owner]) continue;
-
-    const int E_local_layer = g_E_local_per_owner_layer[(size_t)owner * (size_t)L + (size_t)layer];
-    const int owner_total_assign = owner_total_assign_host[owner];
-    const int h_B_local = owner_B_host[owner];
-
-    ensure_device(owner);
-
-    bf16_t *recv_x = (owner == ctx.device_id)
-                         ? ctx.home_peer_buffers.send_x_peer[owner]
-                         : g_devices[owner].owner_receive_buffers.recv_x_from_home[ctx.device_id];
-    int *recv_pos = (owner == ctx.device_id)
-                        ? ctx.home_peer_buffers.send_pos_peer[owner]
-                        : g_devices[owner].owner_receive_buffers.recv_pos_from_home[ctx.device_id];
-    float *recv_topk_v = (owner == ctx.device_id)
-                             ? ctx.home_peer_buffers.send_topk_v_peer[owner]
-                             : g_devices[owner].owner_receive_buffers.recv_topk_v_from_home[ctx.device_id];
-    uint16_t *recv_assignment_batches = (owner == ctx.device_id)
-                                            ? ctx.home_peer_buffers.send_assignment_batches_peer[owner]
-                                            : g_devices[owner].owner_receive_buffers.recv_assignment_batches[ctx.device_id];
-    uint8_t *recv_assignment_slots = (owner == ctx.device_id)
-                                          ? ctx.home_peer_buffers.send_assignment_slots_peer[owner]
-                                          : g_devices[owner].owner_receive_buffers.recv_assignment_slots[ctx.device_id];
-    int *recv_offsets = (owner == ctx.device_id)
-                            ? ctx.home_peer_buffers.send_expert_offsets_peer[owner]
-                            : g_devices[owner].owner_receive_buffers.recv_expert_offsets[ctx.device_id];
-
-    {
-      PROFILE_GPU_SCOPE("zero_partial_rows_kernel", 0);
-      const dim3 zeroBlock(32, 4, 1);
-      const dim3 zeroGrid((H + zeroBlock.x - 1) / zeroBlock.x,
-                          (h_B_local + zeroBlock.y - 1) / zeroBlock.y,
-                          1);
-      zero_partial_rows_kernel<<<zeroGrid, zeroBlock, 0, g_devices[owner].mlp_stream>>>(
-          g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id],
-          H,
-          h_B_local);
-    }
-
-    const size_t gate_bytes = (size_t)owner_total_assign * (size_t)IM * sizeof(bf16_t);
-    if (gate_bytes > 0) {
-      HIP_CHECK(hipMemsetAsync(g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id], 0,
-                               gate_bytes, g_devices[owner].mlp_stream));
-    }
-
-    const size_t mlp2_bytes =
-        (size_t)K * (size_t)h_B_local * (size_t)H * sizeof(bf16_t);
-    if (mlp2_bytes > 0) {
-      HIP_CHECK(hipMemsetAsync(
-          g_devices[owner].partial_buffers.mlp2_partial_owner_per_home[ctx.device_id],
-          0,
-          mlp2_bytes,
-          g_devices[owner].mlp_stream));
-    }
-
-    {
-      PROFILE_GPU_SCOPE("mlp1_kernel", 0);
-      const int max_tiles = (h_B_local + MATMUL_MLP1_BLOCK_ROWS_120B - 1) / MATMUL_MLP1_BLOCK_ROWS_120B;
-      dim3 block_mlp1(WF_SIZE, MATMUL_MLP1_WAVES_PER_BLOCK_120B, 1);
-      dim3 grid_mlp1((2 * IM + MATMUL_MLP1_BLOCK_COLS_120B - 1) / MATMUL_MLP1_BLOCK_COLS_120B,
-                     max_tiles, E_local_layer);
-      mlp1_120b_kernel<<<grid_mlp1, block_mlp1, 0, g_devices[owner].mlp_stream>>>(
-          g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id],
-          recv_x,
-          g_devices[owner].gpu_weights_bf16.d_w_mlp1_bf16,
-          g_devices[owner].stride_w_mlp1_bf16,
-          g_devices[owner].gpu_expert_bias.g_b_mlp1,
-          recv_assignment_batches,
-          recv_assignment_slots,
-          recv_offsets,
-          layer,
-          g_devices[owner].E_local,
-          H, IM, swiglu_limit,
-          h_B_local,
-          recv_pos);
-    }
-
-    {
-      PROFILE_GPU_SCOPE("mlp2_kernel", 0);
-      const int max_tiles = (h_B_local + MATMUL_MLP2_BLOCK_ROWS_120B - 1) / MATMUL_MLP2_BLOCK_ROWS_120B;
-      dim3 block_mlp2(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK_120B, 1);
-      dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS_120B - 1) / MATMUL_MLP2_BLOCK_COLS_120B,
-                     max_tiles, E_local_layer);
-      mlp2_120b_kernel<<<grid_mlp2, block_mlp2, 0, g_devices[owner].mlp_stream>>>(
-          g_devices[owner].partial_buffers.mlp2_partial_owner_per_home[ctx.device_id],
-          g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id],
-          g_devices[owner].gpu_weights_bf16.d_w_mlp2_bf16,
-          g_devices[owner].stride_w_mlp2_bf16,
-          g_devices[owner].gpu_expert_bias.g_b_mlp2,
-          recv_assignment_batches,
-          recv_assignment_slots,
-          recv_offsets,
-          recv_topk_v,
-          layer,
-          g_devices[owner].E_local,
-          IM, H, h_B_local,
-          recv_pos);
-    }
-
-    {
-      PROFILE_GPU_SCOPE("reduce_mlp2_slots", 0);
-      dim3 blockReduce(BLOCK_SIZE, 1, 1);
-      dim3 gridReduce((H + BLOCK_SIZE - 1) / BLOCK_SIZE, h_B_local, 1);
-      reduce_mlp2_slots_kernel<<<gridReduce, blockReduce, 0, g_devices[owner].mlp_stream>>>(
-          g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id],
-          g_devices[owner].partial_buffers.mlp2_partial_owner_per_home[ctx.device_id],
-          recv_pos,
-          K,
-          h_B_local,
-          H);
-    }
-
-    {
-      PROFILE_GPU_SCOPE("cast_partial_fp32_to_bf16", 0);
-      dim3 blockCast(BLOCK_SIZE, 1, 1);
-      dim3 gridCast((H + BLOCK_SIZE - 1) / BLOCK_SIZE, h_B_local, 1);
-      cast_fp32_to_bf16_rows_kernel<<<gridCast, blockCast, 0, g_devices[owner].mlp_stream>>>(
-          g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id],
-          g_devices[owner].partial_buffers.partial_owner_per_home_bf16[ctx.device_id],
-          H,
-          h_B_local);
-    }
-
-    hipEvent_t mlp_done_evt = g_devices[owner].mlp_done_events
-                                  ? g_devices[owner].mlp_done_events[ctx.device_id]
-                                  : nullptr;
-    if (mlp_done_evt) {
-      HIP_CHECK(hipEventRecord(mlp_done_evt, g_devices[owner].mlp_stream));
-    } else {
-      HIP_CHECK(hipStreamSynchronize(g_devices[owner].mlp_stream));
-    }
+    aggregator_wait_for_mlp(ctx, owner, layer, swiglu_limit, H, IM, K, L);
   }
 
   // Stage 5: wait for owner MLP completion before aggregating
