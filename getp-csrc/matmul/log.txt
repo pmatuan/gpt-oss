@@ -1,0 +1,40 @@
+srun: job 82165 queued and waiting for resources
+srun: job 82165 has been allocated resources
+Device 0: AMD Instinct MI250X/MI250 | MultiProcessorCount=104 | MaxThreadsPerBlock=1024
+Timing iterations: 100, warmup: 10
+
+== MatMul QKV | Model 20B | B=896 ==
+baseline (defines): 0.417793 ms | 63.2468 TFLOPS
+  [discard] QKV_BM64_BN256_BK32_WM32_WN64 | 0.357987 ms | 73.8131 TFLOPS | speedup x1.16706 | accuracy fail (max_abs=135, max_rel=6.4787e+06, l2_rel=0.997439)
+  [faster] QKV_BM128_BN64_BK32_WM32_WN32 | 0.404309 ms | 65.3563 TFLOPS | speedup x1.03335
+  [faster] QKV_BM192_BN96_BK32_WM32_WN48 | 0.388557 ms | 68.0058 TFLOPS | speedup x1.07524
+  [faster] QKV_BM192_BN128_BK32_WM32_WN64 | 0.417238 ms | 63.331 TFLOPS | speedup x1.00133
+
+== MatMul AttnOut | Model 20B | B=896 ==
+baseline (defines): 0.339883 ms | 62.1958 TFLOPS
+  [discard] ATT_BM64_BN256_BK32_WM32_WN64 | 0.301678 ms | 70.0724 TFLOPS | speedup x1.12664 | accuracy fail (max_abs=156.5, max_rel=691843, l2_rel=0.989415)
+  [faster] ATT_BM160_BN96_BK32_WM32_WN32 | 0.339696 ms | 62.2301 TFLOPS | speedup x1.00055
+
+== MatMul Logits | Model 20B | B=896 ==
+baseline (defines): 12.7846 ms | 81.1763 TFLOPS
+  [faster] LOGITS_BM192_BN96_BK32_WM32_WN48 | 12.7709 ms | 81.2637 TFLOPS | speedup x1.00108
+
+== MatMul QKV | Model 120B | B=768 ==
+baseline (defines): 0.411795 ms | 55.0013 TFLOPS
+  [faster] QKV_BM64_BN128_BK32_WM32_WN32 | 0.391777 ms | 57.8115 TFLOPS | speedup x1.05109
+  [discard] QKV_BM64_BN256_BK32_WM32_WN64 | 0.353056 ms | 64.1521 TFLOPS | speedup x1.16637 | accuracy fail (max_abs=133.5, max_rel=1.35746e+06, l2_rel=0.996283)
+  [faster] QKV_BM96_BN160_BK32_WM32_WN32 | 0.396357 ms | 57.1436 TFLOPS | speedup x1.03895
+  [faster] QKV_BM128_BN64_BK32_WM32_WN32 | 0.342412 ms | 66.1461 TFLOPS | speedup x1.20263
+  [faster] QKV_BM160_BN96_BK32_WM32_WN32 | 0.371976 ms | 60.889 TFLOPS | speedup x1.10705
+  [faster] QKV_BM192_BN96_BK32_WM32_WN48 | 0.383144 ms | 59.1142 TFLOPS | speedup x1.07478
+  [faster] QKV_BM192_BN128_BK32_WM32_WN64 | 0.411473 ms | 55.0442 TFLOPS | speedup x1.00078
+  [faster] QKV_BM256_BN64_BK32_WM32_WN32 | 0.371614 ms | 60.9483 TFLOPS | speedup x1.10813
+
+== MatMul AttnOut | Model 120B | B=768 ==
+baseline (defines): 0.324473 ms | 55.8425 TFLOPS
+  [discard] ATT_BM64_BN256_BK32_WM32_WN64 | 0.297348 ms | 60.9366 TFLOPS | speedup x1.09122 | accuracy fail (max_abs=160.5, max_rel=1.14929e+06, l2_rel=0.985107)
+  [faster] ATT_BM192_BN128_BK32_WM32_WN64 | 0.297878 ms | 60.8283 TFLOPS | speedup x1.08928
+
+== MatMul Logits | Model 120B | B=768 ==
+baseline (defines): 10.4794 ms | 84.8858 TFLOPS
+  [faster] LOGITS_BM192_BN96_BK32_WM32_WN48 | 10.4747 ms | 84.9235 TFLOPS | speedup x1.00044

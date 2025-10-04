@@ -362,16 +362,16 @@ static float benchmark_kernel(const std::function<void()> &launch, int warmup,
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
 __global__ void matmul_bias_qkv_kernel_variant(
-    bf16_t *y, const bf16_t *x, const bf16_t *w, const float *bias, int n,
+    bf16_t *y, const bf16_t *x, const bf16_t *w, const bf16_t *bias, int n,
     int d, int B, const int *pos) {
-  matmul_bias_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
+    matmul_bias_qkv_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                              WARP_TILE_N>(y, x, w, bias, n, d, B, pos);
 }
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
 static float launch_qkv_kernel(bf16_t *y, const bf16_t *x, const bf16_t *w,
-                               const float *bias, int n, int d, int B,
+                               const bf16_t *bias, int n, int d, int B,
                                const int *pos, hipStream_t stream) {
   static_assert(BLOCK_ROWS % WARP_TILE_M == 0, "invalid BLOCK_ROWS/WARP_TILE_M");
   static_assert(BLOCK_COLS % WARP_TILE_N == 0, "invalid BLOCK_COLS/WARP_TILE_N");
@@ -398,7 +398,7 @@ struct MatmulQKVProblem {
 
 struct MatmulQKVCandidate {
   std::string label;
-  float (*launcher)(bf16_t *, const bf16_t *, const bf16_t *, const float *,
+  float (*launcher)(bf16_t *, const bf16_t *, const bf16_t *, const bf16_t *,
                     int, int, int, const int *, hipStream_t);
 };
 
@@ -406,7 +406,7 @@ static MatmulQKVCandidate make_qkv_candidate_default() {
   MatmulQKVCandidate c{};
   c.label = "defines";
   c.launcher = [](bf16_t *y, const bf16_t *x, const bf16_t *w,
-                  const float *bias, int n, int d, int B, const int *pos,
+                  const bf16_t *bias, int n, int d, int B, const int *pos,
                   hipStream_t stream) -> float {
     dim3 grid((d + MATMUL_QKV_BLOCK_COLS - 1) / MATMUL_QKV_BLOCK_COLS,
               (B + MATMUL_QKV_BLOCK_ROWS - 1) / MATMUL_QKV_BLOCK_ROWS, 1);
@@ -423,7 +423,7 @@ MatmulQKVCandidate make_qkv_candidate(const char *prefix) {
   MatmulQKVCandidate cand{};
   cand.label = format_config_label<Config>(prefix);
   cand.launcher = [](bf16_t *y, const bf16_t *x, const bf16_t *w,
-                     const float *bias, int n, int d, int B, const int *pos,
+                     const bf16_t *bias, int n, int d, int B, const int *pos,
                      hipStream_t stream) -> float {
     return launch_qkv_kernel<Config::BM, Config::BN, Config::BK, Config::WM,
                              Config::WN>(y, x, w, bias, n, d, B, pos, stream);
@@ -436,16 +436,16 @@ MatmulQKVCandidate make_qkv_candidate(const char *prefix) {
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
 __global__ void matmul_bias_att_kernel_variant(
-    bf16_t *y, const bf16_t *x, const bf16_t *w, const float *bias, int n,
+    bf16_t *y, const bf16_t *x, const bf16_t *w, const bf16_t *bias, int n,
     int d, int B, const int *pos) {
-  matmul_bias_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
+    matmul_bias_att_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                              WARP_TILE_N>(y, x, w, bias, n, d, B, pos);
 }
 
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N>
 static float launch_att_kernel(bf16_t *y, const bf16_t *x, const bf16_t *w,
-                               const float *bias, int n, int d, int B,
+                               const bf16_t *bias, int n, int d, int B,
                                const int *pos, hipStream_t stream) {
   static_assert(BLOCK_ROWS % WARP_TILE_M == 0, "invalid BLOCK_ROWS/WARP_TILE_M");
   static_assert(BLOCK_COLS % WARP_TILE_N == 0, "invalid BLOCK_COLS/WARP_TILE_N");
@@ -464,7 +464,7 @@ static float launch_att_kernel(bf16_t *y, const bf16_t *x, const bf16_t *w,
 
 struct MatmulATTCandidate {
   std::string label;
-  float (*launcher)(bf16_t *, const bf16_t *, const bf16_t *, const float *,
+  float (*launcher)(bf16_t *, const bf16_t *, const bf16_t *, const bf16_t *,
                     int, int, int, const int *, hipStream_t);
 };
 
@@ -472,7 +472,7 @@ static MatmulATTCandidate make_att_candidate_default() {
   MatmulATTCandidate c{};
   c.label = "defines";
   c.launcher = [](bf16_t *y, const bf16_t *x, const bf16_t *w,
-                  const float *bias, int n, int d, int B, const int *pos,
+                  const bf16_t *bias, int n, int d, int B, const int *pos,
                   hipStream_t stream) -> float {
     dim3 grid((d + MATMUL_ATT_BLOCK_COLS - 1) / MATMUL_ATT_BLOCK_COLS,
               (B + MATMUL_ATT_BLOCK_ROWS - 1) / MATMUL_ATT_BLOCK_ROWS, 1);
@@ -489,7 +489,7 @@ MatmulATTCandidate make_att_candidate(const char *prefix) {
   MatmulATTCandidate cand{};
   cand.label = format_config_label<Config>(prefix);
   cand.launcher = [](bf16_t *y, const bf16_t *x, const bf16_t *w,
-                     const float *bias, int n, int d, int B, const int *pos,
+                     const bf16_t *bias, int n, int d, int B, const int *pos,
                      hipStream_t stream) -> float {
     return launch_att_kernel<Config::BM, Config::BN, Config::BK, Config::WM,
                              Config::WN>(y, x, w, bias, n, d, B, pos, stream);
@@ -506,7 +506,7 @@ __global__ void matmul_logits_kernel_variant(float *y,
                                                      const bf16_t *w, int n,
                                                      int d, int B,
                                                      const int *pos) {
-  matmul_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
+  matmul_logits_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                         WARP_TILE_N>(y, x, w, n, d, B, pos);
 }
 
@@ -829,7 +829,7 @@ struct RunResult {
 
 static RunResult run_qkv_variant(const MatmulQKVProblem &prob,
                                  bf16_t *d_y, const bf16_t *d_x,
-                                 const bf16_t *d_w, const float *d_bias,
+                                 const bf16_t *d_w, const bf16_t *d_bias,
                                  const int *d_pos, hipStream_t stream,
                                  const TimingOptions &opts,
                                  const MatmulQKVCandidate &cand) {
@@ -860,7 +860,7 @@ struct MatmulATTProblem {
 
 static RunResult run_att_variant(const MatmulATTProblem &prob, bf16_t *d_y,
                                  const bf16_t *d_x, const bf16_t *d_w,
-                                 const float *d_bias, const int *d_pos,
+                                 const bf16_t *d_bias, const int *d_pos,
                                  hipStream_t stream, const TimingOptions &opts,
                                  const MatmulATTCandidate &cand) {
   HIP_CHECK(hipMemsetAsync(d_y, 0, prob.output_elems * sizeof(bf16_t), stream));
@@ -1114,10 +1114,10 @@ static void tune_matmul_qkv(const BenchmarkSetting &setting,
 
   std::mt19937 rng(1337);
   std::vector<bf16_t> h_x((size_t)B * H);
-  std::vector<float> h_bias(QKV_D);
+  std::vector<bf16_t> h_bias(QKV_D);
 
   fill_random_bf16(h_x, rng);
-  fill_random_float(h_bias, rng);
+  fill_random_bf16(h_bias, rng);
 
   const size_t stride = matmul_packed_elems(QKV_D, H);
   std::vector<bf16_t> h_w(stride);
@@ -1126,20 +1126,20 @@ static void tune_matmul_qkv(const BenchmarkSetting &setting,
   std::vector<int> h_pos(B, 0);
 
   bf16_t *d_x = nullptr, *d_w = nullptr, *d_y = nullptr;
-  float *d_bias = nullptr;
+  bf16_t *d_bias = nullptr;
   int *d_pos = nullptr;
 
   HIP_CHECK(hipMalloc(&d_x, h_x.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_y, prob.output_elems * sizeof(bf16_t)));
-  HIP_CHECK(hipMalloc(&d_bias, h_bias.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_bias, h_bias.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_pos, h_pos.size() * sizeof(int)));
 
   HIP_CHECK(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(bf16_t),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(bf16_t),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_bias, h_bias.data(), h_bias.size() * sizeof(float),
+  HIP_CHECK(hipMemcpy(d_bias, h_bias.data(), h_bias.size() * sizeof(bf16_t),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_pos, h_pos.data(), h_pos.size() * sizeof(int),
                       hipMemcpyHostToDevice));
@@ -1199,9 +1199,9 @@ static void tune_matmul_att(const BenchmarkSetting &setting,
 
   std::mt19937 rng(2024);
   std::vector<bf16_t> h_x((size_t)B * O_N);
-  std::vector<float> h_bias(H);
+  std::vector<bf16_t> h_bias(H);
   fill_random_bf16(h_x, rng);
-  fill_random_float(h_bias, rng);
+  fill_random_bf16(h_bias, rng);
 
   const size_t stride = matmul_packed_elems(H, O_N);
   std::vector<bf16_t> h_w(stride);
@@ -1210,20 +1210,20 @@ static void tune_matmul_att(const BenchmarkSetting &setting,
   std::vector<int> h_pos(B, 0);
 
   bf16_t *d_x = nullptr, *d_w = nullptr, *d_y = nullptr;
-  float *d_bias = nullptr;
+  bf16_t *d_bias = nullptr;
   int *d_pos = nullptr;
 
   HIP_CHECK(hipMalloc(&d_x, h_x.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_y, prob.output_elems * sizeof(bf16_t)));
-  HIP_CHECK(hipMalloc(&d_bias, h_bias.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_bias, h_bias.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_pos, h_pos.size() * sizeof(int)));
 
   HIP_CHECK(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(bf16_t),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(bf16_t),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_bias, h_bias.data(), h_bias.size() * sizeof(float),
+  HIP_CHECK(hipMemcpy(d_bias, h_bias.data(), h_bias.size() * sizeof(bf16_t),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_pos, h_pos.data(), h_pos.size() * sizeof(int),
                       hipMemcpyHostToDevice));
@@ -1611,8 +1611,8 @@ int main(int argc, char **argv) {
     tune_matmul_qkv(setting, opts, stream);
     tune_matmul_att(setting, opts, stream);
     tune_matmul_logits(setting, opts, stream);
-    tune_mlp1(setting, opts, stream);
-    tune_mlp2(setting, opts, stream);
+    // tune_mlp1(setting, opts, stream);
+    // tune_mlp2(setting, opts, stream);
   }
 
   return 0;
