@@ -3,54 +3,80 @@
 #include "../utility/utility.h"
 #include <math.h>
 
-__device__ __forceinline__ float block_reduce_max(float thread_val,
-                                                  float *warp_buffer, int lane,
-                                                  int warp_id, int num_warps) {
-  for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
-    thread_val = fmaxf(thread_val, __shfl_down(thread_val, offset, WF_SIZE));
-  }
-
-  if (lane == 0)
-    warp_buffer[warp_id] = thread_val;
-  __syncthreads();
-
-  float block_val = -INFINITY;
-  if (warp_id == 0) {
-    block_val = (lane < num_warps) ? warp_buffer[lane] : -INFINITY;
+__device__ __forceinline__ void block_reduce_max_multi(
+    float (&vals)[ATTN_FLASH_MAX_KV_MUL],
+    float (&warp_storage)[ATTN_FLASH_MAX_KV_MUL][ATTN_WARPS_PER_BLOCK],
+    float (&block_storage)[ATTN_FLASH_MAX_KV_MUL], int lane, int warp_id,
+    int num_warps, int kv_mul) {
+#pragma unroll
+  for (int qh = 0; qh < kv_mul; ++qh) {
+    float v = vals[qh];
+#pragma unroll
     for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
-      block_val = fmaxf(block_val, __shfl_down(block_val, offset, WF_SIZE));
+      v = fmaxf(v, __shfl_down(v, offset, WF_SIZE));
     }
-    if (lane == 0)
-      warp_buffer[0] = block_val;
+    vals[qh] = v;
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (int qh = 0; qh < kv_mul; ++qh) {
+      warp_storage[qh][warp_id] = vals[qh];
+    }
   }
   __syncthreads();
 
-  return warp_buffer[0];
+  if (warp_id == 0) {
+#pragma unroll
+    for (int qh = 0; qh < kv_mul; ++qh) {
+      float v = (lane < num_warps) ? warp_storage[qh][lane] : -INFINITY;
+#pragma unroll
+      for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_down(v, offset, WF_SIZE));
+      }
+      if (lane == 0)
+        block_storage[qh] = v;
+    }
+  }
+  __syncthreads();
 }
 
-__device__ __forceinline__ float block_reduce_sum(float thread_val,
-                                                  float *warp_buffer, int lane,
-                                                  int warp_id, int num_warps) {
-  for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
-    thread_val += __shfl_down(thread_val, offset, WF_SIZE);
-  }
-
-  if (lane == 0)
-    warp_buffer[warp_id] = thread_val;
-  __syncthreads();
-
-  float block_val = 0.0f;
-  if (warp_id == 0) {
-    block_val = (lane < num_warps) ? warp_buffer[lane] : 0.0f;
+__device__ __forceinline__ void block_reduce_sum_multi(
+    float (&vals)[ATTN_FLASH_MAX_KV_MUL],
+    float (&warp_storage)[ATTN_FLASH_MAX_KV_MUL][ATTN_WARPS_PER_BLOCK],
+    float (&block_storage)[ATTN_FLASH_MAX_KV_MUL], int lane, int warp_id,
+    int num_warps, int kv_mul) {
+#pragma unroll
+  for (int qh = 0; qh < kv_mul; ++qh) {
+    float v = vals[qh];
+#pragma unroll
     for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
-      block_val += __shfl_down(block_val, offset, WF_SIZE);
+      v += __shfl_down(v, offset, WF_SIZE);
     }
-    if (lane == 0)
-      warp_buffer[0] = block_val;
+    vals[qh] = v;
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (int qh = 0; qh < kv_mul; ++qh) {
+      warp_storage[qh][warp_id] = vals[qh];
+    }
   }
   __syncthreads();
 
-  return warp_buffer[0];
+  if (warp_id == 0) {
+#pragma unroll
+    for (int qh = 0; qh < kv_mul; ++qh) {
+      float v = (lane < num_warps) ? warp_storage[qh][lane] : 0.0f;
+#pragma unroll
+      for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
+        v += __shfl_down(v, offset, WF_SIZE);
+      }
+      if (lane == 0)
+        block_storage[qh] = v;
+    }
+  }
+  __syncthreads();
 }
 
 template <bool HAS_WINDOW>
@@ -62,8 +88,7 @@ __device__ __forceinline__ void flash_decoding_body(
     const float *__restrict__ rope_inv_freq, float rope_concentration,
     const uint32_t *__restrict__ layer_offsets,
     const int *__restrict__ layer_capacity, int sliding_window,
-    uint32_t kv_batch_stride, int batch_size, float *__restrict__ smem_dyn,
-    float *__restrict__ warp_buffer) {
+    uint32_t kv_batch_stride, int batch_size, float *__restrict__ smem_dyn) {
 
   const int b = blockIdx.y;
   if (b >= batch_size)
@@ -86,7 +111,7 @@ __device__ __forceinline__ void flash_decoding_body(
   if (cap <= 0)
     return;
 
-  const int kv_mul = 8;
+  constexpr int kv_mul = 8;
   if (kv_mul > ATTN_FLASH_MAX_KV_MUL)
     return;
   const int kv_dim = Hk * D;
@@ -130,6 +155,8 @@ __device__ __forceinline__ void flash_decoding_body(
   __shared__ float s_m[ATTN_FLASH_MAX_KV_MUL];
   __shared__ float s_l[ATTN_FLASH_MAX_KV_MUL];
   __shared__ float s_scale[ATTN_FLASH_MAX_KV_MUL];
+  __shared__ float s_warp_red[ATTN_FLASH_MAX_KV_MUL][ATTN_WARPS_PER_BLOCK];
+  __shared__ float s_red_tmp[ATTN_FLASH_MAX_KV_MUL];
 
   if (tid == 0) {
     for (int qh = 0; qh < kv_mul; ++qh) {
@@ -174,6 +201,11 @@ __device__ __forceinline__ void flash_decoding_body(
   }
   __syncthreads();
 
+  const float *q_heads[ATTN_FLASH_MAX_KV_MUL];
+#pragma unroll
+  for (int qh = 0; qh < kv_mul; ++qh)
+    q_heads[qh] = s_q + qh * D;
+
   float acc[ATTN_FLASH_MAX_KV_MUL];
   for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
     acc[qh] = 0.0f;
@@ -215,7 +247,7 @@ __device__ __forceinline__ void flash_decoding_body(
         const int base = d4 << 2;
 #pragma unroll
         for (int qh = 0; qh < kv_mul; ++qh) {
-          const float *qv = s_q + qh * D + base;
+          const float *qv = q_heads[qh] + base;
           sc[qh] = fmaf(qv[0], kv.x, sc[qh]);
           sc[qh] = fmaf(qv[1], kv.y, sc[qh]);
           sc[qh] = fmaf(qv[2], kv.z, sc[qh]);
@@ -226,7 +258,7 @@ __device__ __forceinline__ void flash_decoding_body(
         const float kd = static_cast<float>(k_ptr[d]);
 #pragma unroll
         for (int qh = 0; qh < kv_mul; ++qh) {
-          sc[qh] = fmaf(s_q[qh * D + d], kd, sc[qh]);
+          sc[qh] = fmaf(q_heads[qh][d], kd, sc[qh]);
         }
       }
 #pragma unroll
@@ -244,10 +276,12 @@ __device__ __forceinline__ void flash_decoding_body(
     }
     __syncthreads();
 
-    for (int qh = 0; qh < kv_mul; ++qh) {
-      const float mx =
-          block_reduce_max(thread_max[qh], warp_buffer, lane, wid, nwarp);
-      if (tid == 0) {
+    block_reduce_max_multi(thread_max, s_warp_red, s_red_tmp, lane, wid,
+                            nwarp, kv_mul);
+    if (tid == 0) {
+#pragma unroll
+      for (int qh = 0; qh < kv_mul; ++qh) {
+        const float mx = s_red_tmp[qh];
         if (mx > s_m[qh]) {
           const float scale = __expf(s_m[qh] - mx);
           s_l[qh] *= scale;
@@ -257,25 +291,34 @@ __device__ __forceinline__ void flash_decoding_body(
           s_scale[qh] = 1.0f;
         }
       }
-      __syncthreads();
-      acc[qh] *= s_scale[qh];
-      __syncthreads();
     }
+    __syncthreads();
+#pragma unroll
+    for (int qh = 0; qh < kv_mul; ++qh)
+      acc[qh] *= s_scale[qh];
 
-    for (int qh = 0; qh < kv_mul; ++qh) {
-      float thread_sum = 0.0f;
-      for (int local_t = tid; local_t < tile_len; local_t += blockDim.x) {
+    float thread_sum_multi[ATTN_FLASH_MAX_KV_MUL];
+#pragma unroll
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
+      thread_sum_multi[qh] = 0.0f;
+
+    for (int local_t = tid; local_t < tile_len; local_t += blockDim.x) {
+#pragma unroll
+      for (int qh = 0; qh < kv_mul; ++qh) {
         float p = __expf(s_scores[qh * score_stride + local_t] - s_m[qh]);
         s_scores[qh * score_stride + local_t] = p;
-        thread_sum += p;
+        thread_sum_multi[qh] += p;
       }
-      __syncthreads();
-      const float sum =
-          block_reduce_sum(thread_sum, warp_buffer, lane, wid, nwarp);
-      if (tid == 0)
-        s_l[qh] += sum;
-      __syncthreads();
     }
+    __syncthreads();
+    block_reduce_sum_multi(thread_sum_multi, s_warp_red, s_red_tmp, lane, wid,
+                            nwarp, kv_mul);
+    if (tid == 0) {
+#pragma unroll
+      for (int qh = 0; qh < kv_mul; ++qh)
+        s_l[qh] += s_red_tmp[qh];
+    }
+    __syncthreads();
 
     for (int local_t = worker_rank; local_t < tile_len;
          local_t += workers_this_dim) {
@@ -348,12 +391,10 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
         const int *__restrict__ layer_capacity, int sliding_window,
         uint32_t kv_batch_stride, int batch_size) {
   extern __shared__ float smem[];
-  __shared__ float warp_buffer[ATTN_WARPS_PER_BLOCK];
   flash_decoding_body<true>(
       out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
       rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
-      sliding_window, kv_batch_stride,
-      batch_size, smem, warp_buffer);
+      sliding_window, kv_batch_stride, batch_size, smem);
 }
 
 __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
@@ -367,9 +408,8 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
         const int *__restrict__ layer_capacity, uint32_t kv_batch_stride,
         int batch_size) {
   extern __shared__ float smem[];
-  __shared__ float warp_buffer[ATTN_WARPS_PER_BLOCK];
   flash_decoding_body<false>(
       out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
       rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
-      /*sliding_window*/ 0, kv_batch_stride, batch_size, smem, warp_buffer);
+      /*sliding_window*/ 0, kv_batch_stride, batch_size, smem);
 }
