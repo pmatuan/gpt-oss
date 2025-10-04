@@ -108,6 +108,8 @@ struct GPUActivationBuffers {
   float *d_e_agg;
   bf16_t *d_gate_up_workspace; // Pre-allocated workspace for MLP
   size_t gate_up_workspace_bytes;
+  bf16_t *d_mlp2_partial_bf16; // [K, B, H] intermediate buffer for MLP2 (no atomic)
+  size_t mlp2_partial_bytes;
   bf16_t *d_qkv;
   bf16_t *d_key_cache, *d_value_cache;
   int kv_seq_capacity;
@@ -199,6 +201,7 @@ struct OwnerPartialBuffers {
   bf16_t **partial_owner_per_home_bf16 = nullptr; // [ndev] -> [B_local,H]
   bf16_t **recv_partial_home_bf16 = nullptr;      // [ndev] -> [B_local,H]
   bf16_t **gate_up_owner_per_home = nullptr; // [ndev] -> [K, B_local, IM]
+  bf16_t **mlp2_partial_owner_per_home = nullptr; // [ndev] -> [K, B_local, H]
 };
 
 struct DeviceContext {

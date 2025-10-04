@@ -342,6 +342,10 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     ctx.gpu_activations.gate_up_workspace_bytes = 0;
   }
 
+  // EP path doesn't need MLP2 intermediate buffer (uses partials per owner)
+  ctx.gpu_activations.d_mlp2_partial_bf16 = nullptr;
+  ctx.gpu_activations.mlp2_partial_bytes = 0;
+
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
 
@@ -676,6 +680,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     ensure_host_ptr_array(&ctx.partial_buffers.partial_owner_per_home_bf16, g_num_devices);
     ensure_host_ptr_array(&ctx.partial_buffers.recv_partial_home_bf16, g_num_devices);
     ensure_host_ptr_array(&ctx.partial_buffers.gate_up_owner_per_home, g_num_devices);
+    ensure_host_ptr_array(&ctx.partial_buffers.mlp2_partial_owner_per_home, g_num_devices);
 
     auto hip_alloc = [&](void **ptr, size_t bytes) {
       HIP_CHECK(hipMalloc(ptr, bytes));
@@ -719,6 +724,7 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
       hip_alloc((void**)&ctx.partial_buffers.partial_owner_per_home_bf16[peer],        B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
       hip_alloc((void**)&ctx.partial_buffers.recv_partial_home_bf16[peer],             B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
       hip_alloc((void**)&ctx.partial_buffers.gate_up_owner_per_home[peer],             (size_t)K * B_owner_peer_cap * (size_t)IM * sizeof(bf16_t));
+      hip_alloc((void**)&ctx.partial_buffers.mlp2_partial_owner_per_home[peer],         (size_t)K * B_owner_peer_cap * (size_t)H * sizeof(bf16_t));
     }
   }
 }
@@ -826,6 +832,7 @@ static void cleanup_device_context_ep(DeviceContext &ctx) {
   free_per_peer_ptrs(ctx.partial_buffers.partial_owner_per_home_bf16);
   free_per_peer_ptrs(ctx.partial_buffers.recv_partial_home_bf16);
   free_per_peer_ptrs(ctx.partial_buffers.gate_up_owner_per_home);
+  free_per_peer_ptrs(ctx.partial_buffers.mlp2_partial_owner_per_home);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_b2local_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_local2b_peer);
   free_per_peer_ptrs(ctx.home_peer_buffers.d_expert_counts_peer);
@@ -1085,6 +1092,16 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
                                gate_bytes, g_devices[owner].mlp_stream));
     }
 
+    const size_t mlp2_bytes =
+        (size_t)K * (size_t)h_B_local * (size_t)H * sizeof(bf16_t);
+    if (mlp2_bytes > 0) {
+      HIP_CHECK(hipMemsetAsync(
+          g_devices[owner].partial_buffers.mlp2_partial_owner_per_home[ctx.device_id],
+          0,
+          mlp2_bytes,
+          g_devices[owner].mlp_stream));
+    }
+
     {
       PROFILE_GPU_SCOPE("mlp1_kernel", 0);
       const int max_tiles = (h_B_local + MATMUL_MLP1_BLOCK_ROWS_120B - 1) / MATMUL_MLP1_BLOCK_ROWS_120B;
@@ -1114,7 +1131,7 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
       dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS_120B - 1) / MATMUL_MLP2_BLOCK_COLS_120B,
                      max_tiles, E_local_layer);
       mlp2_120b_kernel<<<grid_mlp2, block_mlp2, 0, g_devices[owner].mlp_stream>>>(
-          g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id],
+          g_devices[owner].partial_buffers.mlp2_partial_owner_per_home[ctx.device_id],
           g_devices[owner].partial_buffers.gate_up_owner_per_home[ctx.device_id],
           g_devices[owner].gpu_weights_bf16.d_w_mlp2_bf16,
           g_devices[owner].stride_w_mlp2_bf16,
@@ -1127,6 +1144,19 @@ static void gpu_forward_device_batch_ep(DeviceContext &ctx, const float swiglu_l
           g_devices[owner].E_local,
           IM, H, h_B_local,
           recv_pos);
+    }
+
+    {
+      PROFILE_GPU_SCOPE("reduce_mlp2_slots", 0);
+      dim3 blockReduce(BLOCK_SIZE, 1, 1);
+      dim3 gridReduce((H + BLOCK_SIZE - 1) / BLOCK_SIZE, h_B_local, 1);
+      reduce_mlp2_slots_kernel<<<gridReduce, blockReduce, 0, g_devices[owner].mlp_stream>>>(
+          g_devices[owner].partial_buffers.partial_owner_per_home[ctx.device_id],
+          g_devices[owner].partial_buffers.mlp2_partial_owner_per_home[ctx.device_id],
+          recv_pos,
+          K,
+          h_B_local,
+          H);
     }
 
     {

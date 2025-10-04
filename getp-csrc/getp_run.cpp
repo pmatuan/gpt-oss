@@ -61,6 +61,12 @@ static void init_device_context(DeviceContext &ctx, int device_id,
     ctx.gpu_activations.gate_up_workspace_bytes = 0;
   }
 
+  // Allocate MLP2 intermediate buffer [K, B, H] for non-atomic accumulation
+  const int K = model_config->experts_per_token;
+  const size_t mlp2_partial_bytes = (size_t)K * (size_t)B * (size_t)H * sizeof(bf16_t);
+  HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_mlp2_partial_bf16, mlp2_partial_bytes));
+  ctx.gpu_activations.mlp2_partial_bytes = mlp2_partial_bytes;
+
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
   ctx.gpu_activations.d_rope_inv_freq = nullptr;
@@ -326,6 +332,8 @@ static void cleanup_device_context(DeviceContext &ctx) {
     HIP_CHECK(hipFree(ctx.gpu_activations.d_e_agg));
   if (ctx.gpu_activations.d_gate_up_workspace)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_gate_up_workspace));
+  if (ctx.gpu_activations.d_mlp2_partial_bf16)
+    HIP_CHECK(hipFree(ctx.gpu_activations.d_mlp2_partial_bf16));
   if (ctx.gpu_activations.d_qkv)
     HIP_CHECK(hipFree(ctx.gpu_activations.d_qkv));
   if (ctx.gpu_activations.d_key_cache)
@@ -626,8 +634,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           sizeof(float);
       const bool layer_has_window = (l & 1) == 0;
       if (layer_has_window) {
-        PROFILE_GPU_SCOPE("attention_flashdecode_mqa_even", 0);
-        attention_flashdecode_mqa_even<<<gridAttn, blockA, shmem_size>>>(
+        PROFILE_GPU_SCOPE("flash_decoding_even", 0);
+        flash_decoding_even<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
             ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
@@ -636,8 +644,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
             ctx.d_kv_layer_capacity,
             p->sliding_window, kv_batch_stride, batch_size);
       } else {
-        PROFILE_GPU_SCOPE("attention_flashdecode_mqa_odd", 0);
-        attention_flashdecode_mqa_odd<<<gridAttn, blockA, shmem_size>>>(
+        PROFILE_GPU_SCOPE("flash_decoding_odd", 0);
+        flash_decoding_odd<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
             ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
@@ -795,8 +803,16 @@ static int *gpu_forward_device_batch(Transformer *transformer,
               batch_size, ctx.gpu_activations.d_pos);
         }
 
+        // Zero intermediate buffer before MLP2
         {
-          PROFILE_GPU_SCOPE("mlp2_bias_weighted_accum_gemm", 0);
+          PROFILE_GPU_SCOPE("zero_mlp2_partial", 0);
+          const size_t zero_bytes = ctx.gpu_activations.mlp2_partial_bytes;
+          HIP_CHECK(hipMemsetAsync(ctx.gpu_activations.d_mlp2_partial_bf16, 0, zero_bytes, 0));
+        }
+
+        // MLP2 writes to intermediate buffer without atomics
+        {
+          PROFILE_GPU_SCOPE("mlp2_noatomic_gemm", 0);
           const int max_tiles =
               (max_assign_per_expert + MATMUL_MLP2_BLOCK_ROWS - 1) /
               MATMUL_MLP2_BLOCK_ROWS;
@@ -804,12 +820,25 @@ static int *gpu_forward_device_batch(Transformer *transformer,
           dim3 grid_mlp2((H + MATMUL_MLP2_BLOCK_COLS - 1) /
                             MATMUL_MLP2_BLOCK_COLS,
                         max_tiles, E);
-          mlp2_kernel<<<grid_mlp2, block_mlp2, 0>>>(
-              ctx.gpu_activations.d_e_agg, d_gate_up_topk,
+          mlp2_kernel_noatomic<<<grid_mlp2, block_mlp2, 0>>>(
+              ctx.gpu_activations.d_mlp2_partial_bf16, d_gate_up_topk,
               ctx.gpu_weights_bf16.d_w_mlp2_bf16, ctx.stride_w_mlp2_bf16,
               ctx.gpu_expert_bias.g_b_mlp2, d_assignment_batches,
               d_assignment_slots, d_expert_offsets, ctx.gpu_activations.d_topk_v, l,
               E, IM, H, batch_size, ctx.gpu_activations.d_pos);
+        }
+
+        // Reduce K slots into e_agg
+        {
+          PROFILE_GPU_SCOPE("reduce_mlp2_slots", 0);
+          const int K = p->experts_per_token;
+          dim3 blockReduce(BLOCK_SIZE, 1, 1);
+          dim3 gridReduce((H + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, 1);
+          reduce_mlp2_slots_kernel<<<gridReduce, blockReduce, 0>>>(
+              ctx.gpu_activations.d_e_agg,
+              ctx.gpu_activations.d_mlp2_partial_bf16,
+              ctx.gpu_activations.d_pos,
+              K, batch_size, H);
         }
       } // End of if total_pairs > 0 && E > 0
 

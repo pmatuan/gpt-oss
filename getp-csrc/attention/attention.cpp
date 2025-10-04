@@ -54,7 +54,7 @@ __device__ __forceinline__ float block_reduce_sum(float thread_val,
 }
 
 template <bool HAS_WINDOW>
-__device__ __forceinline__ void attention_flashdecode_mqa_kernel(
+__device__ __forceinline__ void flash_decoding_body(
     bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
     const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
     const bf16_t *__restrict__ attn_sinks, int layer_idx,
@@ -338,7 +338,7 @@ __device__ __forceinline__ void attention_flashdecode_mqa_kernel(
 }
 
 __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
-    void attention_flashdecode_mqa_even(
+    void flash_decoding_even(
         bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
         const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
         const bf16_t *__restrict__ attn_sinks, int layer_idx,
@@ -349,7 +349,7 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
         uint32_t kv_batch_stride, int batch_size) {
   extern __shared__ float smem[];
   __shared__ float warp_buffer[ATTN_WARPS_PER_BLOCK];
-  attention_flashdecode_mqa_kernel<true>(
+  flash_decoding_body<true>(
       out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
       rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
       sliding_window, kv_batch_stride,
@@ -357,7 +357,7 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
 }
 
 __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
-    void attention_flashdecode_mqa_odd(
+    void flash_decoding_odd(
         bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
         const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
         const bf16_t *__restrict__ attn_sinks, int layer_idx,
@@ -368,7 +368,7 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
         int batch_size) {
   extern __shared__ float smem[];
   __shared__ float warp_buffer[ATTN_WARPS_PER_BLOCK];
-  attention_flashdecode_mqa_kernel<false>(
+  flash_decoding_body<false>(
       out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
       rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
       /*sliding_window*/ 0, kv_batch_stride, batch_size, smem, warp_buffer);

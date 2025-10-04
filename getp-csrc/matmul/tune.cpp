@@ -718,14 +718,14 @@ MLP1Candidate make_mlp1_candidate(const char *prefix) {
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N, int WAVES_PER_BLOCK>
 __global__ void mlp2_kernel_variant(
-    float *e_agg, const bf16_t *gate_up_topk, const bf16_t *w_mlp2_all,
+    bf16_t *mlp2_partial, const bf16_t *gate_up_topk, const bf16_t *w_mlp2_all,
     size_t stride_w_mlp2, const bf16_t *b_mlp2_all,
     const uint16_t *assignment_batches, const uint8_t *assignment_slots,
     const int *expert_offsets, const float *topk_v, int l_layer, int E, int IM,
     int H, int batch_size, const int *pos) {
-  mlp2_kernel_body<
+  mlp2_kernel_body_noatomic<
       BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M, WARP_TILE_N,
-      WAVES_PER_BLOCK>(e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2,
+      WAVES_PER_BLOCK>(mlp2_partial, gate_up_topk, w_mlp2_all, stride_w_mlp2,
                        b_mlp2_all, assignment_batches, assignment_slots,
                        expert_offsets, topk_v, l_layer, E, IM, H, batch_size,
                        pos);
@@ -734,7 +734,7 @@ __global__ void mlp2_kernel_variant(
 template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
           int WARP_TILE_N, int WAVES_PER_BLOCK>
 static float launch_mlp2_kernel(
-    float *e_agg, const bf16_t *gate_up_topk, const bf16_t *w_mlp2_all,
+    bf16_t *mlp2_partial, const bf16_t *gate_up_topk, const bf16_t *w_mlp2_all,
     size_t stride_w_mlp2, const bf16_t *b_mlp2_all,
     const uint16_t *assignment_batches, const uint8_t *assignment_slots,
     const int *expert_offsets, const float *topk_v, int l_layer, int E, int IM,
@@ -755,7 +755,7 @@ static float launch_mlp2_kernel(
   hipLaunchKernelGGL((mlp2_kernel_variant<
                           BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                           WARP_TILE_N, WAVES_PER_BLOCK>),
-                     grid, block, 0, stream, e_agg, gate_up_topk, w_mlp2_all,
+                     grid, block, 0, stream, mlp2_partial, gate_up_topk, w_mlp2_all,
                      stride_w_mlp2, b_mlp2_all, assignment_batches,
                      assignment_slots, expert_offsets, topk_v, l_layer, E, IM,
                      H, batch_size, pos);
@@ -764,7 +764,7 @@ static float launch_mlp2_kernel(
 
 struct MLP2Candidate {
   std::string label;
-  float (*launcher)(float *, const bf16_t *, const bf16_t *, size_t,
+  float (*launcher)(bf16_t *, const bf16_t *, const bf16_t *, size_t,
                     const bf16_t *, const uint16_t *, const uint8_t *,
                     const int *, const float *, int, int, int, int, int,
                     const int *, int, hipStream_t);
@@ -773,7 +773,7 @@ struct MLP2Candidate {
 static MLP2Candidate make_mlp2_candidate_default() {
   MLP2Candidate c{};
   c.label = "defines";
-  c.launcher = [](float *e_agg, const bf16_t *gate_up_topk,
+  c.launcher = [](bf16_t *mlp2_partial, const bf16_t *gate_up_topk,
                   const bf16_t *w_mlp2_all, size_t stride_w_mlp2,
                   const bf16_t *b_mlp2_all,
                   const uint16_t *assignment_batches,
@@ -787,8 +787,8 @@ static MLP2Candidate make_mlp2_candidate_default() {
     dim3 grid((H + MATMUL_MLP2_BLOCK_COLS - 1) / MATMUL_MLP2_BLOCK_COLS,
               max_tiles, E);
     dim3 block(WF_SIZE, MATMUL_MLP2_WAVES_PER_BLOCK, 1);
-    hipLaunchKernelGGL(mlp2_kernel, grid, block, 0,
-                       stream, e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2,
+    hipLaunchKernelGGL(mlp2_kernel_noatomic, grid, block, 0,
+                       stream, mlp2_partial, gate_up_topk, w_mlp2_all, stride_w_mlp2,
                        b_mlp2_all, assignment_batches, assignment_slots,
                        expert_offsets, topk_v, l_layer, E, IM, H, batch_size,
                        pos);
@@ -801,7 +801,7 @@ template <typename Config>
 MLP2Candidate make_mlp2_candidate(const char *prefix) {
   MLP2Candidate cand{};
   cand.label = format_config_label<Config>(prefix);
-  cand.launcher = [](float *e_agg, const bf16_t *gate_up_topk,
+  cand.launcher = [](bf16_t *mlp2_partial, const bf16_t *gate_up_topk,
                      const bf16_t *w_mlp2_all, size_t stride_w_mlp2,
                      const bf16_t *b_mlp2_all,
                      const uint16_t *assignment_batches,
@@ -812,7 +812,7 @@ MLP2Candidate make_mlp2_candidate(const char *prefix) {
                      hipStream_t stream) -> float {
     return launch_mlp2_kernel<Config::BM, Config::BN, Config::BK, Config::WM,
                               Config::WN, Config::WavesPerWg>(
-        e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
+        mlp2_partial, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
         assignment_batches, assignment_slots, expert_offsets, topk_v, l_layer,
         E, IM, H, batch_size, pos, max_assign_per_expert, stream);
   };
@@ -954,27 +954,43 @@ struct MLP2Problem {
   int IM;
   int max_assign;
   int total_assign;
+  int K;
   size_t output_elems;
+  size_t partial_elems;
   double flops;
 };
 
 static RunResult run_mlp2_variant(
-    const MLP2Problem &prob, float *d_out, const bf16_t *d_gate_up,
+    const MLP2Problem &prob, bf16_t *d_partial, float *d_out,
+    const bf16_t *d_gate_up,
     const bf16_t *d_w, size_t stride_w, const bf16_t *d_bias,
     const uint16_t *d_batches, const uint8_t *d_slots, const int *d_offsets,
     const float *d_topk_v, int l_layer, const int *d_pos, hipStream_t stream,
     const TimingOptions &opts, const MLP2Candidate &cand) {
+  HIP_CHECK(hipMemsetAsync(d_partial, 0, prob.partial_elems * sizeof(bf16_t),
+                           stream));
   HIP_CHECK(hipMemsetAsync(d_out, 0, prob.output_elems * sizeof(float),
                            stream));
   HIP_CHECK(hipStreamSynchronize(stream));
 
   auto launch = [&]() {
-    cand.launcher(d_out, d_gate_up, d_w, stride_w, d_bias, d_batches, d_slots,
-                  d_offsets, d_topk_v, l_layer, prob.E, prob.IM, prob.H,
-                  prob.B, d_pos, prob.max_assign, stream);
+    cand.launcher(d_partial, d_gate_up, d_w, stride_w, d_bias, d_batches,
+                  d_slots, d_offsets, d_topk_v, l_layer, prob.E, prob.IM,
+                  prob.H, prob.B, d_pos, prob.max_assign, stream);
   };
 
   float ms = benchmark_kernel(launch, opts.warmup, opts.iters, stream);
+  {
+    dim3 blockReduce(BLOCK_SIZE, 1, 1);
+    dim3 gridReduce((prob.H + BLOCK_SIZE - 1) / BLOCK_SIZE, prob.B, 1);
+    reduce_mlp2_slots_kernel<<<gridReduce, blockReduce, 0, stream>>>(
+        d_out,
+        d_partial,
+        d_pos,
+        prob.K,
+        prob.B,
+        prob.H);
+  }
   HIP_CHECK(hipStreamSynchronize(stream));
 
   RunResult out;
@@ -1464,7 +1480,9 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
                    IM,
                    assigns.max_count,
                    total_assign,
+                   K,
                    (size_t)B * H,
+                   (size_t)K * (size_t)B * (size_t)H,
                    2.0 * static_cast<double>(IM) * static_cast<double>(H) *
                        static_cast<double>(total_assign)};
 
@@ -1489,6 +1507,7 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
   std::vector<int> h_pos(B, 0);
 
   float *d_out = nullptr;
+  bf16_t *d_partial = nullptr;
   bf16_t *d_gate = nullptr, *d_w = nullptr, *d_bias = nullptr;
   float *d_topk = nullptr;
   uint16_t *d_batches = nullptr;
@@ -1496,6 +1515,7 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
   int *d_offsets = nullptr;
   int *d_pos = nullptr;
 
+  HIP_CHECK(hipMalloc(&d_partial, prob.partial_elems * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_out, prob.output_elems * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_gate, h_gate.size() * sizeof(bf16_t)));
   HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(bf16_t)));
@@ -1527,10 +1547,10 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
                       hipMemcpyHostToDevice));
 
   MLP2Candidate baseline = make_mlp2_candidate_default();
-  RunResult base_run = run_mlp2_variant(prob, d_out, d_gate, d_w, stride,
-                                        d_bias, d_batches, d_slots, d_offsets,
-                                        d_topk, 0, d_pos, stream, opts,
-                                        baseline);
+  RunResult base_run = run_mlp2_variant(prob, d_partial, d_out, d_gate, d_w,
+                                        stride, d_bias, d_batches, d_slots,
+                                        d_offsets, d_topk, 0, d_pos, stream,
+                                        opts, baseline);
 
   std::cout << "baseline (" << baseline.label << "): " << base_run.ms
             << " ms | " << base_run.tflops << " TFLOPS\n";
@@ -1538,9 +1558,10 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
   static const auto candidates = build_mlp2_candidates();
 
   for (const auto &cand : candidates) {
-    RunResult trial = run_mlp2_variant(prob, d_out, d_gate, d_w, stride, d_bias,
-                                       d_batches, d_slots, d_offsets, d_topk, 0,
-                                       d_pos, stream, opts, cand);
+    RunResult trial = run_mlp2_variant(prob, d_partial, d_out, d_gate, d_w,
+                                       stride, d_bias, d_batches, d_slots,
+                                       d_offsets, d_topk, 0, d_pos, stream,
+                                       opts, cand);
     ErrStats err = compare_vectors(trial.output, base_run.output);
     const bool ok = accuracy_ok(err, 1e-1, 1e-2, 1e-2);
     const double speedup = trial.ms > 0.0 ? base_run.ms / trial.ms : 0.0;
@@ -1563,6 +1584,7 @@ static void tune_mlp2(const BenchmarkSetting &setting, const TimingOptions &opts
 
   HIP_CHECK(hipFree(d_out));
   HIP_CHECK(hipFree(d_gate));
+  HIP_CHECK(hipFree(d_partial));
   HIP_CHECK(hipFree(d_w));
   HIP_CHECK(hipFree(d_bias));
   HIP_CHECK(hipFree(d_topk));

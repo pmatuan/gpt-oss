@@ -746,12 +746,14 @@ mlp1_kernel_body<
 
 // ============ MLP2 (weighted accum) : batched per expert ==============
 
-template <
+// Non-atomic version: writes to [K,B,H] intermediate buffer
+template<
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
   int WARP_TILE_M, int WARP_TILE_N, int WAVES_PER_BLOCK
 >
-__device__ __forceinline__ void mlp2_kernel_body(
-    float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
+__device__ __forceinline__ void mlp2_kernel_body_noatomic(
+    bf16_t *__restrict__ mlp2_partial,  // [K, B, H] intermediate buffer
+    const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const bf16_t *__restrict__ b_mlp2_all,
     const uint16_t *__restrict__ assignment_batches,
@@ -802,6 +804,7 @@ __device__ __forceinline__ void mlp2_kernel_body(
   __shared__ int sh_batch[BLOCK_ROWS];
   __shared__ float sh_weight[BLOCK_ROWS];
   __shared__ uint8_t sh_valid[BLOCK_ROWS];
+  __shared__ uint8_t sh_slot[BLOCK_ROWS];
   __shared__ size_t sh_gate_offset[BLOCK_ROWS];
   __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
   __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
@@ -812,11 +815,12 @@ __device__ __forceinline__ void mlp2_kernel_body(
     int batch = -1;
     float weight = 0.0f;
     uint8_t valid = 0;
+    uint8_t slot = 0;
     size_t gate_offset = 0;
     if (idx < tile_rows) {
       const int assignment_idx = start + block_m + idx;
       batch = static_cast<int>(assignment_batches[assignment_idx]);
-      const int slot = static_cast<int>(assignment_slots[assignment_idx]);
+      slot = assignment_slots[assignment_idx];
       if (batch >= 0 && slot >= 0) {
         const bool pos_ok = (!pos) || (pos[batch] >= 0);
         if (pos_ok) {
@@ -831,6 +835,7 @@ __device__ __forceinline__ void mlp2_kernel_body(
     sh_batch[idx] = batch;
     sh_weight[idx] = weight;
     sh_valid[idx] = valid;
+    sh_slot[idx] = slot;
     sh_gate_offset[idx] = gate_offset;
   }
   __syncthreads();
@@ -931,6 +936,7 @@ __device__ __forceinline__ void mlp2_kernel_body(
     __syncthreads();
   }
 
+  // Write to intermediate buffer [K, B, H] without atomics
 #pragma unroll
   for (int wm = 0; wm < SUB_TILES_M; ++wm) {
     const int row_block = wave_m * WARP_TILE_M + wm * 16;
@@ -953,16 +959,22 @@ __device__ __forceinline__ void mlp2_kernel_body(
 
         const int batch = sh_batch[row];
         const float weight = sh_weight[row];
-        if (batch < 0 || weight == 0.0f) continue;
+        const int slot = static_cast<int>(sh_slot[row]);
+        if (batch < 0 || weight == 0.0f || slot < 0) continue;
 
         const float value = (vec[i] + bias_val) * weight;
-        atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)col, value);
+        const size_t offset = (size_t)slot * (size_t)batch_size * (size_t)H +
+                             (size_t)batch * (size_t)H + (size_t)col;
+        mlp2_partial[offset] = bf16_t(value);
       }
     }
   }
 }
-__global__ void mlp2_kernel(
-    float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
+
+// Non-atomic wrapper kernel
+__global__ void mlp2_kernel_noatomic(
+    bf16_t *__restrict__ mlp2_partial,  // [K, B, H]
+    const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const bf16_t *__restrict__ b_mlp2_all,
     const uint16_t *__restrict__ assignment_batches,
@@ -970,29 +982,31 @@ __global__ void mlp2_kernel(
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size,
     const int *__restrict__ pos) {
-  mlp2_kernel_body<
+  mlp2_kernel_body_noatomic<
       MATMUL_MLP2_BLOCK_ROWS, MATMUL_MLP2_BLOCK_COLS, MATMUL_MLP2_BLOCK_DEPTH,
       MATMUL_MLP2_WARP_TILE_M, MATMUL_MLP2_WARP_TILE_N,
       MATMUL_MLP2_WAVES_PER_BLOCK>(
-      e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
+      mlp2_partial, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
       assignment_batches, assignment_slots, expert_offsets, topk_v,
       l_layer, E, IM, H, batch_size, pos);
 }
 
 __global__ void mlp2_120b_kernel(
-  float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
-  const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
-  const bf16_t *__restrict__ b_mlp2_all,
-  const uint16_t *__restrict__ assignment_batches,
-  const uint8_t *__restrict__ assignment_slots,
-  const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
-  int l_layer, int E, int IM, int H, int batch_size,
-  const int *__restrict__ pos) {
-mlp2_kernel_body<
-    MATMUL_MLP2_BLOCK_ROWS_120B, MATMUL_MLP2_BLOCK_COLS_120B, MATMUL_MLP2_BLOCK_DEPTH_120B,
-    MATMUL_MLP2_WARP_TILE_M_120B, MATMUL_MLP2_WARP_TILE_N_120B,
-    MATMUL_MLP2_WAVES_PER_BLOCK_120B>(
-    e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
-    assignment_batches, assignment_slots, expert_offsets, topk_v,
-    l_layer, E, IM, H, batch_size, pos);
+    bf16_t *__restrict__ mlp2_partial,
+    const bf16_t *__restrict__ gate_up_topk,
+    const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
+    const bf16_t *__restrict__ b_mlp2_all,
+    const uint16_t *__restrict__ assignment_batches,
+    const uint8_t *__restrict__ assignment_slots,
+    const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
+    int l_layer, int E, int IM, int H, int batch_size,
+    const int *__restrict__ pos) {
+  mlp2_kernel_body_noatomic<
+      MATMUL_MLP2_BLOCK_ROWS_120B, MATMUL_MLP2_BLOCK_COLS_120B,
+      MATMUL_MLP2_BLOCK_DEPTH_120B,
+      MATMUL_MLP2_WARP_TILE_M_120B, MATMUL_MLP2_WARP_TILE_N_120B,
+      MATMUL_MLP2_WAVES_PER_BLOCK_120B>(
+      mlp2_partial, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
+      assignment_batches, assignment_slots, expert_offsets, topk_v,
+      l_layer, E, IM, H, batch_size, pos);
 }
