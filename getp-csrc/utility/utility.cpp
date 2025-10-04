@@ -697,6 +697,34 @@ __global__ void accumulate_partials_bf16_kernel(
   }
 }
 
+// Reduce K slots from [K, B, H] to [B, H] without atomics
+__global__ void reduce_mlp2_slots_kernel(
+    float* __restrict__ dest,        // [B, H]
+    const bf16_t* __restrict__ src,  // [K, B, H]
+    const int* __restrict__ pos,     // [B] or nullptr
+    int K,
+    int B,
+    int H) {
+  const int b = blockIdx.y;
+  if (b >= B) return;
+  if (pos && pos[b] < 0) return;
+
+  float* __restrict__ dst_row = dest + (size_t)b * (size_t)H;
+
+  const int thread_linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_threads = blockDim.x * gridDim.x;
+
+  for (int h = thread_linear_idx; h < H; h += total_threads) {
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      const size_t offset = (size_t)k * (size_t)B * (size_t)H +
+                           (size_t)b * (size_t)H + (size_t)h;
+      sum += bf16_to_float_scalar(src[offset]);
+    }
+    dst_row[h] += sum;
+  }
+}
+
 __global__ void zero_partial_rows_kernel(
     float* __restrict__ dst,
     int H,

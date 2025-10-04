@@ -108,6 +108,8 @@ struct GPUActivationBuffers {
   float *d_e_agg;
   bf16_t *d_gate_up_workspace; // Pre-allocated workspace for MLP
   size_t gate_up_workspace_bytes;
+  bf16_t *d_mlp2_partial_bf16; // [K, B, H] intermediate buffer for MLP2 (no atomic)
+  size_t mlp2_partial_bytes;
   bf16_t *d_qkv;
   bf16_t *d_key_cache, *d_value_cache;
   int kv_seq_capacity;

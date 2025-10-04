@@ -86,6 +86,14 @@ __global__ void accumulate_partials_bf16_kernel(
     int H,
     int cnt);
 
+__global__ void reduce_mlp2_slots_kernel(
+    float* __restrict__ dest,
+    const bf16_t* __restrict__ src,
+    const int* __restrict__ pos,
+    int K,
+    int B,
+    int H);
+
 __global__ void zero_partial_rows_kernel(
     float* __restrict__ dst,
     int H,

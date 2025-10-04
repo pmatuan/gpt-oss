@@ -56,6 +56,18 @@ mlp1_120b_kernel(bf16_t *__restrict__ gate_up_topk,     // [K, B, IM]
                  const int *pos);
 
 __global__ void
+mlp2_kernel_noatomic(bf16_t *__restrict__ mlp2_partial,  // [K, B, H]
+                     const bf16_t *__restrict__ gate_up_topk,
+                     const bf16_t *__restrict__ w_mlp2_all,
+                     size_t stride_w_mlp2,
+                     const bf16_t *__restrict__ b_mlp2_all,
+                     const uint16_t *__restrict__ assignment_batches,
+                     const uint8_t *__restrict__ assignment_slots,
+                     const int *__restrict__ expert_offsets,
+                     const float *__restrict__ topk_v, int l_layer, int E,
+                     int IM, int H, int batch_size, const int *pos);
+
+__global__ void
 mlp2_kernel(float *__restrict__ e_agg,               // [B, H]
             const bf16_t *__restrict__ gate_up_topk, // [K, B, IM]
             const bf16_t *__restrict__ w_mlp2_all,   // [L, E, H, IM]

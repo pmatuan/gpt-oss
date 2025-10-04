@@ -342,6 +342,10 @@ static void init_device_context_ep(DeviceContext &ctx, int device_id,
     ctx.gpu_activations.gate_up_workspace_bytes = 0;
   }
 
+  // EP path doesn't need MLP2 intermediate buffer (uses partials per owner)
+  ctx.gpu_activations.d_mlp2_partial_bf16 = nullptr;
+  ctx.gpu_activations.mlp2_partial_bytes = 0;
+
   HIP_CHECK(hipMalloc(&ctx.gpu_activations.d_qkv,
                       (size_t)B * (D * (Hq + 2 * Hk)) * sizeof(bf16_t)));
 
