@@ -258,7 +258,6 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
   constexpr int WAVES_N = BLOCK_COLS / WARP_TILE_N;
   constexpr int WAVES   = WAVES_M * WAVES_N;
   constexpr int K_QUADS = BLOCK_DEPTH / MATMUL_CHUNK_K;
-  static_assert(BLOCK_DEPTH % 16 == 0, "BLOCK_DEPTH must be multiple of 16");
 
   const int block_m = blockIdx.y * BLOCK_ROWS;
   const int block_n = blockIdx.x * BLOCK_COLS;
@@ -281,8 +280,7 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
   const int tid_lin = wave * WF_SIZE + lane;
   const int wg_size = blockDim.y * WF_SIZE;
 
-  // Single LDS buffers + PAD=1
-  constexpr int LDS_STRIDE = K_QUADS + 1;
+  constexpr int LDS_STRIDE = K_QUADS + 3;
   __shared__ __align__(16) s16x4 shA[BLOCK_ROWS * LDS_STRIDE];
   __shared__ __align__(16) s16x4 shB[BLOCK_COLS * LDS_STRIDE];
 
