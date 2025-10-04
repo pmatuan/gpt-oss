@@ -3,6 +3,9 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <condition_variable>
+#include <mutex>
+#include <memory>
 #include <stdint.h>
 #include <string>
 #include <stdlib.h>
@@ -204,6 +207,39 @@ struct OwnerPartialBuffers {
   bf16_t **mlp2_partial_owner_per_home = nullptr; // [ndev] -> [K, B_local, H]
 };
 
+struct OwnerAggregateBuffers {
+  bf16_t *recv_x_all = nullptr;
+  int *recv_pos_all = nullptr;
+  float *recv_topk_v_all = nullptr;
+  uint16_t *assignment_batches_all = nullptr;
+  uint8_t *assignment_slots_all = nullptr;
+  int *expert_offsets_all = nullptr;
+  bf16_t *gate_up_all = nullptr;
+  bf16_t *mlp2_partial_all = nullptr;
+  float *partial_fp32_all = nullptr;
+  bf16_t *partial_bf16_all = nullptr;
+};
+
+struct OwnerLayerAggregator {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool collecting = false;
+  bool ready_for_mlp = false;
+  bool mlp_running = false;
+  bool mlp_done = false;
+  int epoch = 0;
+  int homes_arrived = 0;
+  int homes_copied = 0;
+  int total_B = 0;
+  int total_assign = 0;
+  int offset_stride = 0;
+  std::vector<int> B_offsets;
+  std::vector<int> assign_offsets;
+  std::vector<int> B_counts;
+  std::vector<int> assign_counts;
+  std::vector<int> expert_offsets_flat;
+};
+
 struct DeviceContext {
   int device_id;
   int E_local = 0; // number of local experts owned by this device (per layer)
@@ -244,6 +280,8 @@ struct DeviceContext {
   OwnerReceiveBuffers owner_receive_buffers;
   // Owner-side partials per home and home-side recv partials
   OwnerPartialBuffers partial_buffers;
+  OwnerAggregateBuffers aggregate_buffers;
+  std::vector<std::unique_ptr<OwnerLayerAggregator>> owner_layer_aggregators;
 };
 
 // Prompt Context Structure
