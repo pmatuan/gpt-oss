@@ -3,6 +3,26 @@
 #include "matmul.h"
 #include <math.h>
 
+__device__ __forceinline__ void load_bf16x8_aligned(
+    const uint16_t *src,
+    s16x4 &out0,
+    s16x4 &out1) {
+  const uint4 packed = *reinterpret_cast<const uint4 *>(
+      __builtin_assume_aligned(src, 16));
+  const uint32_t p0 = packed.x;
+  const uint32_t p1 = packed.y;
+  const uint32_t p2 = packed.z;
+  const uint32_t p3 = packed.w;
+  out0[0] = static_cast<short>(p0 & 0xFFFF);
+  out0[1] = static_cast<short>(p0 >> 16);
+  out0[2] = static_cast<short>(p1 & 0xFFFF);
+  out0[3] = static_cast<short>(p1 >> 16);
+  out1[0] = static_cast<short>(p2 & 0xFFFF);
+  out1[1] = static_cast<short>(p2 >> 16);
+  out1[2] = static_cast<short>(p3 & 0xFFFF);
+  out1[3] = static_cast<short>(p3 >> 16);
+}
+
 template <
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
   int WARP_TILE_M, int WARP_TILE_N
@@ -76,23 +96,66 @@ __device__ __forceinline__ void matmul_bias_bf16_mfma_body(
   for (int tile_idx = 0; tile_idx < total_tiles_k; ++tile_idx) {
     const int k_base = tile_idx * BLOCK_DEPTH;
 
-    const int total_a_quads = BLOCK_ROWS * K_QUADS;
-    for (int linear = tid_linear; linear < total_a_quads; linear += threads_per_block) {
-      const int row  = linear / K_QUADS;
-      const int quad = linear - row * K_QUADS;
-      const int global_row = block_m + row;
-      const int k   = k_base + quad * MATMUL_CHUNK_K;
-      const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
-                                                    : (remaining > 0 ? remaining : 0);
-      const bool row_in_range = (global_row < B);
-      const bool row_active = row_in_range && (!has_pos || pos[global_row] >= 0);
-      s16x4 val = {0,0,0,0};
-      if (row_active && valid > 0) {
-        const uint16_t *src = x_u16 + (size_t)global_row * (size_t)n + (size_t)k;
-        val = load_bf16x4(src, valid);
+    const int pairs_per_row = K_QUADS / 2;
+    const int total_a_pairs = BLOCK_ROWS * pairs_per_row;
+    if (pairs_per_row > 0) {
+      for (int linear = tid_linear; linear < total_a_pairs; linear += threads_per_block) {
+        const int row  = linear / pairs_per_row;
+        const int pair = linear - row * pairs_per_row;
+        const int quad0 = pair * 2;
+        const int quad1 = quad0 + 1;
+        const int global_row = block_m + row;
+        const bool row_in_range = (global_row < B);
+        const bool row_active = row_in_range && (!has_pos || pos[global_row] >= 0);
+        s16x4 val0 = {0,0,0,0};
+        s16x4 val1 = {0,0,0,0};
+        if (row_active) {
+          const size_t row_offset = (size_t)global_row * (size_t)n;
+          const int k0 = k_base + quad0 * MATMUL_CHUNK_K;
+          const int k1 = k0 + MATMUL_CHUNK_K;
+          const int remaining0 = n - k0;
+          const int remaining1 = n - k1;
+          const int valid0 = remaining0 >= MATMUL_CHUNK_K
+                                 ? MATMUL_CHUNK_K
+                                 : (remaining0 > 0 ? remaining0 : 0);
+          const int valid1 = remaining1 >= MATMUL_CHUNK_K
+                                 ? MATMUL_CHUNK_K
+                                 : (remaining1 > 0 ? remaining1 : 0);
+          const size_t elem_base = row_offset + (size_t)k0;
+          const uint16_t *src0 = x_u16 + elem_base;
+          if (valid0 == MATMUL_CHUNK_K && valid1 == MATMUL_CHUNK_K && ((elem_base & 7) == 0)) {
+            load_bf16x8_aligned(src0, val0, val1);
+          } else {
+            val0 = load_bf16x4(src0, valid0);
+            val1 = load_bf16x4(src0 + MATMUL_CHUNK_K, valid1);
+          }
+        }
+        sh_A[row * LDS_STRIDE + quad0] = val0;
+        sh_A[row * LDS_STRIDE + quad1] = val1;
       }
-      sh_A[row * LDS_STRIDE + quad] = val;
+    }
+
+    if (K_QUADS & 1) {
+      const int quad = K_QUADS - 1;
+      for (int row_linear = tid_linear; row_linear < BLOCK_ROWS; row_linear += threads_per_block) {
+        const int row = row_linear;
+        const int global_row = block_m + row;
+        const bool row_in_range = (global_row < B);
+        const bool row_active = row_in_range && (!has_pos || pos[global_row] >= 0);
+        s16x4 val = {0,0,0,0};
+        if (row_active) {
+          const int k   = k_base + quad * MATMUL_CHUNK_K;
+          const int remaining = n - k;
+          const int valid = remaining >= MATMUL_CHUNK_K
+                                 ? MATMUL_CHUNK_K
+                                 : (remaining > 0 ? remaining : 0);
+          if (valid > 0) {
+            const uint16_t *src = x_u16 + (size_t)global_row * (size_t)n + (size_t)k;
+            val = load_bf16x4(src, valid);
+          }
+        }
+        sh_A[row * LDS_STRIDE + quad] = val;
+      }
     }
 
     const int total_b_quads = BLOCK_COLS * K_QUADS;
@@ -288,19 +351,63 @@ __device__ __forceinline__ void matmul_bf16_mfma_body(
                             : (remaining > 0 ? remaining : 0);
     }
 
-    const int total_a_quads = BLOCK_ROWS * K_QUADS;
-    for (int linear = tid_linear; linear < total_a_quads; linear += threads_per_block) {
-      const int row  = linear / K_QUADS;
-      const int quad = linear - row * K_QUADS;
-      const int valid = valid_lut[quad];
-      const bool row_active = sh_row_active[row];
-      s16x4 val = {0,0,0,0};
-      if (row_active && valid > 0) {
-        const size_t row_offset = sh_row_offsets[row];
-        const uint16_t *src = x_u16 + row_offset + (size_t)k_lut[quad];
-        val = load_bf16x4(src, valid);
+    const int pairs_per_row = K_QUADS / 2;
+    const int total_a_pairs = BLOCK_ROWS * pairs_per_row;
+    if (pairs_per_row > 0) {
+      for (int linear = tid_linear; linear < total_a_pairs; linear += threads_per_block) {
+        const int row  = linear / pairs_per_row;
+        const int pair = linear - row * pairs_per_row;
+        const int quad0 = pair * 2;
+        const int quad1 = quad0 + 1;
+        const bool row_active = sh_row_active[row];
+        s16x4 val0 = {0,0,0,0};
+        s16x4 val1 = {0,0,0,0};
+        if (row_active) {
+          const size_t row_offset = sh_row_offsets[row];
+          const int valid0 = valid_lut[quad0];
+          const int valid1 = valid_lut[quad1];
+          if (valid0 == MATMUL_CHUNK_K && valid1 == MATMUL_CHUNK_K) {
+            const size_t elem_base = row_offset + (size_t)k_lut[quad0];
+            if ((elem_base & 7) == 0) {
+              const uint16_t *src0 = x_u16 + elem_base;
+              load_bf16x8_aligned(src0, val0, val1);
+            } else {
+              const uint16_t *src0 = x_u16 + elem_base;
+              val0 = load_bf16x4(src0, valid0);
+              val1 = load_bf16x4(src0 + MATMUL_CHUNK_K, valid1);
+            }
+          } else {
+            if (valid0 > 0) {
+              const uint16_t *src0 = x_u16 + row_offset + (size_t)k_lut[quad0];
+              val0 = load_bf16x4(src0, valid0);
+            }
+            if (valid1 > 0) {
+              const uint16_t *src1 = x_u16 + row_offset + (size_t)k_lut[quad1];
+              val1 = load_bf16x4(src1, valid1);
+            }
+          }
+        }
+        sh_A[row * LDS_STRIDE + quad0] = val0;
+        sh_A[row * LDS_STRIDE + quad1] = val1;
       }
-      sh_A[row * LDS_STRIDE + quad] = val;
+    }
+
+    if (K_QUADS & 1) {
+      const int quad = K_QUADS - 1;
+      for (int row_linear = tid_linear; row_linear < BLOCK_ROWS; row_linear += threads_per_block) {
+        const int row = row_linear;
+        const bool row_active = sh_row_active[row];
+        s16x4 val = {0,0,0,0};
+        if (row_active) {
+          const int valid = valid_lut[quad];
+          if (valid > 0) {
+            const size_t row_offset = sh_row_offsets[row];
+            const uint16_t *src = x_u16 + row_offset + (size_t)k_lut[quad];
+            val = load_bf16x4(src, valid);
+          }
+        }
+        sh_A[row * LDS_STRIDE + quad] = val;
+      }
     }
 
     const int total_b_quads = BLOCK_COLS * K_QUADS;

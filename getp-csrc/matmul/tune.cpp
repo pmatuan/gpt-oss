@@ -1611,8 +1611,8 @@ int main(int argc, char **argv) {
     tune_matmul_qkv(setting, opts, stream);
     tune_matmul_att(setting, opts, stream);
     tune_matmul_logits(setting, opts, stream);
-    tune_mlp1(setting, opts, stream);
-    tune_mlp2(setting, opts, stream);
+    // tune_mlp1(setting, opts, stream);
+    // tune_mlp2(setting, opts, stream);
   }
 
   return 0;
