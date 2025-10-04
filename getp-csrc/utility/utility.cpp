@@ -872,7 +872,6 @@ __global__ void fused_route_owner_kernel(
     if (pos[b] < 0) continue;
 
     bool has_local_assignment = false;
-    #pragma unroll
     for (int k = 0; k < K; ++k) {
       const int e = topk_i[(size_t)b * (size_t)K + k];
       if ((unsigned)e >= (unsigned)E) continue;
