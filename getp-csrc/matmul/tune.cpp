@@ -364,7 +364,7 @@ template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
 __global__ void matmul_bias_qkv_kernel_variant(
     bf16_t *y, const bf16_t *x, const bf16_t *w, const bf16_t *bias, int n,
     int d, int B, const int *pos) {
-  matmul_bias_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
+    matmul_bias_qkv_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                              WARP_TILE_N>(y, x, w, bias, n, d, B, pos);
 }
 
@@ -438,7 +438,7 @@ template <int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH, int WARP_TILE_M,
 __global__ void matmul_bias_att_kernel_variant(
     bf16_t *y, const bf16_t *x, const bf16_t *w, const bf16_t *bias, int n,
     int d, int B, const int *pos) {
-  matmul_bias_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
+    matmul_bias_att_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                              WARP_TILE_N>(y, x, w, bias, n, d, B, pos);
 }
 
@@ -506,7 +506,7 @@ __global__ void matmul_logits_kernel_variant(float *y,
                                                      const bf16_t *w, int n,
                                                      int d, int B,
                                                      const int *pos) {
-  matmul_bf16_mfma_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
+  matmul_logits_body<BLOCK_ROWS, BLOCK_COLS, BLOCK_DEPTH, WARP_TILE_M,
                         WARP_TILE_N>(y, x, w, n, d, B, pos);
 }
 
