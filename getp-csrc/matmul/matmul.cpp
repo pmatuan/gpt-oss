@@ -70,8 +70,8 @@ __device__ __forceinline__ void matmul_bias_qkv_body(
   const int k_group         = lane_group * MATMUL_CHUNK_K;
   const int row_lane_offset = lane_group * 4;
 
-  __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
-  __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_x[BLOCK_ROWS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_w[BLOCK_COLS * LDS_STRIDE];
 
   f32x4 acc[SUB_TILES_M * SUB_TILES_N];
 #pragma unroll
@@ -97,9 +97,9 @@ __device__ __forceinline__ void matmul_bias_qkv_body(
     const int k_base = tile_idx * BLOCK_DEPTH;
 
     const int pairs_per_row = K_QUADS / 2;
-    const int total_a_pairs = BLOCK_ROWS * pairs_per_row;
+    const int total_x_pairs = BLOCK_ROWS * pairs_per_row;
     if (pairs_per_row > 0) {
-      for (int linear = tid_linear; linear < total_a_pairs; linear += threads_per_block) {
+      for (int linear = tid_linear; linear < total_x_pairs; linear += threads_per_block) {
         const int row  = linear / pairs_per_row;
         const int pair = linear - row * pairs_per_row;
         const int quad0 = pair * 2;
@@ -130,8 +130,8 @@ __device__ __forceinline__ void matmul_bias_qkv_body(
             val1 = load_bf16x4(src0 + MATMUL_CHUNK_K, valid1);
           }
         }
-        sh_A[row * LDS_STRIDE + quad0] = val0;
-        sh_A[row * LDS_STRIDE + quad1] = val1;
+        sh_x[row * LDS_STRIDE + quad0] = val0;
+        sh_x[row * LDS_STRIDE + quad1] = val1;
       }
     }
 
@@ -154,12 +154,12 @@ __device__ __forceinline__ void matmul_bias_qkv_body(
             val = load_bf16x4(src, valid);
           }
         }
-        sh_A[row * LDS_STRIDE + quad] = val;
+        sh_x[row * LDS_STRIDE + quad] = val;
       }
     }
 
-    const int total_b_quads = BLOCK_COLS * K_QUADS;
-    for (int linear = tid_linear; linear < total_b_quads; linear += threads_per_block) {
+    const int total_w_quads = BLOCK_COLS * K_QUADS;
+    for (int linear = tid_linear; linear < total_w_quads; linear += threads_per_block) {
       const int col  = linear / K_QUADS;           // 0..BLOCK_COLS-1 trong block
       const int quad = linear - col * K_QUADS;     // 0..K_QUADS-1
       const int global_col = block_n + col;        // cột thật trong d
@@ -189,7 +189,7 @@ __device__ __forceinline__ void matmul_bias_qkv_body(
 
         val = load_bf16x4(src_u16, valid);
       }
-      sh_B[col * LDS_STRIDE + quad] = val;
+      sh_w[col * LDS_STRIDE + quad] = val;
     }
 
     __syncthreads();
@@ -201,15 +201,15 @@ __device__ __forceinline__ void matmul_bias_qkv_body(
       const int quad_idx = (k_group + kk) >> 2;
 #pragma unroll
       for (int wm = 0; wm < SUB_TILES_M; ++wm) {
-        const int a_row = wave_row_base + wm * 16;
-        const s16x4 avec = sh_A[a_row * LDS_STRIDE + quad_idx];
+        const int x_row = wave_row_base + wm * 16;
+        const s16x4 xvec = sh_x[x_row * LDS_STRIDE + quad_idx];
 #pragma unroll
         for (int wn = 0; wn < SUB_TILES_N; ++wn) {
-          const int b_col = wave_col_base + wn * 16;
+          const int w_col = wave_col_base + wn * 16;
           const int acc_idx = wm * SUB_TILES_N + wn;
-          const s16x4 bvec = sh_B[b_col * LDS_STRIDE + quad_idx];
+          const s16x4 wvec = sh_w[w_col * LDS_STRIDE + quad_idx];
           acc[acc_idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[acc_idx], 0,0,0);
+              xvec, wvec, acc[acc_idx], 0,0,0);
         }
       }
     }
@@ -285,8 +285,8 @@ __device__ __forceinline__ void matmul_bias_att_body(
   const int tid_lin = wave * WF_SIZE + lane;
   const int wg_size = blockDim.y * WF_SIZE;
 
-  __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
-  __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_x[BLOCK_ROWS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_w[BLOCK_COLS * LDS_STRIDE];
   __shared__ uint8_t  sh_row_act[BLOCK_ROWS];
   __shared__ uint32_t sh_row_off[BLOCK_ROWS];
   __shared__ uint8_t  sh_col_act[BLOCK_COLS];
@@ -346,7 +346,7 @@ __device__ __forceinline__ void matmul_bias_att_body(
     }
   }
 
-  auto load_tileA_to_lds = [&](int k0) {
+  auto load_tileX_to_lds = [&](int k0) {
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
     for (int idx = tid_lin; idx < num_vec; idx += wg_size) {
@@ -357,12 +357,12 @@ __device__ __forceinline__ void matmul_bias_att_body(
       s16x4 v0 = {0,0,0,0}, v1 = {0,0,0,0};
       if (row_active(r)) {
         const uint32_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0);
-        const int L1  = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0);
+        const int L1  = vlen(kX1);
         if (L0 == MATMUL_CHUNK_K && L1 == MATMUL_CHUNK_K) {
-          const size_t eb = (size_t)ro + (size_t)kA0;
+          const size_t eb = (size_t)ro + (size_t)kX0;
           const uint16_t* src0 = x_u16 + eb;
           if ((eb & 7) == 0) {
             load_bf16x8_aligned(src0, v0, v1);
@@ -371,12 +371,12 @@ __device__ __forceinline__ void matmul_bias_att_body(
             v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, MATMUL_CHUNK_K);
           }
         } else {
-          if (L0) v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA0, L0);
-          if (L1) v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA1, L1);
+          if (L0) v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX0, L0);
+          if (L1) v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX1, L1);
         }
       }
-      sh_A[r * LDS_STRIDE + q0] = v0;
-      sh_A[r * LDS_STRIDE + q1] = v1;
+      sh_x[r * LDS_STRIDE + q0] = v0;
+      sh_x[r * LDS_STRIDE + q1] = v1;
     }
     if (K_QUADS & 1) {
       const int q = K_QUADS - 1;
@@ -387,12 +387,12 @@ __device__ __forceinline__ void matmul_bias_att_body(
           const int L = vlen(kval);
           if (L) v = load_bf16x4(x_u16 + (size_t)row_off(r) + (size_t)kval, L);
         }
-        sh_A[r * LDS_STRIDE + q] = v;
+        sh_x[r * LDS_STRIDE + q] = v;
       }
     }
   };
 
-  auto load_tileB_to_lds = [&](int k0) {
+  auto load_tileW_to_lds = [&](int k0) {
     const int num_quads = BLOCK_COLS * K_QUADS;
     for (int idx = tid_lin; idx < num_quads; idx += wg_size) {
       const int c = idx / K_QUADS;
@@ -412,13 +412,13 @@ __device__ __forceinline__ void matmul_bias_att_body(
           v = load_bf16x4(src, L);
         }
       }
-      sh_B[c * LDS_STRIDE + q] = v;
+      sh_w[c * LDS_STRIDE + q] = v;
     }
   };
 
   struct RegPair { s16x4 v0, v1; bool valid; };
 
-  auto prefetchA_regs = [&](int k0)->RegPair {
+  auto prefetchX_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
@@ -428,13 +428,13 @@ __device__ __forceinline__ void matmul_bias_att_body(
       const int q0 = (p << 1), q1 = q0 + 1;
       if (row_active(r)) {
         const uint32_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0);
-        const int L1  = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0);
+        const int L1  = vlen(kX1);
         if (L0 | L1) {
           if (L0 == MATMUL_CHUNK_K && L1 == MATMUL_CHUNK_K) {
-            const size_t eb = (size_t)ro + (size_t)kA0;
+            const size_t eb = (size_t)ro + (size_t)kX0;
             const uint16_t* src0 = x_u16 + eb;
             if ((eb & 7) == 0) {
               load_bf16x8_aligned(src0, R.v0, R.v1);
@@ -443,8 +443,8 @@ __device__ __forceinline__ void matmul_bias_att_body(
               R.v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, MATMUL_CHUNK_K);
             }
           } else {
-            if (L0) R.v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA0, L0);
-            if (L1) R.v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA1, L1);
+            if (L0) R.v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX0, L0);
+            if (L1) R.v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX1, L1);
           }
           R.valid = true;
         }
@@ -453,7 +453,7 @@ __device__ __forceinline__ void matmul_bias_att_body(
     return R;
   };
 
-  auto prefetchB_regs = [&](int k0)->RegPair {
+  auto prefetchW_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_col = K_QUADS >> 1;
     const int num_vec = BLOCK_COLS * pairs_per_col;
@@ -492,37 +492,37 @@ __device__ __forceinline__ void matmul_bias_att_body(
     return R;
   };
 
-  auto storeA_regs_to_lds = [&](RegPair R) {
+  auto storeX_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_row = K_QUADS >> 1;
     const int r  = tid_lin / pairs_per_row;
     const int p  = tid_lin - r * pairs_per_row;
     const int q0 = (p << 1), q1 = q0 + 1;
-    sh_A[r * LDS_STRIDE + q0] = R.v0;
-    sh_A[r * LDS_STRIDE + q1] = R.v1;
+    sh_x[r * LDS_STRIDE + q0] = R.v0;
+    sh_x[r * LDS_STRIDE + q1] = R.v1;
   };
-  auto storeB_regs_to_lds = [&](RegPair R) {
+  auto storeW_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_col = K_QUADS >> 1;
     const int c  = tid_lin / pairs_per_col;
     const int p  = tid_lin - c * pairs_per_col;
     const int q0 = (p << 1), q1 = q0 + 1;
-    sh_B[c * LDS_STRIDE + q0] = R.v0;
-    sh_B[c * LDS_STRIDE + q1] = R.v1;
+    sh_w[c * LDS_STRIDE + q0] = R.v0;
+    sh_w[c * LDS_STRIDE + q1] = R.v1;
   };
 
-  load_tileA_to_lds(0);
-  load_tileB_to_lds(0);
+  load_tileX_to_lds(0);
+  load_tileW_to_lds(0);
   __syncthreads();
 
   for (int t = 0; t < tilesK; ++t) {
-    RegPair A_next{{0,0,0,0},{0,0,0,0}, false};
-    RegPair B_next{{0,0,0,0},{0,0,0,0}, false};
+    RegPair X_next{{0,0,0,0},{0,0,0,0}, false};
+    RegPair W_next{{0,0,0,0},{0,0,0,0}, false};
     const bool has_next = (t + 1) < tilesK;
     const int k_next = (t + 1) * BLOCK_DEPTH;
     if (has_next) {
-      A_next = prefetchA_regs(k_next);
-      B_next = prefetchB_regs(k_next);
+      X_next = prefetchX_regs(k_next);
+      W_next = prefetchW_regs(k_next);
     }
 
     const int wave_row_base = wave_m * WARP_TILE_M + lane16;
@@ -533,14 +533,14 @@ __device__ __forceinline__ void matmul_bias_att_body(
 #pragma unroll
       for (int wm = 0; wm < SUB_M; ++wm) {
         const int ar = wave_row_base + wm * 16;
-        const s16x4 avec = sh_A[ar * LDS_STRIDE + qidx];
+        const s16x4 xvec = sh_x[ar * LDS_STRIDE + qidx];
 #pragma unroll
         for (int wn = 0; wn < SUB_N; ++wn) {
           const int bc = wave_col_base + wn * 16;
           const int ai = wm * SUB_N + wn;
-          const s16x4 bvec = sh_B[bc * LDS_STRIDE + qidx];
+          const s16x4 wvec = sh_w[bc * LDS_STRIDE + qidx];
           acc[ai] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[ai], 0,0,0);
+              xvec, wvec, acc[ai], 0,0,0);
         }
       }
     }
@@ -548,8 +548,8 @@ __device__ __forceinline__ void matmul_bias_att_body(
     if (!has_next) break;
 
     __syncthreads();
-    storeA_regs_to_lds(A_next);
-    storeB_regs_to_lds(B_next);
+    storeX_regs_to_lds(X_next);
+    storeW_regs_to_lds(W_next);
     __syncthreads();
   }
 
@@ -617,8 +617,8 @@ __device__ __forceinline__ void matmul_logits_body(
   const int wg_size = blockDim.y * WF_SIZE;
 
   constexpr int LDS_STRIDE = K_QUADS + 3;
-  __shared__ __align__(16) s16x4 shA[BLOCK_ROWS * LDS_STRIDE];
-  __shared__ __align__(16) s16x4 shB[BLOCK_COLS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 shx[BLOCK_ROWS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 shw[BLOCK_COLS * LDS_STRIDE];
 
   // Hoist row/col act/offset (32-bit để tiết kiệm LDS)
   __shared__ uint8_t  sh_row_act[BLOCK_ROWS];
@@ -671,7 +671,7 @@ __device__ __forceinline__ void matmul_logits_body(
   };
 
   // CURRENT tile → LDS
-  auto load_tileA_to_lds = [&](int k0) {
+  auto load_tileX_to_lds = [&](int k0) {
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
     for (int idx = tid_lin; idx < num_vec; idx += wg_size) {
@@ -682,12 +682,12 @@ __device__ __forceinline__ void matmul_logits_body(
       s16x4 v0 = {0,0,0,0}, v1 = {0,0,0,0};
       if (row_active(r)) {
         const uint32_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0), L1 = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0), L1 = vlen(kX1);
 
         if (L0 == 4 && L1 == 4) {
-          const size_t eb = (size_t)ro + (size_t)kA0;
+          const size_t eb = (size_t)ro + (size_t)kX0;
           const uint16_t* src0 = x_u16 + eb;
           if (((eb & 7) == 0)) {
             load_bf16x8_aligned(src0, v0, v1);
@@ -696,12 +696,12 @@ __device__ __forceinline__ void matmul_logits_body(
             v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, 4);
           }
         } else {
-          if (L0) v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA0, L0);
-          if (L1) v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA1, L1);
+          if (L0) v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX0, L0);
+          if (L1) v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX1, L1);
         }
       }
-      shA[r * LDS_STRIDE + q0] = v0;
-      shA[r * LDS_STRIDE + q1] = v1;
+      shx[r * LDS_STRIDE + q0] = v0;
+      shx[r * LDS_STRIDE + q1] = v1;
     }
     if (K_QUADS & 1) {
       const int q = K_QUADS - 1;
@@ -712,12 +712,12 @@ __device__ __forceinline__ void matmul_logits_body(
           const int L    = vlen(kval);
           if (L) v = load_bf16x4(x_u16 + (size_t)row_off(r) + (size_t)kval, L);
         }
-        shA[r * LDS_STRIDE + q] = v;
+        shx[r * LDS_STRIDE + q] = v;
       }
     }
   };
 
-  auto load_tileB_to_lds = [&](int k0) {
+  auto load_tileW_to_lds = [&](int k0) {
     const int num_quads = BLOCK_COLS * K_QUADS;
     const int tile_k_glob = k0 / MATMUL_TILE_K;
     const uint32_t tile_k_base = (uint32_t)tile_k_glob * tile_elems;
@@ -737,13 +737,13 @@ __device__ __forceinline__ void matmul_logits_body(
           v = load_bf16x4(src, L);
         }
       }
-      shB[c * LDS_STRIDE + q] = v;
+      shw[c * LDS_STRIDE + q] = v;
     }
   };
 
   // NEXT tile prefetch → REG
   struct RegPair { s16x4 v0, v1; bool valid; };
-  auto prefetchA_regs = [&](int k0)->RegPair {
+  auto prefetchX_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
@@ -753,12 +753,12 @@ __device__ __forceinline__ void matmul_logits_body(
       const int q0 = (p << 1), q1 = q0 + 1;
       if (row_active(r)) {
         const uint32_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0), L1 = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0), L1 = vlen(kX1);
         if (L0|L1) {
           if (L0 == 4 && L1 == 4) {
-            const size_t eb = (size_t)ro + (size_t)kA0;
+            const size_t eb = (size_t)ro + (size_t)kX0;
             const uint16_t* src0 = x_u16 + eb;
             if (((eb & 7) == 0)) {
               load_bf16x8_aligned(src0, R.v0, R.v1);
@@ -767,8 +767,8 @@ __device__ __forceinline__ void matmul_logits_body(
               R.v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, 4);
             }
           } else {
-            if (L0) R.v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA0, L0);
-            if (L1) R.v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA1, L1);
+            if (L0) R.v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX0, L0);
+            if (L1) R.v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX1, L1);
           }
           R.valid = true;
         }
@@ -777,7 +777,7 @@ __device__ __forceinline__ void matmul_logits_body(
     return R;
   };
 
-  auto prefetchB_regs = [&](int k0)->RegPair {
+  auto prefetchW_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int num_vec = (BLOCK_COLS * K_QUADS) >> 1;
     if (tid_lin < num_vec) {
@@ -818,39 +818,39 @@ __device__ __forceinline__ void matmul_logits_body(
     return R;
   };
 
-  auto storeA_regs_to_lds = [&](RegPair R) {
+  auto storeX_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_row = K_QUADS >> 1;
     const int r  = tid_lin / pairs_per_row;
     const int p  = tid_lin - r * pairs_per_row;
     const int q0 = (p << 1), q1 = q0 + 1;
-    shA[r * LDS_STRIDE + q0] = R.v0;
-    shA[r * LDS_STRIDE + q1] = R.v1;
+    shx[r * LDS_STRIDE + q0] = R.v0;
+    shx[r * LDS_STRIDE + q1] = R.v1;
   };
-  auto storeB_regs_to_lds = [&](RegPair R) {
+  auto storeW_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_col = K_QUADS >> 1;
     const int c  = tid_lin / pairs_per_col;
     const int p  = tid_lin - c * pairs_per_col;
     const int q0 = (p << 1), q1 = q0 + 1;
-    shB[c * LDS_STRIDE + q0] = R.v0;
-    shB[c * LDS_STRIDE + q1] = R.v1;
+    shw[c * LDS_STRIDE + q0] = R.v0;
+    shw[c * LDS_STRIDE + q1] = R.v1;
   };
 
   // Prologue: tile 0 → LDS
-  load_tileA_to_lds(0);
-  load_tileB_to_lds(0);
+  load_tileX_to_lds(0);
+  load_tileW_to_lds(0);
   __syncthreads();
 
   // Main loop with register prefetch
   for (int t = 0; t < tilesK; ++t) {
-    RegPair A_next{{0,0,0,0},{0,0,0,0},false};
-    RegPair B_next{{0,0,0,0},{0,0,0,0},false};
+    RegPair X_next{{0,0,0,0},{0,0,0,0},false};
+    RegPair W_next{{0,0,0,0},{0,0,0,0},false};
     const int k_next = (t + 1) * BLOCK_DEPTH;
     const bool has_next = (t + 1) < tilesK;
     if (has_next) {
-      A_next = prefetchA_regs(k_next);
-      B_next = prefetchB_regs(k_next);
+      X_next = prefetchX_regs(k_next);
+      W_next = prefetchW_regs(k_next);
     }
 
     // compute on current
@@ -862,14 +862,14 @@ __device__ __forceinline__ void matmul_logits_body(
 #pragma unroll
       for (int wm = 0; wm < SUB_M; ++wm) {
         const int ar = wave_row_base + wm * 16;
-        const s16x4 avec = shA[ar * LDS_STRIDE + qidx];
+        const s16x4 xvec = shx[ar * LDS_STRIDE + qidx];
 #pragma unroll
         for (int wn = 0; wn < SUB_N; ++wn) {
           const int bc = wave_col_base + wn * 16;
           const int ai = wm * SUB_N + wn;
-          const s16x4 bvec = shB[bc * LDS_STRIDE + qidx];
+          const s16x4 wvec = shw[bc * LDS_STRIDE + qidx];
           acc[ai] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[ai], 0,0,0);
+              xvec, wvec, acc[ai], 0,0,0);
         }
       }
     }
@@ -877,8 +877,8 @@ __device__ __forceinline__ void matmul_logits_body(
     if (!has_next) break;
 
     __syncthreads();
-    storeA_regs_to_lds(A_next);
-    storeB_regs_to_lds(B_next);
+    storeX_regs_to_lds(X_next);
+    storeW_regs_to_lds(W_next);
     __syncthreads();
   }
 
@@ -1078,8 +1078,8 @@ __device__ __forceinline__ void mlp1_kernel_body(
   __shared__ uint32_t sh_row_off[BLOCK_ROWS];
   __shared__ uint8_t sh_col_act[BLOCK_COLS];
   __shared__ uint32_t sh_col_off[BLOCK_COLS];
-  __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
-  __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_x[BLOCK_ROWS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_w[BLOCK_COLS * LDS_STRIDE];
 
   const uint16_t *__restrict__ x_u16 = reinterpret_cast<const uint16_t *>(x);
   const int n = H;
@@ -1164,7 +1164,7 @@ __device__ __forceinline__ void mlp1_kernel_body(
 
   struct RegPair { s16x4 v0, v1; bool valid; };
 
-  auto load_tileA_to_lds = [&](int k0) {
+  auto load_tileX_to_lds = [&](int k0) {
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
     for (int idx = tid_linear; idx < num_vec; idx += threads_per_block) {
@@ -1177,12 +1177,12 @@ __device__ __forceinline__ void mlp1_kernel_body(
       s16x4 v1 = {0,0,0,0};
       if (row_active(r)) {
         const uint32_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0);
-        const int L1  = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0);
+        const int L1  = vlen(kX1);
         if (L0 == 4 && L1 == 4) {
-          const size_t base = (size_t)ro + (size_t)kA0;
+          const size_t base = (size_t)ro + (size_t)kX0;
           const uint16_t *src0 = x_u16 + base;
           if (((base & 7) == 0)) {
             load_bf16x8_aligned(src0, v0, v1);
@@ -1191,12 +1191,12 @@ __device__ __forceinline__ void mlp1_kernel_body(
             v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, 4);
           }
         } else {
-          if (L0) v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA0, L0);
-          if (L1) v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA1, L1);
+          if (L0) v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX0, L0);
+          if (L1) v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX1, L1);
         }
       }
-      sh_A[r * LDS_STRIDE + q0] = v0;
-      sh_A[r * LDS_STRIDE + q1] = v1;
+      sh_x[r * LDS_STRIDE + q0] = v0;
+      sh_x[r * LDS_STRIDE + q1] = v1;
     }
     if (K_QUADS & 1) {
       const int q = K_QUADS - 1;
@@ -1207,12 +1207,12 @@ __device__ __forceinline__ void mlp1_kernel_body(
           const int L = vlen(kval);
           if (L) v = load_bf16x4(x_u16 + (size_t)row_off(r) + (size_t)kval, L);
         }
-        sh_A[r * LDS_STRIDE + q] = v;
+        sh_x[r * LDS_STRIDE + q] = v;
       }
     }
   };
 
-  auto load_tileB_to_lds = [&](int k0) {
+  auto load_tileW_to_lds = [&](int k0) {
     const int num_quads = BLOCK_COLS * K_QUADS;
     for (int idx = tid_linear; idx < num_quads; idx += threads_per_block) {
       const int c  = idx / K_QUADS;
@@ -1233,11 +1233,11 @@ __device__ __forceinline__ void mlp1_kernel_body(
           v = load_bf16x4(src, L);
         }
       }
-      sh_B[c * LDS_STRIDE + q] = v;
+      sh_w[c * LDS_STRIDE + q] = v;
     }
   };
 
-  auto prefetchA_regs = [&](int k0)->RegPair {
+  auto prefetchX_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
@@ -1248,13 +1248,13 @@ __device__ __forceinline__ void mlp1_kernel_body(
       const int q1 = q0 + 1;
       if (row_active(r)) {
         const uint32_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0);
-        const int L1  = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0);
+        const int L1  = vlen(kX1);
         if (L0 | L1) {
           if (L0 == 4 && L1 == 4) {
-            const size_t base = (size_t)ro + (size_t)kA0;
+            const size_t base = (size_t)ro + (size_t)kX0;
             const uint16_t *src0 = x_u16 + base;
             if (((base & 7) == 0)) {
               load_bf16x8_aligned(src0, R.v0, R.v1);
@@ -1263,8 +1263,8 @@ __device__ __forceinline__ void mlp1_kernel_body(
               R.v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, 4);
             }
           } else {
-            if (L0) R.v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA0, L0);
-            if (L1) R.v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kA1, L1);
+            if (L0) R.v0 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX0, L0);
+            if (L1) R.v1 = load_bf16x4(x_u16 + (size_t)ro + (size_t)kX1, L1);
           }
           R.valid = true;
         }
@@ -1273,7 +1273,7 @@ __device__ __forceinline__ void mlp1_kernel_body(
     return R;
   };
 
-  auto prefetchB_regs = [&](int k0)->RegPair {
+  auto prefetchW_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_col = K_QUADS >> 1;
     const int num_vec = BLOCK_COLS * pairs_per_col;
@@ -1315,7 +1315,7 @@ __device__ __forceinline__ void mlp1_kernel_body(
     return R;
   };
 
-  auto storeA_regs_to_lds = [&](RegPair R) {
+  auto storeX_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_row = K_QUADS >> 1;
     if (!pairs_per_row) return;
@@ -1323,11 +1323,11 @@ __device__ __forceinline__ void mlp1_kernel_body(
     const int p  = tid_linear - r * pairs_per_row;
     const int q0 = (p << 1);
     const int q1 = q0 + 1;
-    sh_A[r * LDS_STRIDE + q0] = R.v0;
-    sh_A[r * LDS_STRIDE + q1] = R.v1;
+    sh_x[r * LDS_STRIDE + q0] = R.v0;
+    sh_x[r * LDS_STRIDE + q1] = R.v1;
   };
 
-  auto storeB_regs_to_lds = [&](RegPair R) {
+  auto storeW_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_col = K_QUADS >> 1;
     if (!pairs_per_col) return;
@@ -1335,40 +1335,40 @@ __device__ __forceinline__ void mlp1_kernel_body(
     const int p  = tid_linear - c * pairs_per_col;
     const int q0 = (p << 1);
     const int q1 = q0 + 1;
-    sh_B[c * LDS_STRIDE + q0] = R.v0;
-    sh_B[c * LDS_STRIDE + q1] = R.v1;
+    sh_w[c * LDS_STRIDE + q0] = R.v0;
+    sh_w[c * LDS_STRIDE + q1] = R.v1;
   };
 
-  load_tileA_to_lds(0);
-  load_tileB_to_lds(0);
+  load_tileX_to_lds(0);
+  load_tileW_to_lds(0);
   __syncthreads();
 
   const int wave_row_base = wave_m * WARP_TILE_M + lane_row;
   const int wave_col_base = wave_n * WARP_TILE_N + lane_col;
 
   for (int tile_idx = 0; tile_idx < tilesK; ++tile_idx) {
-    RegPair A_next{{0,0,0,0},{0,0,0,0},false};
-    RegPair B_next{{0,0,0,0},{0,0,0,0},false};
+    RegPair X_next{{0,0,0,0},{0,0,0,0},false};
+    RegPair W_next{{0,0,0,0},{0,0,0,0},false};
     const int k_next = (tile_idx + 1) * BLOCK_DEPTH;
     const bool has_next = (tile_idx + 1) < tilesK;
     if (has_next) {
-      A_next = prefetchA_regs(k_next);
-      B_next = prefetchB_regs(k_next);
+      X_next = prefetchX_regs(k_next);
+      W_next = prefetchW_regs(k_next);
     }
 
     for (int kk = 0; kk < BLOCK_DEPTH; kk += 16) {
       const int quad_idx = (k_group + kk) >> 2;
 #pragma unroll
       for (int wm = 0; wm < SUB_TILES_M; ++wm) {
-        const int a_row = wave_row_base + wm * 16;
-        const s16x4 avec = sh_A[a_row * LDS_STRIDE + quad_idx];
+        const int x_row = wave_row_base + wm * 16;
+        const s16x4 xvec = sh_x[x_row * LDS_STRIDE + quad_idx];
 #pragma unroll
         for (int wn = 0; wn < SUB_TILES_N; ++wn) {
-          const int b_col = wave_col_base + wn * 16;
+          const int w_col = wave_col_base + wn * 16;
           const int acc_idx = wm * SUB_TILES_N + wn;
-          const s16x4 bvec = sh_B[b_col * LDS_STRIDE + quad_idx];
+          const s16x4 wvec = sh_w[w_col * LDS_STRIDE + quad_idx];
           acc[acc_idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[acc_idx], 0,0,0);
+              xvec, wvec, acc[acc_idx], 0,0,0);
         }
       }
     }
@@ -1376,8 +1376,8 @@ __device__ __forceinline__ void mlp1_kernel_body(
     if (!has_next) break;
 
     __syncthreads();
-    storeA_regs_to_lds(A_next);
-    storeB_regs_to_lds(B_next);
+    storeX_regs_to_lds(X_next);
+    storeW_regs_to_lds(W_next);
     __syncthreads();
   }
 
@@ -1528,8 +1528,8 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
   __shared__ size_t sh_gate_offset[BLOCK_ROWS];
   __shared__ uint8_t sh_col_act[BLOCK_COLS];
   __shared__ uint32_t sh_col_off[BLOCK_COLS];
-  __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
-  __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_x[BLOCK_ROWS * LDS_STRIDE];
+  __shared__ __align__(16) s16x4 sh_w[BLOCK_COLS * LDS_STRIDE];
 
   const uint16_t *gate_up_u16 = reinterpret_cast<const uint16_t *>(gate_up_topk);
   const int n = IM;
@@ -1621,7 +1621,7 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
 
   struct RegPair { s16x4 v0, v1; bool valid; };
 
-  auto load_tileA_to_lds = [&](int k0) {
+  auto load_tileX_to_lds = [&](int k0) {
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
     for (int idx = tid_linear; idx < num_vec; idx += threads_per_block) {
@@ -1634,12 +1634,12 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
       s16x4 v1 = {0,0,0,0};
       if (row_active(r)) {
         const size_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0);
-        const int L1  = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0);
+        const int L1  = vlen(kX1);
         if (L0 == 4 && L1 == 4) {
-          const size_t base = ro + (size_t)kA0;
+          const size_t base = ro + (size_t)kX0;
           const uint16_t *src0 = gate_up_u16 + base;
           if (((base & 7) == 0)) {
             load_bf16x8_aligned(src0, v0, v1);
@@ -1648,12 +1648,12 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
             v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, 4);
           }
         } else {
-          if (L0) v0 = load_bf16x4(gate_up_u16 + ro + (size_t)kA0, L0);
-          if (L1) v1 = load_bf16x4(gate_up_u16 + ro + (size_t)kA1, L1);
+          if (L0) v0 = load_bf16x4(gate_up_u16 + ro + (size_t)kX0, L0);
+          if (L1) v1 = load_bf16x4(gate_up_u16 + ro + (size_t)kX1, L1);
         }
       }
-      sh_A[r * LDS_STRIDE + q0] = v0;
-      sh_A[r * LDS_STRIDE + q1] = v1;
+      sh_x[r * LDS_STRIDE + q0] = v0;
+      sh_x[r * LDS_STRIDE + q1] = v1;
     }
     if (K_QUADS & 1) {
       const int q = K_QUADS - 1;
@@ -1664,12 +1664,12 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
           const int L = vlen(kval);
           if (L) v = load_bf16x4(gate_up_u16 + row_off(r) + (size_t)kval, L);
         }
-        sh_A[r * LDS_STRIDE + q] = v;
+        sh_x[r * LDS_STRIDE + q] = v;
       }
     }
   };
 
-  auto load_tileB_to_lds = [&](int k0) {
+  auto load_tileW_to_lds = [&](int k0) {
     const int num_quads = BLOCK_COLS * K_QUADS;
     for (int idx = tid_linear; idx < num_quads; idx += threads_per_block) {
       const int c  = idx / K_QUADS;
@@ -1690,11 +1690,11 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
           v = load_bf16x4(src, L);
         }
       }
-      sh_B[c * LDS_STRIDE + q] = v;
+      sh_w[c * LDS_STRIDE + q] = v;
     }
   };
 
-  auto prefetchA_regs = [&](int k0)->RegPair {
+  auto prefetchX_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_row = K_QUADS >> 1;
     const int num_vec = BLOCK_ROWS * pairs_per_row;
@@ -1705,13 +1705,13 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
       const int q1 = q0 + 1;
       if (row_active(r)) {
         const size_t ro = row_off(r);
-        const int kA0 = k0 + q0 * MATMUL_CHUNK_K;
-        const int kA1 = kA0 + MATMUL_CHUNK_K;
-        const int L0  = vlen(kA0);
-        const int L1  = vlen(kA1);
+        const int kX0 = k0 + q0 * MATMUL_CHUNK_K;
+        const int kX1 = kX0 + MATMUL_CHUNK_K;
+        const int L0  = vlen(kX0);
+        const int L1  = vlen(kX1);
         if (L0 | L1) {
           if (L0 == 4 && L1 == 4) {
-            const size_t base = ro + (size_t)kA0;
+            const size_t base = ro + (size_t)kX0;
             const uint16_t *src0 = gate_up_u16 + base;
             if (((base & 7) == 0)) {
               load_bf16x8_aligned(src0, R.v0, R.v1);
@@ -1720,8 +1720,8 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
               R.v1 = load_bf16x4(src0 + MATMUL_CHUNK_K, 4);
             }
           } else {
-            if (L0) R.v0 = load_bf16x4(gate_up_u16 + ro + (size_t)kA0, L0);
-            if (L1) R.v1 = load_bf16x4(gate_up_u16 + ro + (size_t)kA1, L1);
+            if (L0) R.v0 = load_bf16x4(gate_up_u16 + ro + (size_t)kX0, L0);
+            if (L1) R.v1 = load_bf16x4(gate_up_u16 + ro + (size_t)kX1, L1);
           }
           R.valid = true;
         }
@@ -1730,7 +1730,7 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
     return R;
   };
 
-  auto prefetchB_regs = [&](int k0)->RegPair {
+  auto prefetchW_regs = [&](int k0)->RegPair {
     RegPair R{{0,0,0,0},{0,0,0,0}, false};
     const int pairs_per_col = K_QUADS >> 1;
     const int num_vec = BLOCK_COLS * pairs_per_col;
@@ -1772,7 +1772,7 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
     return R;
   };
 
-  auto storeA_regs_to_lds = [&](RegPair R) {
+  auto storeX_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_row = K_QUADS >> 1;
     if (!pairs_per_row) return;
@@ -1780,11 +1780,11 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
     const int p  = tid_linear - r * pairs_per_row;
     const int q0 = (p << 1);
     const int q1 = q0 + 1;
-    sh_A[r * LDS_STRIDE + q0] = R.v0;
-    sh_A[r * LDS_STRIDE + q1] = R.v1;
+    sh_x[r * LDS_STRIDE + q0] = R.v0;
+    sh_x[r * LDS_STRIDE + q1] = R.v1;
   };
 
-  auto storeB_regs_to_lds = [&](RegPair R) {
+  auto storeW_regs_to_lds = [&](RegPair R) {
     if (!R.valid) return;
     const int pairs_per_col = K_QUADS >> 1;
     if (!pairs_per_col) return;
@@ -1792,40 +1792,40 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
     const int p  = tid_linear - c * pairs_per_col;
     const int q0 = (p << 1);
     const int q1 = q0 + 1;
-    sh_B[c * LDS_STRIDE + q0] = R.v0;
-    sh_B[c * LDS_STRIDE + q1] = R.v1;
+    sh_w[c * LDS_STRIDE + q0] = R.v0;
+    sh_w[c * LDS_STRIDE + q1] = R.v1;
   };
 
-  load_tileA_to_lds(0);
-  load_tileB_to_lds(0);
+  load_tileX_to_lds(0);
+  load_tileW_to_lds(0);
   __syncthreads();
 
   const int wave_row_base = wave_m * WARP_TILE_M + lane_row;
   const int wave_col_base = wave_n * WARP_TILE_N + lane_col;
 
   for (int tile_idx = 0; tile_idx < tilesK; ++tile_idx) {
-    RegPair A_next{{0,0,0,0},{0,0,0,0},false};
-    RegPair B_next{{0,0,0,0},{0,0,0,0},false};
+    RegPair X_next{{0,0,0,0},{0,0,0,0},false};
+    RegPair W_next{{0,0,0,0},{0,0,0,0},false};
     const int k_next = (tile_idx + 1) * BLOCK_DEPTH;
     const bool has_next = (tile_idx + 1) < tilesK;
     if (has_next) {
-      A_next = prefetchA_regs(k_next);
-      B_next = prefetchB_regs(k_next);
+      X_next = prefetchX_regs(k_next);
+      W_next = prefetchW_regs(k_next);
     }
 
     for (int kk = 0; kk < BLOCK_DEPTH; kk += 16) {
       const int quad_idx = (k_group + kk) >> 2;
 #pragma unroll
       for (int wm = 0; wm < SUB_TILES_M; ++wm) {
-        const int a_row = wave_row_base + wm * 16;
-        const s16x4 avec = sh_A[a_row * LDS_STRIDE + quad_idx];
+        const int x_row = wave_row_base + wm * 16;
+        const s16x4 xvec = sh_x[x_row * LDS_STRIDE + quad_idx];
 #pragma unroll
         for (int wn = 0; wn < SUB_TILES_N; ++wn) {
-          const int b_col = wave_col_base + wn * 16;
+          const int w_col = wave_col_base + wn * 16;
           const int acc_idx = wm * SUB_TILES_N + wn;
-          const s16x4 bvec = sh_B[b_col * LDS_STRIDE + quad_idx];
+          const s16x4 wvec = sh_w[w_col * LDS_STRIDE + quad_idx];
           acc[acc_idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[acc_idx], 0,0,0);
+              xvec, wvec, acc[acc_idx], 0,0,0);
         }
       }
     }
@@ -1833,8 +1833,8 @@ __device__ __forceinline__ void mlp2_kernel_body_noatomic(
     if (!has_next) break;
 
     __syncthreads();
-    storeA_regs_to_lds(A_next);
-    storeB_regs_to_lds(B_next);
+    storeX_regs_to_lds(X_next);
+    storeW_regs_to_lds(W_next);
     __syncthreads();
   }
 
