@@ -746,222 +746,6 @@ mlp1_kernel_body<
 
 // ============ MLP2 (weighted accum) : batched per expert ==============
 
-template <
-  int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
-  int WARP_TILE_M, int WARP_TILE_N, int WAVES_PER_BLOCK
->
-__device__ __forceinline__ void mlp2_kernel_body(
-    float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
-    const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
-    const bf16_t *__restrict__ b_mlp2_all,
-    const uint16_t *__restrict__ assignment_batches,
-    const uint8_t *__restrict__ assignment_slots,
-    const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
-    int l_layer, int E, int IM, int H, int batch_size,
-    const int *__restrict__ pos) {
-
-  constexpr int SUB_TILES_M   = WARP_TILE_M / 16;
-  constexpr int SUB_TILES_N   = WARP_TILE_N / 16;
-  constexpr int WAVES_M       = BLOCK_ROWS / WARP_TILE_M;
-  constexpr int WAVES_N       = BLOCK_COLS / WARP_TILE_N;
-  constexpr int K_QUADS       = BLOCK_DEPTH / MATMUL_CHUNK_K;
-  constexpr int LDS_STRIDE    = K_QUADS + 3;
-
-  const int expert_id = blockIdx.z;
-  const int start = expert_offsets[expert_id];
-  const int end = expert_offsets[expert_id + 1];
-  const int count = end - start;
-  if (count <= 0) return;
-
-  const int block_m = blockIdx.y * BLOCK_ROWS;
-  if (block_m >= count) return;
-  const int tile_rows = min(BLOCK_ROWS, count - block_m);
-
-  const int total_cols = H;
-  const int block_n = blockIdx.x * BLOCK_COLS;
-  if (block_n >= total_cols) return;
-
-  if (blockDim.x != WF_SIZE || blockDim.y != WAVES_PER_BLOCK) return;
-
-  const int lane = threadIdx.x & (WF_SIZE - 1);
-  const int wave = threadIdx.y;
-  const int tid_linear = wave * WF_SIZE + lane;
-  const int threads_per_block = blockDim.x * blockDim.y;
-
-  const int wave_m = wave / WAVES_N;
-  const int wave_n = wave - wave_m * WAVES_N;
-  if (wave_m >= WAVES_M || wave_n >= WAVES_N) return;
-
-  const int lane_mod16      = lane & 15;
-  const int lane_row        = lane_mod16;
-  const int lane_col        = lane_mod16;
-  const int lane_group      = lane >> 4;
-  const int k_group         = lane_group * MATMUL_CHUNK_K;
-  const int row_lane_offset = lane_group * 4;
-
-  __shared__ int sh_batch[BLOCK_ROWS];
-  __shared__ float sh_weight[BLOCK_ROWS];
-  __shared__ uint8_t sh_valid[BLOCK_ROWS];
-  __shared__ size_t sh_gate_offset[BLOCK_ROWS];
-  __shared__ __align__(16) s16x4 sh_A[BLOCK_ROWS * LDS_STRIDE];
-  __shared__ __align__(16) s16x4 sh_B[BLOCK_COLS * LDS_STRIDE];
-
-  const uint16_t *gate_up_u16 = reinterpret_cast<const uint16_t *>(gate_up_topk);
-
-  for (int idx = tid_linear; idx < BLOCK_ROWS; idx += threads_per_block) {
-    int batch = -1;
-    float weight = 0.0f;
-    uint8_t valid = 0;
-    size_t gate_offset = 0;
-    if (idx < tile_rows) {
-      const int assignment_idx = start + block_m + idx;
-      batch = static_cast<int>(assignment_batches[assignment_idx]);
-      const int slot = static_cast<int>(assignment_slots[assignment_idx]);
-      if (batch >= 0 && slot >= 0) {
-        const bool pos_ok = (!pos) || (pos[batch] >= 0);
-        if (pos_ok) {
-          weight = topk_v[(size_t)batch * (size_t)EXPERT_PER_TOKEN + slot];
-          if (weight != 0.0f) {
-            valid = 1;
-            gate_offset = ((size_t)slot * (size_t)batch_size + (size_t)batch) * (size_t)IM;
-          }
-        }
-      }
-    }
-    sh_batch[idx] = batch;
-    sh_weight[idx] = weight;
-    sh_valid[idx] = valid;
-    sh_gate_offset[idx] = gate_offset;
-  }
-  __syncthreads();
-
-  const size_t matrix_idx = (size_t)l_layer * (size_t)E + (size_t)expert_id;
-  const bf16_t *__restrict__ w_matrix =
-      w_mlp2_all + matrix_idx * stride_w_mlp2;
-  const uint16_t *__restrict__ w_u16 =
-      reinterpret_cast<const uint16_t *>(w_matrix);
-  const bf16_t *__restrict__ bias_base =
-      b_mlp2_all + matrix_idx * (size_t)H;
-
-  const int n = IM;
-  const int tiles_k_total = (n + MATMUL_TILE_K - 1) / MATMUL_TILE_K;
-  const int total_tiles = (n + BLOCK_DEPTH - 1) / BLOCK_DEPTH;
-
-  f32x4 acc[SUB_TILES_M * SUB_TILES_N];
-#pragma unroll
-  for (int i = 0; i < SUB_TILES_M * SUB_TILES_N; ++i) acc[i] = f32x4{0.f,0.f,0.f,0.f};
-
-  float bias_lane[SUB_TILES_N];
-#pragma unroll
-  for (int wn = 0; wn < SUB_TILES_N; ++wn) {
-    const int col = block_n + wave_n * WARP_TILE_N + wn * 16 + lane_col;
-    bias_lane[wn] = (col < total_cols)
-                        ? float(bias_base[col])
-                        : 0.0f;
-  }
-
-  for (int tile_idx = 0; tile_idx < total_tiles; ++tile_idx) {
-    const int k_base = tile_idx * BLOCK_DEPTH;
-
-    const int total_a_quads = BLOCK_ROWS * K_QUADS;
-    for (int linear = tid_linear; linear < total_a_quads; linear += threads_per_block) {
-      const int row  = linear / K_QUADS;
-      const int quad = linear - row * K_QUADS;
-      const int k    = k_base + quad * MATMUL_CHUNK_K;
-      const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
-                                                    : (remaining > 0 ? remaining : 0);
-      s16x4 val = {0,0,0,0};
-      if (row < tile_rows && sh_valid[row] && valid > 0) {
-        const size_t offset = sh_gate_offset[row] + (size_t)k;
-        val = load_bf16x4(gate_up_u16 + offset, valid);
-      }
-      sh_A[row * LDS_STRIDE + quad] = val;
-    }
-
-    const int total_b_quads = BLOCK_COLS * K_QUADS;
-    for (int linear = tid_linear; linear < total_b_quads; linear += threads_per_block) {
-      const int col  = linear / K_QUADS;
-      const int quad = linear - col * K_QUADS;
-      const int global_col = block_n + col;
-      const int k    = k_base + quad * MATMUL_CHUNK_K;
-      const int remaining = n - k;
-      const int valid = remaining >= MATMUL_CHUNK_K ? MATMUL_CHUNK_K
-                                                    : (remaining > 0 ? remaining : 0);
-      s16x4 val = {0,0,0,0};
-      if (global_col < total_cols && valid > 0) {
-        const int tile_col   = global_col / MATMUL_TILE_COLS;
-        const int row_in_tile= global_col - tile_col * MATMUL_TILE_COLS;
-        const int tile_k     = k / MATMUL_TILE_K;
-        const int k_in_tile  = k - tile_k * MATMUL_TILE_K;
-        const int group      = k_in_tile / MATMUL_CHUNK_K;
-        const int within     = k_in_tile - group * MATMUL_CHUNK_K;
-        const size_t tile_elems = (size_t)MATMUL_TILE_COLS * MATMUL_TILE_K;
-        const size_t tile_base  = ((size_t)tile_col * tiles_k_total + tile_k) * tile_elems;
-        const size_t group_base = (size_t)group * MATMUL_TILE_COLS * MATMUL_CHUNK_K;
-        const uint16_t *src = w_u16 + tile_base + group_base +
-            (size_t)row_in_tile * MATMUL_CHUNK_K + within;
-        val = load_bf16x4(src, valid);
-      }
-      sh_B[col * LDS_STRIDE + quad] = val;
-    }
-
-    __syncthreads();
-
-    const int wave_row_base = wave_m * WARP_TILE_M + lane_row;
-    const int wave_col_base = wave_n * WARP_TILE_N + lane_col;
-
-    for (int kk = 0; kk < BLOCK_DEPTH; kk += 16) {
-      const int quad_idx = (k_group + kk) >> 2;
-#pragma unroll
-      for (int wm = 0; wm < SUB_TILES_M; ++wm) {
-        const int a_row = wave_row_base + wm * 16;
-        const s16x4 avec = sh_A[a_row * LDS_STRIDE + quad_idx];
-#pragma unroll
-        for (int wn = 0; wn < SUB_TILES_N; ++wn) {
-          const int b_col = wave_col_base + wn * 16;
-          const int acc_idx = wm * SUB_TILES_N + wn;
-          const s16x4 bvec = sh_B[b_col * LDS_STRIDE + quad_idx];
-          acc[acc_idx] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
-              avec, bvec, acc[acc_idx], 0,0,0);
-        }
-      }
-    }
-
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int wm = 0; wm < SUB_TILES_M; ++wm) {
-    const int row_block = wave_m * WARP_TILE_M + wm * 16;
-#pragma unroll
-    for (int wn = 0; wn < SUB_TILES_N; ++wn) {
-      const int col_base = wave_n * WARP_TILE_N + wn * 16;
-      const int col = block_n + col_base + lane_col;
-      const bool col_valid = (col < total_cols);
-      const int acc_idx = wm * SUB_TILES_N + wn;
-      const f32x4 vec = acc[acc_idx];
-      const float bias_val = bias_lane[wn];
-      const int row_base = row_block + row_lane_offset;
-
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int row = row_base + i;
-        if (row >= tile_rows) continue;
-        if (!sh_valid[row]) continue;
-        if (!col_valid) continue;
-
-        const int batch = sh_batch[row];
-        const float weight = sh_weight[row];
-        if (batch < 0 || weight == 0.0f) continue;
-
-        const float value = (vec[i] + bias_val) * weight;
-        atomicAdd(e_agg + (size_t)batch * (size_t)H + (size_t)col, value);
-      }
-    }
-  }
-}
-
 // Non-atomic version: writes to [K,B,H] intermediate buffer
 template<
   int BLOCK_ROWS, int BLOCK_COLS, int BLOCK_DEPTH,
@@ -1207,8 +991,9 @@ __global__ void mlp2_kernel_noatomic(
       l_layer, E, IM, H, batch_size, pos);
 }
 
-__global__ void mlp2_kernel(
-    float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
+__global__ void mlp2_120b_kernel(
+    bf16_t *__restrict__ mlp2_partial,
+    const bf16_t *__restrict__ gate_up_topk,
     const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
     const bf16_t *__restrict__ b_mlp2_all,
     const uint16_t *__restrict__ assignment_batches,
@@ -1216,29 +1001,12 @@ __global__ void mlp2_kernel(
     const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
     int l_layer, int E, int IM, int H, int batch_size,
     const int *__restrict__ pos) {
-  mlp2_kernel_body<
-      MATMUL_MLP2_BLOCK_ROWS, MATMUL_MLP2_BLOCK_COLS, MATMUL_MLP2_BLOCK_DEPTH,
-      MATMUL_MLP2_WARP_TILE_M, MATMUL_MLP2_WARP_TILE_N,
-      MATMUL_MLP2_WAVES_PER_BLOCK>(
-      e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
+  mlp2_kernel_body_noatomic<
+      MATMUL_MLP2_BLOCK_ROWS_120B, MATMUL_MLP2_BLOCK_COLS_120B,
+      MATMUL_MLP2_BLOCK_DEPTH_120B,
+      MATMUL_MLP2_WARP_TILE_M_120B, MATMUL_MLP2_WARP_TILE_N_120B,
+      MATMUL_MLP2_WAVES_PER_BLOCK_120B>(
+      mlp2_partial, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
       assignment_batches, assignment_slots, expert_offsets, topk_v,
       l_layer, E, IM, H, batch_size, pos);
-}
-
-__global__ void mlp2_120b_kernel(
-  float *__restrict__ e_agg, const bf16_t *__restrict__ gate_up_topk,
-  const bf16_t *__restrict__ w_mlp2_all, size_t stride_w_mlp2,
-  const bf16_t *__restrict__ b_mlp2_all,
-  const uint16_t *__restrict__ assignment_batches,
-  const uint8_t *__restrict__ assignment_slots,
-  const int *__restrict__ expert_offsets, const float *__restrict__ topk_v,
-  int l_layer, int E, int IM, int H, int batch_size,
-  const int *__restrict__ pos) {
-mlp2_kernel_body<
-    MATMUL_MLP2_BLOCK_ROWS_120B, MATMUL_MLP2_BLOCK_COLS_120B, MATMUL_MLP2_BLOCK_DEPTH_120B,
-    MATMUL_MLP2_WARP_TILE_M_120B, MATMUL_MLP2_WARP_TILE_N_120B,
-    MATMUL_MLP2_WAVES_PER_BLOCK_120B>(
-    e_agg, gate_up_topk, w_mlp2_all, stride_w_mlp2, b_mlp2_all,
-    assignment_batches, assignment_slots, expert_offsets, topk_v,
-    l_layer, E, IM, H, batch_size, pos);
 }

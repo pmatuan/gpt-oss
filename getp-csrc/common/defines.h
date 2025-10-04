@@ -201,6 +201,7 @@ struct OwnerPartialBuffers {
   bf16_t **partial_owner_per_home_bf16 = nullptr; // [ndev] -> [B_local,H]
   bf16_t **recv_partial_home_bf16 = nullptr;      // [ndev] -> [B_local,H]
   bf16_t **gate_up_owner_per_home = nullptr; // [ndev] -> [K, B_local, IM]
+  bf16_t **mlp2_partial_owner_per_home = nullptr; // [ndev] -> [K, B_local, H]
 };
 
 struct DeviceContext {
