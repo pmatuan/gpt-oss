@@ -7,9 +7,9 @@ __device__ __forceinline__ void block_reduce_max_multi(
     float (&vals)[ATTN_FLASH_MAX_KV_MUL],
     float (&warp_storage)[ATTN_FLASH_MAX_KV_MUL][ATTN_WARPS_PER_BLOCK],
     float (&block_storage)[ATTN_FLASH_MAX_KV_MUL], int lane, int warp_id,
-    int num_warps, int kv_mul) {
+    int num_warps) {
 #pragma unroll
-  for (int qh = 0; qh < kv_mul; ++qh) {
+  for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
     float v = vals[qh];
 #pragma unroll
     for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
@@ -20,7 +20,7 @@ __device__ __forceinline__ void block_reduce_max_multi(
 
   if (lane == 0) {
 #pragma unroll
-    for (int qh = 0; qh < kv_mul; ++qh) {
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       warp_storage[qh][warp_id] = vals[qh];
     }
   }
@@ -28,7 +28,7 @@ __device__ __forceinline__ void block_reduce_max_multi(
 
   if (warp_id == 0) {
 #pragma unroll
-    for (int qh = 0; qh < kv_mul; ++qh) {
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       float v = (lane < num_warps) ? warp_storage[qh][lane] : -INFINITY;
 #pragma unroll
       for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
@@ -45,9 +45,9 @@ __device__ __forceinline__ void block_reduce_sum_multi(
     float (&vals)[ATTN_FLASH_MAX_KV_MUL],
     float (&warp_storage)[ATTN_FLASH_MAX_KV_MUL][ATTN_WARPS_PER_BLOCK],
     float (&block_storage)[ATTN_FLASH_MAX_KV_MUL], int lane, int warp_id,
-    int num_warps, int kv_mul) {
+    int num_warps) {
 #pragma unroll
-  for (int qh = 0; qh < kv_mul; ++qh) {
+  for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
     float v = vals[qh];
 #pragma unroll
     for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
@@ -58,7 +58,7 @@ __device__ __forceinline__ void block_reduce_sum_multi(
 
   if (lane == 0) {
 #pragma unroll
-    for (int qh = 0; qh < kv_mul; ++qh) {
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       warp_storage[qh][warp_id] = vals[qh];
     }
   }
@@ -66,7 +66,7 @@ __device__ __forceinline__ void block_reduce_sum_multi(
 
   if (warp_id == 0) {
 #pragma unroll
-    for (int qh = 0; qh < kv_mul; ++qh) {
+    for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       float v = (lane < num_warps) ? warp_storage[qh][lane] : 0.0f;
 #pragma unroll
       for (int offset = WF_SIZE >> 1; offset > 0; offset >>= 1) {
@@ -84,7 +84,7 @@ __device__ __forceinline__ void flash_decoding_body(
     bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
     const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
     const bf16_t *__restrict__ attn_sinks, int layer_idx,
-    const int *__restrict__ pos, int D, int Hq, int Hk,
+    const int *__restrict__ pos,
     const float *__restrict__ rope_inv_freq, float rope_concentration,
     const uint32_t *__restrict__ layer_offsets,
     const int *__restrict__ layer_capacity, int sliding_window,
@@ -274,7 +274,7 @@ __device__ __forceinline__ void flash_decoding_body(
     __syncthreads();
 
     block_reduce_max_multi(thread_max, s_warp_red, s_red_tmp, lane, wid,
-                            nwarp, ATTN_FLASH_MAX_KV_MUL);
+                            nwarp);
     if (tid == 0) {
 #pragma unroll
       for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
@@ -309,7 +309,7 @@ __device__ __forceinline__ void flash_decoding_body(
     }
     __syncthreads();
     block_reduce_sum_multi(thread_sum_multi, s_warp_red, s_red_tmp, lane, wid,
-                            nwarp, ATTN_FLASH_MAX_KV_MUL);
+                            nwarp);
     if (tid == 0) {
 #pragma unroll
       for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh)
@@ -337,6 +337,7 @@ __device__ __forceinline__ void flash_decoding_body(
   }
 
   if (tid == 0) {
+    #pragma unroll
     for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
       const int q_head = kv_head * ATTN_FLASH_MAX_KV_MUL + qh;
       const float sink = static_cast<float>(attn_sinks[layer_idx * Hq + q_head]);
@@ -353,6 +354,7 @@ __device__ __forceinline__ void flash_decoding_body(
   }
   __syncthreads();
 
+  #pragma unroll
   for (int qh = 0; qh < ATTN_FLASH_MAX_KV_MUL; ++qh) {
     acc[qh] *= s_scale[qh];
     s_accum[qh * acc_stride + tid] = acc[qh];
@@ -382,14 +384,14 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
         bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
         const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
         const bf16_t *__restrict__ attn_sinks, int layer_idx,
-        const int *__restrict__ pos, int D, int Hq, int Hk,
+        const int *__restrict__ pos,
         const float *__restrict__ rope_inv_freq, float rope_concentration,
         const uint32_t *__restrict__ layer_offsets,
         const int *__restrict__ layer_capacity, int sliding_window,
         uint32_t kv_batch_stride, int batch_size) {
   extern __shared__ float smem[];
   flash_decoding_body<true>(
-      out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
+      out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos,
       rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
       sliding_window, kv_batch_stride, batch_size, smem);
 }
@@ -399,14 +401,14 @@ __launch_bounds__(ATTN_THREADS_PER_BLOCK, 4) __global__
         bf16_t *__restrict__ out_tb, const bf16_t *__restrict__ qkv,
         const bf16_t *__restrict__ k_cache, const bf16_t *__restrict__ v_cache,
         const bf16_t *__restrict__ attn_sinks, int layer_idx,
-        const int *__restrict__ pos, int D, int Hq, int Hk,
+        const int *__restrict__ pos,
         const float *__restrict__ rope_inv_freq, float rope_concentration,
         const uint32_t *__restrict__ layer_offsets,
         const int *__restrict__ layer_capacity, uint32_t kv_batch_stride,
         int batch_size) {
   extern __shared__ float smem[];
   flash_decoding_body<false>(
-      out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos, D, Hq, Hk,
+      out_tb, qkv, k_cache, v_cache, attn_sinks, layer_idx, pos,
       rope_inv_freq, rope_concentration, layer_offsets, layer_capacity,
       /*sliding_window*/ 0, kv_batch_stride, batch_size, smem);
 }

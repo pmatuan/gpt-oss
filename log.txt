@@ -1,0 +1,38 @@
+srun: job 82839 queued and waiting for resources
+srun: job 82839 has been allocated resources
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 32
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 24
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 2048
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+requests size = 235110400 B
+Num requests: 896
+Found 1 HIP devices, initializing multi-GPU setup...
+Not using expert parallelism (n_experts=32, n_devices=1)
+Initializing device 0 for batch size 896...
+[DEVICE] 0 [HIP] before allocations: HBM free 63.90 GiB / total 63.98 GiB (used 0.09 GiB)
+[DEVICE] 0 [HIP] after activations: HBM free 63.00 GiB / total 63.98 GiB (used 0.98 GiB)
+[DEVICE] 0 [HIP] after small BF16 weights: HBM free 62.99 GiB / total 63.98 GiB (used 0.99 GiB)
+[DEVICE] 0 [HIP] after expert biases: HBM free 62.97 GiB / total 63.98 GiB (used 1.01 GiB)
+[DEVICE] 0 [HIP] after large BF16 weights: HBM free 24.03 GiB / total 63.98 GiB (used 39.95 GiB)
+[DEVICE] 0 allocated KV cache full 1024 tokens
+[DEVICE] 0 [HIP] after KV cache allocation (model fully loaded): HBM free 0.41 GiB / total 63.98 GiB (used 63.58 GiB)
+Multi-GPU initialization complete!
+
+warm up elapsed time(s): 47.106000
+Processing 896 requests across 1 GPUs...
+Multi-GPU inference completed. Total tokens generated: 891656
+
+elapsed time(s): 200.077000, achieved throughput TPS (tok/s): 4456.564223
+
+finish elapsed time(s): 0.002000

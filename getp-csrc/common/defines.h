@@ -14,6 +14,15 @@
 typedef hip_bfloat16 bf16_t;
 
 // GPU Compute Constants
+// Attention geometry constants stay fixed to enable compile-time unrolling.
+static constexpr int D = 64;
+static constexpr int Hq = 64;
+static constexpr int Hk = 8;
+
+#define ATTN_D_LITERAL 64
+#define ATTN_HQ_LITERAL 64
+#define ATTN_HK_LITERAL 8
+
 #define WF_SIZE 64
 #define TM 8  
 #define BLOCK_SIZE (WF_SIZE * TM)

@@ -632,8 +632,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         flash_decoding_even<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-            Hq, Hk, ctx.gpu_activations.d_rope_inv_freq,
+            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos,
+            ctx.gpu_activations.d_rope_inv_freq,
             ctx.gpu_activations.rope_concentration, ctx.d_kv_layer_offsets,
             ctx.d_kv_layer_capacity,
             p->sliding_window, kv_batch_stride, batch_size);
@@ -641,8 +641,8 @@ static int *gpu_forward_device_batch(Transformer *transformer,
         flash_decoding_odd<<<gridAttn, blockA, shmem_size>>>(
             ctx.gpu_activations.d_tb, ctx.gpu_activations.d_qkv,
             ctx.gpu_activations.d_key_cache, ctx.gpu_activations.d_value_cache,
-            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos, D,
-            Hq, Hk, ctx.gpu_activations.d_rope_inv_freq,
+            ctx.gpu_weights_fp32.d_attn_sinks, l, ctx.gpu_activations.d_pos,
+            ctx.gpu_activations.d_rope_inv_freq,
             ctx.gpu_activations.rope_concentration, ctx.d_kv_layer_offsets,
             ctx.d_kv_layer_capacity, kv_batch_stride, batch_size);
       }
