@@ -1,112 +1,124 @@
-# Environment Setup
+<div align="center">
+
+# GPT-OSS from Scratch on GPU AMD MI250
+
+[Overview](#overview) • [Highlights](#highlights) • [Repository-layout](#repository-layout) • [Getting-started](#getting-started) • [Evaluation](#evaluation) • [Performance](#performance) • [Acknowledgements](#acknowledgements)
+
+</div>
+
+## Overview
+
+This project delivers a pure C++17/HIP implementation of OpenAI's GPT-OSS 20B and 120B models for AMD MI250 GPUs.
+
+## Highlights
+
+- Pure C++/HIP implementation of GPT-OSS 20B and 120B inference without library dependencies.
+- Optimized and validated on AMD MI250 GPUs.
+
+## Repository layout
+
+```text
+gpt-oss/
+├── run.cpp                  # Entry point with chat/generate/getp modes
+├── tokenizer.{hpp,cpp}      # C++ tokenizer matching o200k_harmony
+├── getp-csrc/               # GPU kernels (attention, matmul, routing, profiler)
+├── export_model_bin/        # Safetensor → binary conversion scripts
+├── data/                    # Sample prompts and helper assets
+├── evaluation/              # METEOR & BERTScore evaluation pipeline
+├── decode.cpp               # Utility to detokenize model outputs
+├── Makefile                 # hipcc/g++ build targets
+└── requirements.txt         # Python dependencies for tooling
+```
+
+## Getting started
+
+### Prerequisites
+
+- ROCm-enabled AMD Instinct MI250 GPUs and a working HIP toolchain (`hipcc` preferred).
+- GCC/Clang with OpenMP support if you plan to use CPU-assisted runs.
+- Python 3.10+ with virtualenv tooling.
+- Access to the GPT-OSS checkpoints (`openai/gpt-oss-20b`, `openai/gpt-oss-120b`, optional `tiny-random/gpt-oss`).
+
+### Environment setup
 
 ```bash
-# gpt-oss
-export GPT_OSS_REPO_ROOT="/nfs/gpu_trainee/user/gpt-oss" # TODO(user): change to your account name
-cd $GPT_OSS_REPO_ROOT
-
-# Create and activate a Python 3.10 virtual environment
-python3.10 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-
-# Model paths
-export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
-export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
+pip install -r requirements.txt
 ```
 
-# Main program
-
-The main function at `run.cpp`
-Do not modify `run.cpp` `getp_csrc/getp_eval.cpp` `Makefile`
-
-## Build
+Generate the tokenizer binary once:
 
 ```bash
-make run  # Default compilation, very slow
-make runfast  # Compiled with -O3 optimization
-make runomp # Compiled with -O3 and -fopenmp
+python3 export_tokenizer_bin.py -o tokenizer.bin
 ```
 
-## Run
+### Convert model weights
 
-Example:
+1. Download the safetensor checkpoints from Hugging Face into `export_model_bin/{gpt-oss-20b,gpt-oss-120b}`.
+2. Run the exporter matching your target model, for example:
+
+   ```bash
+   python3 export_model_bin/gpt-oss-20b/export_model_bin.py \
+       --model openai/gpt-oss-20b \
+       --output /path/to/model_bins/gpt-oss-20b.bin
+   ```
+
+The resulting `.bin` is a memory-mappable blob consumed by `./run`.
+
+### Build targets
 
 ```bash
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m getp -i data/input.txt -o data/output.txt
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m chat
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m generate -i "1+1="
+make run        # Development build (no optimizations)
+make runfast    # Optimized build (-O3) using hipcc or g++
+make runomp     # OpenMP-enabled build for multi-threaded runs
+make runprof    # Build with profiling instrumentation enabled
+make decode     # Detokenizer CLI (./decode)
+make clean      # Remove build outputs
 ```
 
-## Visualize `getp` mode output
+If `hipcc` is available it is used automatically; otherwise the Makefile falls back to `g++`.
 
-For `getp` mode the output file contains list of output tokens index of each requests. To convert those indexes into text, you should build and run `decode.cpp`
+### Run inference
 
 ```bash
-make decode
-./decode -1 -i data/output.txt
+# Batch GETP job
+./run /path/to/gpt-oss-120b.bin -m getp -i data/input.txt -o data/output.txt
+
+# Convert token IDs back to text
+./decode -i data/output.txt -o data/output.txt.decoded
 ```
 
-# Tokenizer
+## Evaluation
 
-## Export Tokenizer
+The `evaluation/` folder provides a metrics pipeline built around METEOR and BERTScore F1. Typical usage:
 
 ```bash
-make tokenizer-bin
+python3 evaluation/eval.py -m 20b \
+    -s submission/output_20b_token_ids.txt \
+    -r references/output_20b_token_ids.txt
 ```
 
-## Build & Run Tokenizer Test (C++)
+Key features:
 
-```bash
-make tokenizer-test
-./test_tokenizer -t tokenizer.bin -i "Hello world"
-# Expected output: 13225 2375
-```
+- Token IDs are decoded with `tiktoken` to align with the tokenizer used during inference.
+- Optional `threshold.json` asserts minimum acceptable scores during CI.
+- Supports overriding submission/reference paths and encodings for custom datasets.
+- Designed to run efficiently on multi-GPU ROCm systems; CPU fallback is available but slower.
 
-## Verify Compatibility with Tiktoken
+## Performance
 
-```bash
-python3 test_tokenizer.py \
-  --bin ./test_tokenizer \
-  --tok ./tokenizer.bin \
-  --verbose \
-  --prompt data/input.txt
-```
+End-to-end results collected on a single node with 8× AMD Instinct MI250 GPUs:
 
-### Example Results
+| Model        | Mode | Batch Size | Throughput (TPS) | METEOR  | BERTScore F1 |
+| ------------ | ---- | ---------- | ---------------- | ------- | ------------ |
+| gpt-oss-20b  | GETP | 7,168      | 35,454.61        | 0.49883 | 0.976014     |
+| gpt-oss-120b | GETP | 6,144      | 10,296.66        | 0.42150 | 0.971202     |
 
-```
-PROMPT: 'ฉันรักทะเล'
-  C  encoded: [97797, 6560, 151737, 37899, 17758]
-  PY encoded: [97797, 6560, 151737, 37899, 17758]
-  C  decoded: 'ฉันรักทะเล'
-  PY decoded: 'ฉันรักทะเล'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: 'naïve façade — déjà vu'
-  C  encoded: [1503, 9954, 737, 114665, 2733, 21229, 12005]
-  PY encoded: [1503, 9954, 737, 114665, 2733, 21229, 12005]
-  C  decoded: 'naïve façade — déjà vu'
-  PY decoded: 'naïve façade — déjà vu'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: '🍣 sushi and 🍜 ramen'
-  C  encoded: [102415, 96, 85535, 326, 197348, 250, 90938]
-  PY encoded: [102415, 96, 85535, 326, 197348, 250, 90938]
-  C  decoded: '🍣 sushi and 🍜 ramen'
-  PY decoded: '🍣 sushi and 🍜 ramen'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: 'email: test@example.com'
-  C  encoded: [4261, 25, 1746, 81309, 1136]
-  PY encoded: [4261, 25, 1746, 81309, 1136]
-  C  decoded: 'email: test@example.com'
-  PY decoded: 'email: test@example.com'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: 'newlines:'
-  C  encoded: [1389, 10105, 25]
-  PY encoded: [1389, 10105, 25]
-  C  decoded: 'newlines:'
-  PY decoded: 'newlines:'
-  [ENCODE MATCH] [DECODE MATCH]
-```
+## Acknowledgements
+
+Developed as part of the GPU Engineer Training Program jointly organized by [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and the [THUNDER Research Group](http://snuvm.snu.ac.kr/) at Seoul National University. GPT-OSS weights are provided by OpenAI.
+
+## Contributing
+
+Issues and pull requests are welcome. If you are adding new kernels, include profiler captures or benchmarks, and keep changes scoped to existing files when possible. For larger features, please open an issue first so we can coordinate API changes.
